@@ -1,0 +1,1263 @@
+     1→// ============================================================
+     2→// AgentForge - Auth Routes
+     3→// Register, Login, Refresh with proper token management
+     4→// Phase 10: MFA support, Threat Detection, Session Management
+     5→// P2.1.1: AES-256-GCM encrypted MFA secrets
+     6→// P2.1.3: Refresh token rotation with reuse detection
+     7→// P2.1.4: JWT hardening (iss, aud, sub, iat, exp, jti + blacklist)
+     8→// ============================================================
+     9→
+    10→import { Hono } from 'hono';
+    11→import { zValidator } from '@hono/zod-validator';
+    12→import { sign, verify } from 'hono/jwt';
+    13→import bcrypt from 'bcryptjs';
+    14→import { z } from 'zod';
+    15→import { v4 as uuidv4 } from 'uuid';
+    16→import { LoginSchema, RegisterSchema } from '@agentforge/shared';
+    17→import { env } from '../config/env';
+    18→import { db } from '../db';
+    19→import { users, refreshTokens } from '../db/schema';
+    20→import { eq, and } from 'drizzle-orm';
+    21→import { createHash, randomBytes } from 'crypto';
+    22→import { mfaService } from '../services/security/MFAService';
+    23→import { encryptionService } from '../services/security/EncryptionService';
+    24→import { sessionManager } from '../services/security/SessionManager';
+    25→import { tracingService } from '../services/telemetry/TracingService';
+    26→import { auditTrailService } from '../services/security/AuditTrailService';
+    27→import { threatDetectionService } from '../services/security/ThreatDetectionService';
+    28→import { jwtBlacklist } from '../services/security/JWTBlacklist';
+    29→import { getPrimaryRedis, isRedisAvailable } from '../services/RedisManager';
+    30→
+    31→const auth = new Hono();
+    32→
+    33→// ─── Auth Rate Limiting (EGCS-5: uses RedisManager) ──────────
+    34→
+    35→interface AuthRateLimitOptions {
+    36→  windowMs: number;
+    37→  maxRequests: number;
+    38→  keyPrefix: string;
+    39→}
+    40→
+    41→async function checkAuthRateLimit(key: string, options: AuthRateLimitOptions): Promise<{ allowed: boolean; remaining: number; retryAfterMs: number }> {
+    42→  if (!isRedisAvailable()) {
+    43→    return { allowed: true, remaining: options.maxRequests, retryAfterMs: 0 };
+    44→  }
+    45→
+    46→  const redis = getPrimaryRedis();
+    47→  const now = Date.now();
+    48→  const windowKey = `authrl:${options.keyPrefix}:${key}:${Math.floor(now / options.windowMs)}`;
+    49→
+    50→  try {
+    51→    const count = await redis.incr(windowKey);
+    52→    if (count === 1) {
+    53→      await redis.pexpire(windowKey, options.windowMs);
+    54→    }
+    55→    const remaining = Math.max(0, options.maxRequests - count);
+    56→    const retryAfterMs = Math.ceil(now / options.windowMs) * options.windowMs - now;
+    57→    return { allowed: count <= options.maxRequests, remaining, retryAfterMs };
+    58→  } catch {
+    59→    return { allowed: true, remaining: options.maxRequests, retryAfterMs: 0 };
+    60→  }
+    61→}
+    62→
+    63→/** Strict rate limiter: 5 requests per 15 minutes per IP — for login, register, MFA login-verify */
+    64→const strictAuthRateLimiter = async (c: any, next: any) => {
+    65→  const ip = getClientIp(c);
+    66→  const result = await checkAuthRateLimit(ip, { windowMs: 15 * 60 * 1000, maxRequests: 5, keyPrefix: 'strict' });
+    67→
+    68→  c.header('X-RateLimit-Remaining', result.remaining.toString());
+    69→
+    70→  if (!result.allowed) {
+    71→    return c.json({
+    72→      success: false,
+    73→      error: 'Too many attempts. Please try again later.',
+    74→      retryAfter: Math.ceil(result.retryAfterMs / 1000),
+    75→    }, 429);
+    76→  }
+    77→
+    78→  await next();
+    79→};
+    80→
+    81→/** MFA rate limiter: 20 requests per 15 minutes per IP — for MFA setup/enable/disable */
+    82→const mfaRateLimiter = async (c: any, next: any) => {
+    83→  const ip = getClientIp(c);
+    84→  const result = await checkAuthRateLimit(ip, { windowMs: 15 * 60 * 1000, maxRequests: 20, keyPrefix: 'mfa' });
+    85→
+    86→  c.header('X-RateLimit-Remaining', result.remaining.toString());
+    87→
+    88→  if (!result.allowed) {
+    89→    return c.json({
+    90→      success: false,
+    91→      error: 'Too many MFA attempts. Please try again later.',
+    92→      retryAfter: Math.ceil(result.retryAfterMs / 1000),
+    93→    }, 429);
+    94→  }
+    95→
+    96→  await next();
+    97→};
+    98→
+    99→/** Account lockout: check if email/IP is locked after 5 failed login attempts */
+   100→const ACCOUNT_LOCKOUT_MAX_ATTEMPTS = 5;
+   101→const ACCOUNT_LOCKOUT_WINDOW_MS = 15 * 60 * 1000; // 15 minutes
+   102→
+   103→async function checkAccountLockout(identifier: string): Promise<boolean> {
+   104→  if (!isRedisAvailable()) return false;
+   105→  const key = `authrl:lockout:${identifier}`;
+   106→  try {
+   107→    const redis = getPrimaryRedis();
+   108→    const count = await redis.get(key);
+   109→    return count !== null && parseInt(count) >= ACCOUNT_LOCKOUT_MAX_ATTEMPTS;
+   110→  } catch {
+   111→    return false; // Redis unavailable — don't block
+   112→  }
+   113→}
+   114→
+   115→async function recordFailedLoginAttempt(identifier: string): Promise<void> {
+   116→  if (!isRedisAvailable()) return;
+   117→  const key = `authrl:lockout:${identifier}`;
+   118→  try {
+   119→    const redis = getPrimaryRedis();
+   120→    const count = await redis.incr(key);
+   121→    if (count === 1) {
+   122→      await redis.pexpire(key, ACCOUNT_LOCKOUT_WINDOW_MS);
+   123→    }
+   124→  } catch {
+   125→    // Redis unavailable — skip
+   126→  }
+   127→}
+   128→
+   129→async function resetFailedLoginAttempts(identifier: string): Promise<void> {
+   130→  if (!isRedisAvailable()) return;
+   131→  const key = `authrl:lockout:${identifier}`;
+   132→  try {
+   133→    const redis = getPrimaryRedis();
+   134→    await redis.del(key);
+   135→  } catch {
+   136→    // Redis unavailable — skip
+   137→  }
+   138→}
+   139→
+   140→// ─── P2.1.4: JWT Token Generation with full claims ──────────
+   141→
+   142→interface JWTPayload {
+   143→  sub: string;
+   144→  tier: string;
+   145→  iss: string;
+   146→  aud: string;
+   147→  iat: number;
+   148→  exp: number;
+   149→  jti: string;
+   150→  [key: string]: unknown;
+   151→}
+   152→
+   153→interface RefreshJWTPayload {
+   154→  sub: string;
+   155→  type: 'refresh';
+   156→  tid: string;
+   157→  iss: string;
+   158→  aud: string;
+   159→  iat: number;
+   160→  exp: number;
+   161→  jti: string;
+   162→  [key: string]: unknown;
+   163→}
+   164→
+   165→interface MFAPendingJWTPayload {
+   166→  sub: string;
+   167→  type: 'mfa_pending';
+   168→  sessionId: string;
+   169→  iss: string;
+   170→  aud: string;
+   171→  iat: number;
+   172→  exp: number;
+   173→  jti: string;
+   174→  [key: string]: unknown;
+   175→}
+   176→
+   177→/**
+   178→ * Generate an access token with full OWASP-recommended claims.
+   179→ * P2.1.4: iss, aud, sub, iat, exp, jti
+   180→ */
+   181→async function generateAccessToken(userId: string, tier: string): Promise<string> {
+   182→  const now = Math.floor(Date.now() / 1000);
+   183→  const payload: JWTPayload = {
+   184→    sub: userId,
+   185→    tier,
+   186→    iss: env.JWT_ISSUER,
+   187→    aud: env.JWT_AUDIENCE,
+   188→    iat: now,
+   189→    exp: now + 900, // 15 minutes
+   190→    jti: uuidv4(),
+   191→  };
+   192→
+   193→  return sign(payload, env.JWT_SECRET);
+   194→}
+   195→
+   196→/**
+   197→ * Generate a refresh token JWT with full claims.
+   198→ * P2.1.3: Includes jti for rotation tracking.
+   199→ */
+   200→async function generateRefreshTokenJWT(userId: string, tokenHash: string): Promise<string> {
+   201→  const now = Math.floor(Date.now() / 1000);
+   202→  const payload: RefreshJWTPayload = {
+   203→    sub: userId,
+   204→    type: 'refresh',
+   205→    tid: tokenHash.substring(0, 16),
+   206→    iss: env.JWT_ISSUER,
+   207→    aud: env.JWT_AUDIENCE,
+   208→    iat: now,
+   209→    exp: now + 604800, // 7 days
+   210→    jti: uuidv4(),
+   211→  };
+   212→
+   213→  return sign(payload, env.JWT_SECRET);
+   214→}
+   215→
+   216→/**
+   217→ * Generate an MFA pending token with full claims.
+   218→ */
+   219→async function generateMFAPendingToken(userId: string, sessionId: string): Promise<string> {
+   220→  const now = Math.floor(Date.now() / 1000);
+   221→  const payload: MFAPendingJWTPayload = {
+   222→    sub: userId,
+   223→    type: 'mfa_pending',
+   224→    sessionId,
+   225→    iss: env.JWT_ISSUER,
+   226→    aud: env.JWT_AUDIENCE,
+   227→    iat: now,
+   228→    exp: now + 300, // 5 minutes
+   229→    jti: uuidv4(),
+   230→  };
+   231→
+   232→  return sign(payload, env.JWT_SECRET);
+   233→}
+   234→
+   235→/**
+   236→ * Create and persist a refresh token in the database.
+   237→ * Returns the raw JWT and the hash for storage.
+   238→ * P2.1.3: Stores tokenHash in DB for specific token binding.
+   239→ */
+   240→async function createRefreshToken(userId: string): Promise<{ jwt: string; tokenHash: string; hashFull: string }> {
+   241→  const refreshTokenValue = uuidv4() + '-' + uuidv4();
+   242→  const hashFull = createHash('sha256').update(refreshTokenValue).digest('hex');
+   243→  const tokenHash = hashFull.substring(0, 64); // Use full hash for specific token binding
+   244→
+   245→  await db.insert(refreshTokens).values({
+   246→    id: uuidv4(),
+   247→    userId,
+   248→    tokenHash, // P2.1.3: Full hash for specific token identification
+   249→    expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+   250→  });
+   251→
+   252→  const jwt = await generateRefreshTokenJWT(userId, tokenHash);
+   253→
+   254→  return { jwt, tokenHash, hashFull };
+   255→}
+   256→
+   257→// ─── Validation Schemas ───────────────────────────────────
+   258→
+   259→const MFASetupSchema = z.object({
+   260→  password: z.string().min(1, 'Password is required to setup MFA'),
+   261→});
+   262→
+   263→const MFAVerifySchema = z.object({
+   264→  code: z.string().length(6, 'Code must be 6 digits'),
+   265→  sessionId: z.string().optional(),
+   266→});
+   267→
+   268→const MFAEnableSchema = z.object({
+   269→  secret: z.string().min(1, 'Secret is required'),
+   270→  code: z.string().length(6, 'Verification code is required'),
+   271→});
+   272→
+   273→const MFADisableSchema = z.object({
+   274→  password: z.string().min(1, 'Password is required to disable MFA'),
+   275→  code: z.string().length(6, 'MFA code is required').optional(),
+   276→  backupCode: z.string().optional(),
+   277→});
+   278→
+   279→const MFALoginVerifySchema = z.object({
+   280→  email: z.string().email(),
+   281→  code: z.string().length(6, 'Code must be 6 digits').optional(),
+   282→  backupCode: z.string().optional(),
+   283→  sessionId: z.string().min(1, 'Session ID is required'),
+   284→});
+   285→
+   286→const MFABackupCodesSchema = z.object({
+   287→  password: z.string().min(1, 'Password is required to generate backup codes'),
+   288→});
+   289→
+   290→// Helper: extract client IP
+   291→function getClientIp(c: any): string {
+   292→  return c.req.header('X-Forwarded-For')?.split(',')[0]?.trim()
+   293→    || c.req.header('X-Real-IP')
+   294→    || 'unknown';
+   295→}
+   296→
+   297→// Helper: extract user agent
+   298→function getUserAgent(c: any): string {
+   299→  return c.req.header('User-Agent') || 'unknown';
+   300→}
+   301→
+   302→// ═══════════════════════════════════════════════════════════
+   303→// Register
+   304→// ═══════════════════════════════════════════════════════════
+   305→
+   306→auth.post('/register', strictAuthRateLimiter, zValidator('json', RegisterSchema), async (c) => {
+   307→  const data = c.req.valid('json');
+   308→  const ipAddress = getClientIp(c);
+   309→  const userAgent = getUserAgent(c);
+   310→
+   311→  const doRegister = async () => {
+   312→    // Check existing user
+   313→    const existing = await db.select().from(users).where(eq(users.email, data.email)).limit(1);
+   314→    if (existing.length > 0) {
+   315→      return { result: c.json({ success: false, error: 'Email already registered' }, 409) };
+   316→    }
+   317→
+   318→    // Create user
+   319→    const passwordHash = await bcrypt.hash(data.password, 12);
+   320→    const userId = uuidv4();
+   321→
+   322→    await db.insert(users).values({
+   323→      id: userId,
+   324→      email: data.email,
+   325→      name: data.name,
+   326→      passwordHash,
+   327→      tier: 'free',
+   328→    });
+   329→
+   330→    // Generate tokens with full claims (P2.1.4)
+   331→    const accessToken = await generateAccessToken(userId, 'free');
+   332→    const { jwt: refreshTokenJwt } = await createRefreshToken(userId);
+   333→
+   334→    // Audit: registration
+   335→    await auditTrailService.record({
+   336→      action: 'auth.register',
+   337→      actorId: userId,
+   338→      actorType: 'user',
+   339→      resourceType: 'user',
+   340→      resourceId: userId,
+   341→      details: { email: data.email },
+   342→      ipAddress,
+   343→      userAgent,
+   344→      success: true,
+   345→      riskLevel: 'low',
+   346→    });
+   347→
+   348→    return {
+   349→      result: c.json({
+   350→        success: true,
+   351→        data: {
+   352→          user: { id: userId, email: data.email, name: data.name, tier: 'free' },
+   353→          tokens: { accessToken, refreshToken: refreshTokenJwt, expiresIn: 900 },
+   354→        },
+   355→      }, 201),
+   356→      userId,
+   357→    };
+   358→  };
+   359→
+   360→  if (tracingService.isEnabled()) {
+   361→    return await tracingService.withSpan(
+   362→      { name: 'auth.register', attributes: { 'auth.method': 'password' } },
+   363→      async (span) => {
+   364→        const { result } = await doRegister();
+   365→        span.setAttribute('auth.success', true);
+   366→        return result;
+   367→      },
+   368→    );
+   369→  } else {
+   370→    const { result } = await doRegister();
+   371→    return result;
+   372→  }
+   373→});
+   374→
+   375→// ═══════════════════════════════════════════════════════════
+   376→// Login (with MFA check + Threat Detection)
+   377→// ═══════════════════════════════════════════════════════════
+   378→
+   379→auth.post('/login', strictAuthRateLimiter, zValidator('json', LoginSchema), async (c) => {
+   380→  const data = c.req.valid('json');
+   381→  const ipAddress = getClientIp(c);
+   382→  const userAgent = getUserAgent(c);
+   383→
+   384→  const doLogin = async () => {
+   385→    // ── Account Lockout: Check if email or IP is locked ──
+   386→    const emailLocked = await checkAccountLockout(data.email);
+   387→    const ipLocked = await checkAccountLockout(ipAddress);
+   388→    if (emailLocked || ipLocked) {
+   389→      return { result: c.json({ success: false, error: 'Account temporarily locked due to too many failed attempts. Try again in 15 minutes.' }, 423), mfaRequired: false };
+   390→    }
+   391→
+   392→    // ── Threat Detection: Check if IP is blocked ──
+   393→    if (threatDetectionService.isBlocked(ipAddress)) {
+   394→      await auditTrailService.record({
+   395→        action: 'auth.login',
+   396→        actorId: 'unknown',
+   397→        actorType: 'user',
+   398→        resourceType: 'user',
+   399→        resourceId: 'unknown',
+   400→        details: { reason: 'IP blocked by threat detection' },
+   401→        ipAddress,
+   402→        userAgent,
+   403→        success: false,
+   404→        riskLevel: 'high',
+   405→      });
+   406→
+   407→      return { result: c.json({ success: false, error: 'Access temporarily restricted. Try again later.' }, 429), mfaRequired: false };
+   408→    }
+   409→
+   410→    const userRows = await db.select().from(users).where(eq(users.email, data.email)).limit(1);
+   411→    const user = userRows[0];
+   412→
+   413→    if (!user || !(await bcrypt.compare(data.password, user.passwordHash))) {
+   414→      // ── Account Lockout: Record failed login attempt ──
+   415→      await recordFailedLoginAttempt(data.email);
+   416→      await recordFailedLoginAttempt(ipAddress);
+   417→
+   418→      // ── Threat Detection: Record failed login ──
+   419→      const threatAlert = threatDetectionService.recordFailedLogin(
+   420→        user?.id || data.email,
+   421→        ipAddress
+   422→      );
+   423→
+   424→      // Audit: failed login
+   425→      await auditTrailService.record({
+   426→        action: 'auth.login',
+   427→        actorId: user?.id || 'unknown',
+   428→        actorType: 'user',
+   429→        resourceType: 'user',
+   430→        resourceId: user?.id || 'unknown',
+   431→        details: { reason: 'Invalid credentials', threatAlert: threatAlert?.id },
+   432→        ipAddress,
+   433→        userAgent,
+   434→        success: false,
+   435→        riskLevel: threatAlert ? 'high' : 'medium',
+   436→      });
+   437→
+   438→      return { result: c.json({ success: false, error: 'Invalid email or password' }, 401), mfaRequired: false };
+   439→    }
+   440→
+   441→    // ── Threat Detection: Record successful login (resets user counters) ──
+   442→    threatDetectionService.recordSuccessfulLogin(user.id, ipAddress);
+   443→
+   444→    // ── Account Lockout: Reset failed login attempts on success ──
+   445→    await resetFailedLoginAttempts(data.email);
+   446→    await resetFailedLoginAttempts(ipAddress);
+   447→
+   448→    // ── MFA Check: If MFA is enabled, return mfaRequired flag ──
+   449→    if (user.mfaEnabled) {
+   450→      // Create a pending session (not yet MFA-verified)
+   451→      const fingerprint = sessionManager.generateFingerprint(userAgent, ipAddress);
+   452→      const session = await sessionManager.createSession(user.id, fingerprint, ipAddress, userAgent);
+   453→
+   454→      // Issue a temporary MFA token with full claims (P2.1.4)
+   455→      const mfaToken = await generateMFAPendingToken(user.id, session.id);
+   456→
+   457→      // Audit: MFA required
+   458→      await auditTrailService.record({
+   459→        action: 'auth.login',
+   460→        actorId: user.id,
+   461→        actorType: 'user',
+   462→        resourceType: 'user',
+   463→        resourceId: user.id,
+   464→        details: { reason: 'MFA verification required' },
+   465→        ipAddress,
+   466→        userAgent,
+   467→        success: false,
+   468→        riskLevel: 'low',
+   469→      });
+   470→
+   471→      return {
+   472→        result: c.json({
+   473→          success: true,
+   474→          mfaRequired: true,
+   475→          data: {
+   476→            mfaToken,
+   477→            sessionId: session.id,
+   478→            message: 'MFA verification required',
+   479→          },
+   480→        }),
+   481→        userId: user.id,
+   482→        mfaRequired: true,
+   483→      };
+   484→    }
+   485→
+   486→    // ── No MFA: Issue full tokens ──
+   487→    const accessToken = await generateAccessToken(user.id, user.tier);
+   488→    const { jwt: refreshTokenJwt } = await createRefreshToken(user.id);
+   489→
+   490→    // Create session
+   491→    const fingerprint = sessionManager.generateFingerprint(userAgent, ipAddress);
+   492→    const session = await sessionManager.createSession(user.id, fingerprint, ipAddress, userAgent);
+   493→    await sessionManager.verifyMfa(session.id); // Mark as MFA-verified since no MFA required
+   494→
+   495→    // Audit: successful login
+   496→    await auditTrailService.record({
+   497→      action: 'auth.login',
+   498→      actorId: user.id,
+   499→      actorType: 'user',
+   500→      resourceType: 'user',
+   501→      resourceId: user.id,
+   502→      details: { mfaUsed: false },
+   503→      ipAddress,
+   504→      userAgent,
+   505→      success: true,
+   506→      riskLevel: 'low',
+   507→    });
+   508→
+   509→    return {
+   510→      result: c.json({
+   511→        success: true,
+   512→        mfaRequired: false,
+   513→        data: {
+   514→          user: { id: user.id, email: user.email, name: user.name, tier: user.tier, mfaEnabled: false },
+   515→          tokens: { accessToken, refreshToken: refreshTokenJwt, expiresIn: 900 },
+   516→        },
+   517→      }),
+   518→      userId: user.id,
+   519→      mfaRequired: false,
+   520→    };
+   521→  };
+   522→
+   523→  if (tracingService.isEnabled()) {
+   524→    return await tracingService.withSpan(
+   525→      { name: 'auth.login', attributes: { 'auth.method': 'password' } },
+   526→      async (span) => {
+   527→        const { result, userId, mfaRequired } = await doLogin();
+   528→        if (userId) {
+   529→          span.setAttribute('auth.user_id', userId);
+   530→          span.setAttribute('auth.mfa_required', mfaRequired ?? false);
+   531→          span.setAttribute('auth.success', true);
+   532→        }
+   533→        return result;
+   534→      },
+   535→    );
+   536→  } else {
+   537→    const { result } = await doLogin();
+   538→    return result;
+   539→  }
+   540→});
+   541→
+   542→// ═══════════════════════════════════════════════════════════
+   543→// MFA Login Verification (second step for MFA-enabled users)
+   544→// ═══════════════════════════════════════════════════════════
+   545→
+   546→auth.post('/mfa/login-verify', strictAuthRateLimiter, zValidator('json', MFALoginVerifySchema), async (c) => {
+   547→  const data = c.req.valid('json');
+   548→  const ipAddress = getClientIp(c);
+   549→  const userAgent = getUserAgent(c);
+   550→
+   551→  const doMfaVerify = async () => {
+   552→    // Validate session
+   553→    const sessionResult = await sessionManager.validateSession(data.sessionId);
+   554→    if (!sessionResult.valid || !sessionResult.session) {
+   555→      return { result: c.json({ success: false, error: 'Invalid or expired session' }, 401), userId: undefined as string | undefined, method: data.code ? 'totp' : 'backup' as string };
+   556→    }
+   557→
+   558→    const session = sessionResult.session;
+   559→    const userId = session.userId;
+   560→
+   561→    // Fetch user with MFA data
+   562→    const userRows = await db.select().from(users).where(eq(users.id, userId)).limit(1);
+   563→    const user = userRows[0];
+   564→
+   565→    if (!user || !user.mfaEnabled || !user.mfaSecret) {
+   566→      return { result: c.json({ success: false, error: 'MFA not enabled for this account' }, 400), userId, method: data.code ? 'totp' : 'backup' };
+   567→    }
+   568→
+   569→    // Verify TOTP code or backup code — P2.1.1: Use encrypted verification
+   570→    let verified = false;
+   571→
+   572→    if (data.code) {
+   573→      // P2.1.1: Decrypt secret and verify TOTP code
+   574→      verified = mfaService.verifyWithEncryptedSecret(user.mfaSecret, data.code);
+   575→    } else if (data.backupCode) {
+   576→      // P2.1.1: Verify against encrypted backup codes
+   577→      const backupCodes = (user.mfaBackupCodes as string[]) || [];
+   578→      const result = mfaService.verifyEncryptedBackupCode(backupCodes, data.backupCode);
+   579→      if (result.valid) {
+   580→        // Update backup codes in DB (remove used one)
+   581→        await db.update(users)
+   582→          .set({ mfaBackupCodes: result.remainingEncrypted })
+   583→          .where(eq(users.id, userId));
+   584→        verified = true;
+   585→      }
+   586→    }
+   587→
+   588→    if (!verified) {
+   589→      // Record failed MFA attempt
+   590→      threatDetectionService.recordFailedLogin(userId, ipAddress);
+   591→
+   592→      await auditTrailService.record({
+   593→        action: 'auth.mfa_verify',
+   594→        actorId: userId,
+   595→        actorType: 'user',
+   596→        resourceType: 'user',
+   597→        resourceId: userId,
+   598→        details: { method: data.code ? 'totp' : 'backup', success: false },
+   599→        ipAddress,
+   600→        userAgent,
+   601→        success: false,
+   602→        riskLevel: 'medium',
+   603→      });
+   604→
+   605→      return { result: c.json({ success: false, error: 'Invalid MFA code' }, 401), userId, method: data.code ? 'totp' : 'backup' };
+   606→    }
+   607→
+   608→    // MFA verified — mark session
+   609→    await sessionManager.verifyMfa(session.id);
+   610→
+   611→    // Issue full tokens with full claims (P2.1.4)
+   612→    const accessToken = await generateAccessToken(user.id, user.tier);
+   613→    const { jwt: refreshTokenJwt } = await createRefreshToken(user.id);
+   614→
+   615→    // Audit: successful MFA login
+   616→    await auditTrailService.record({
+   617→      action: 'auth.mfa_verify',
+   618→      actorId: userId,
+   619→      actorType: 'user',
+   620→      resourceType: 'user',
+   621→      resourceId: userId,
+   622→      details: { method: data.code ? 'totp' : 'backup', success: true },
+   623→      ipAddress,
+   624→      userAgent,
+   625→      success: true,
+   626→      riskLevel: 'low',
+   627→    });
+   628→
+   629→    return {
+   630→      result: c.json({
+   631→        success: true,
+   632→        data: {
+   633→          user: { id: user.id, email: user.email, name: user.name, tier: user.tier, mfaEnabled: true },
+   634→          tokens: { accessToken, refreshToken: refreshTokenJwt, expiresIn: 900 },
+   635→        },
+   636→      }),
+   637→      userId,
+   638→      method: data.code ? 'totp' : 'backup',
+   639→    };
+   640→  };
+   641→
+   642→  if (tracingService.isEnabled()) {
+   643→    return await tracingService.withSpan(
+   644→      { name: 'auth.mfa_verify', attributes: { 'auth.mfa_method': data.code ? 'totp' : 'backup' } },
+   645→      async (span) => {
+   646→        const { result, userId, method } = await doMfaVerify();
+   647→        if (userId) {
+   648→          span.setAttribute('auth.user_id', userId);
+   649→          span.setAttribute('auth.mfa_method', method ?? 'unknown');
+   650→        }
+   651→        return result;
+   652→      },
+   653→    );
+   654→  } else {
+   655→    const { result } = await doMfaVerify();
+   656→    return result;
+   657→  }
+   658→});
+   659→
+   660→// ═══════════════════════════════════════════════════════════
+   661→// MFA Setup - Generate TOTP secret (requires auth)
+   662→// P2.1.1: Encrypt secrets before storage
+   663→// ═══════════════════════════════════════════════════════════
+   664→
+   665→auth.post('/mfa/setup', mfaRateLimiter, zValidator('json', MFASetupSchema), async (c) => {
+   666→  const authHeader = c.req.header('Authorization');
+   667→  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+   668→    return c.json({ success: false, error: 'Authentication required' }, 401);
+   669→  }
+   670→
+   671→  const token = authHeader.substring(7);
+   672→  const ipAddress = getClientIp(c);
+   673→  const userAgent = getUserAgent(c);
+   674→
+   675→  try {
+   676→    const payload = await verify(token, env.JWT_SECRET, 'HS256') as { sub: string };
+   677→    const userId = payload.sub;
+   678→
+   679→    const data = c.req.valid('json');
+   680→
+   681→    // Verify password
+   682→    const userRows = await db.select().from(users).where(eq(users.id, userId)).limit(1);
+   683→    const user = userRows[0];
+   684→
+   685→    if (!user) {
+   686→      return c.json({ success: false, error: 'User not found' }, 404);
+   687→    }
+   688→
+   689→    if (!(await bcrypt.compare(data.password, user.passwordHash))) {
+   690→      return c.json({ success: false, error: 'Invalid password' }, 401);
+   691→    }
+   692→
+   693→    if (user.mfaEnabled) {
+   694→      return c.json({ success: false, error: 'MFA is already enabled. Disable it first to reconfigure.' }, 400);
+   695→    }
+   696→
+   697→    // Generate TOTP secret — P2.1.1: Returns both raw (for QR) and encrypted (for DB)
+   698→    const { secret, encryptedSecret, qrCodeUrl, backupCodes, encryptedBackupCodes } = mfaService.generateSecret(user.email);
+   699→
+   700→    // Store ENCRYPTED secret and backup codes in DB — P2.1.1
+   701→    await db.update(users)
+   702→      .set({ mfaSecret: encryptedSecret, mfaBackupCodes: encryptedBackupCodes })
+   703→      .where(eq(users.id, userId));
+   704→
+   705→    // Audit: MFA setup initiated — P2.1.1: Never log the raw secret
+   706→    await auditTrailService.record({
+   707→      action: 'auth.mfa_enable',
+   708→      actorId: userId,
+   709→      actorType: 'user',
+   710→      resourceType: 'user',
+   711→      resourceId: userId,
+   712→      details: { step: 'setup_initiated' },
+   713→      ipAddress,
+   714→      userAgent,
+   715→      success: true,
+   716→      riskLevel: 'medium',
+   717→    });
+   718→
+   719→    return c.json({
+   720→      success: true,
+   721→      data: {
+   722→        secret,        // Raw secret returned once for QR code setup
+   723→        qrCodeUrl,
+   724→        backupCodes,   // Raw backup codes returned once for user to save
+   725→      },
+   726→    });
+   727→  } catch {
+   728→    return c.json({ success: false, error: 'Invalid token' }, 401);
+   729→  }
+   730→});
+   731→
+   732→// ═══════════════════════════════════════════════════════════
+   733→// MFA Enable - Verify and enable MFA (requires auth)
+   734→// P2.1.1: Verify against encrypted secret
+   735→// ═══════════════════════════════════════════════════════════
+   736→
+   737→auth.post('/mfa/enable', mfaRateLimiter, zValidator('json', MFAEnableSchema), async (c) => {
+   738→  const authHeader = c.req.header('Authorization');
+   739→  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+   740→    return c.json({ success: false, error: 'Authentication required' }, 401);
+   741→  }
+   742→
+   743→  const token = authHeader.substring(7);
+   744→  const ipAddress = getClientIp(c);
+   745→  const userAgent = getUserAgent(c);
+   746→
+   747→  try {
+   748→    const payload = await verify(token, env.JWT_SECRET, 'HS256') as { sub: string };
+   749→    const userId = payload.sub;
+   750→
+   751→    const data = c.req.valid('json');
+   752→
+   753→    const userRows = await db.select().from(users).where(eq(users.id, userId)).limit(1);
+   754→    const user = userRows[0];
+   755→
+   756→    if (!user) {
+   757→      return c.json({ success: false, error: 'User not found' }, 404);
+   758→    }
+   759→
+   760→    if (user.mfaEnabled) {
+   761→      return c.json({ success: false, error: 'MFA is already enabled' }, 400);
+   762→    }
+   763→
+   764→    if (!user.mfaSecret) {
+   765→      return c.json({ success: false, error: 'MFA not set up. Call /mfa/setup first.' }, 400);
+   766→    }
+   767→
+   768→    // P2.1.1: Verify the provided code against the ENCRYPTED secret
+   769→    if (!mfaService.verifyWithEncryptedSecret(user.mfaSecret, data.code)) {
+   770→      return c.json({ success: false, error: 'Invalid verification code. Please try again.' }, 400);
+   771→    }
+   772→
+   773→    // Enable MFA
+   774→    await db.update(users)
+   775→      .set({ mfaEnabled: true })
+   776→      .where(eq(users.id, userId));
+   777→
+   778→    // Trust current device
+   779→    const fingerprint = sessionManager.generateFingerprint(userAgent, ipAddress);
+   780→    await sessionManager.trustDevice(userId, fingerprint);
+   781→
+   782→    // Audit: MFA enabled — P2.1.1: No secret in audit log
+   783→    await auditTrailService.record({
+   784→      action: 'auth.mfa_enable',
+   785→      actorId: userId,
+   786→      actorType: 'user',
+   787→      resourceType: 'user',
+   788→      resourceId: userId,
+   789→      details: { step: 'enabled' },
+   790→      ipAddress,
+   791→      userAgent,
+   792→      success: true,
+   793→      riskLevel: 'medium',
+   794→    });
+   795→
+   796→    return c.json({
+   797→      success: true,
+   798→      message: 'MFA has been enabled for your account',
+   799→    });
+   800→  } catch {
+   801→    return c.json({ success: false, error: 'Invalid token' }, 401);
+   802→  }
+   803→});
+   804→
+   805→// ═══════════════════════════════════════════════════════════
+   806→// MFA Disable (requires auth + password + MFA code)
+   807→// P2.1.1: Verify against encrypted secret/codes
+   808→// ═══════════════════════════════════════════════════════════
+   809→
+   810→auth.post('/mfa/disable', mfaRateLimiter, zValidator('json', MFADisableSchema), async (c) => {
+   811→  const authHeader = c.req.header('Authorization');
+   812→  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+   813→    return c.json({ success: false, error: 'Authentication required' }, 401);
+   814→  }
+   815→
+   816→  const token = authHeader.substring(7);
+   817→  const ipAddress = getClientIp(c);
+   818→  const userAgent = getUserAgent(c);
+   819→
+   820→  try {
+   821→    const payload = await verify(token, env.JWT_SECRET, 'HS256') as { sub: string };
+   822→    const userId = payload.sub;
+   823→
+   824→    const data = c.req.valid('json');
+   825→
+   826→    const userRows = await db.select().from(users).where(eq(users.id, userId)).limit(1);
+   827→    const user = userRows[0];
+   828→
+   829→    if (!user) {
+   830→      return c.json({ success: false, error: 'User not found' }, 404);
+   831→    }
+   832→
+   833→    if (!user.mfaEnabled) {
+   834→      return c.json({ success: false, error: 'MFA is not enabled' }, 400);
+   835→    }
+   836→
+   837→    // Verify password
+   838→    if (!(await bcrypt.compare(data.password, user.passwordHash))) {
+   839→      return c.json({ success: false, error: 'Invalid password' }, 401);
+   840→    }
+   841→
+   842→    // Verify MFA code or backup code — P2.1.1: Use encrypted verification
+   843→    let mfaVerified = false;
+   844→    if (data.code && user.mfaSecret) {
+   845→      mfaVerified = mfaService.verifyWithEncryptedSecret(user.mfaSecret, data.code);
+   846→    } else if (data.backupCode) {
+   847→      const backupCodes = (user.mfaBackupCodes as string[]) || [];
+   848→      const result = mfaService.verifyEncryptedBackupCode(backupCodes, data.backupCode);
+   849→      if (result.valid) {
+   850→        mfaVerified = true;
+   851→        // Update remaining backup codes
+   852→        await db.update(users)
+   853→          .set({ mfaBackupCodes: result.remainingEncrypted })
+   854→          .where(eq(users.id, userId));
+   855→      }
+   856→    }
+   857→
+   858→    if (!mfaVerified) {
+   859→      return c.json({ success: false, error: 'Valid MFA code or backup code required' }, 401);
+   860→    }
+   861→
+   862→    // Disable MFA — clear encrypted secret and codes
+   863→    await db.update(users)
+   864→      .set({ mfaEnabled: false, mfaSecret: null, mfaBackupCodes: null })
+   865→      .where(eq(users.id, userId));
+   866→
+   867→    // Destroy all existing sessions (force re-login)
+   868→    await sessionManager.destroyAllUserSessions(userId);
+   869→
+   870→    // Audit: MFA disabled
+   871→    await auditTrailService.record({
+   872→      action: 'auth.mfa_enable',
+   873→      actorId: userId,
+   874→      actorType: 'user',
+   875→      resourceType: 'user',
+   876→      resourceId: userId,
+   877→      details: { step: 'disabled' },
+   878→      ipAddress,
+   879→      userAgent,
+   880→      success: true,
+   881→      riskLevel: 'high',
+   882→    });
+   883→
+   884→    return c.json({
+   885→      success: true,
+   886→      message: 'MFA has been disabled. All sessions have been terminated for security.',
+   887→    });
+   888→  } catch {
+   889→    return c.json({ success: false, error: 'Invalid token' }, 401);
+   890→  }
+   891→});
+   892→
+   893→// ═══════════════════════════════════════════════════════════
+   894→// MFA Verify - Verify a TOTP code (for ongoing session verification)
+   895→// P2.1.1: Verify against encrypted secret
+   896→// ═══════════════════════════════════════════════════════════
+   897→
+   898→auth.post('/mfa/verify', strictAuthRateLimiter, zValidator('json', MFAVerifySchema), async (c) => {
+   899→  const authHeader = c.req.header('Authorization');
+   900→  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+   901→    return c.json({ success: false, error: 'Authentication required' }, 401);
+   902→  }
+   903→
+   904→  const token = authHeader.substring(7);
+   905→  const ipAddress = getClientIp(c);
+   906→  const userAgent = getUserAgent(c);
+   907→
+   908→  try {
+   909→    const payload = await verify(token, env.JWT_SECRET, 'HS256') as { sub: string };
+   910→    const userId = payload.sub;
+   911→
+   912→    const data = c.req.valid('json');
+   913→
+   914→    const userRows = await db.select().from(users).where(eq(users.id, userId)).limit(1);
+   915→    const user = userRows[0];
+   916→
+   917→    if (!user) {
+   918→      return c.json({ success: false, error: 'User not found' }, 404);
+   919→    }
+   920→
+   921→    if (!user.mfaEnabled || !user.mfaSecret) {
+   922→      return c.json({ success: false, error: 'MFA is not enabled' }, 400);
+   923→    }
+   924→
+   925→    // P2.1.1: Verify the TOTP code against the ENCRYPTED secret
+   926→    const verified = mfaService.verifyWithEncryptedSecret(user.mfaSecret, data.code);
+   927→
+   928→    if (!verified) {
+   929→      await auditTrailService.record({
+   930→        action: 'auth.mfa_verify',
+   931→        actorId: userId,
+   932→        actorType: 'user',
+   933→        resourceType: 'user',
+   934→        resourceId: userId,
+   935→        details: { success: false },
+   936→        ipAddress,
+   937→        userAgent,
+   938→        success: false,
+   939→        riskLevel: 'medium',
+   940→      });
+   941→
+   942→      return c.json({ success: false, error: 'Invalid MFA code' }, 401);
+   943→    }
+   944→
+   945→    // Mark session as MFA-verified if sessionId provided
+   946→    if (data.sessionId) {
+   947→      await sessionManager.verifyMfa(data.sessionId);
+   948→    }
+   949→
+   950→    // Audit: successful MFA verify
+   951→    await auditTrailService.record({
+   952→      action: 'auth.mfa_verify',
+   953→      actorId: userId,
+   954→      actorType: 'user',
+   955→      resourceType: 'user',
+   956→      resourceId: userId,
+   957→      details: { success: true },
+   958→      ipAddress,
+   959→      userAgent,
+   960→      success: true,
+   961→      riskLevel: 'low',
+   962→    });
+   963→
+   964→    return c.json({
+   965→      success: true,
+   966→      message: 'MFA code verified successfully',
+   967→    });
+   968→  } catch {
+   969→    return c.json({ success: false, error: 'Invalid token' }, 401);
+   970→  }
+   971→});
+   972→
+   973→// ═══════════════════════════════════════════════════════════
+   974→// MFA Backup Codes - Generate new backup codes (requires auth)
+   975→// P2.1.1: Encrypt backup codes before storage
+   976→// ═══════════════════════════════════════════════════════════
+   977→
+   978→auth.post('/mfa/backup-codes', mfaRateLimiter, zValidator('json', MFABackupCodesSchema), async (c) => {
+   979→  const authHeader = c.req.header('Authorization');
+   980→  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+   981→    return c.json({ success: false, error: 'Authentication required' }, 401);
+   982→  }
+   983→
+   984→  const token = authHeader.substring(7);
+   985→  const ipAddress = getClientIp(c);
+   986→  const userAgent = getUserAgent(c);
+   987→
+   988→  try {
+   989→    const payload = await verify(token, env.JWT_SECRET, 'HS256') as { sub: string };
+   990→    const userId = payload.sub;
+   991→
+   992→    const data = c.req.valid('json');
+   993→
+   994→    const userRows = await db.select().from(users).where(eq(users.id, userId)).limit(1);
+   995→    const user = userRows[0];
+   996→
+   997→    if (!user) {
+   998→      return c.json({ success: false, error: 'User not found' }, 404);
+   999→    }
+  1000→
+  1001→    if (!user.mfaEnabled) {
+  1002→      return c.json({ success: false, error: 'MFA is not enabled' }, 400);
+  1003→    }
+  1004→
+  1005→    // Verify password
+  1006→    if (!(await bcrypt.compare(data.password, user.passwordHash))) {
+  1007→      return c.json({ success: false, error: 'Invalid password' }, 401);
+  1008→    }
+  1009→
+  1010→    // Generate new backup codes — P2.1.1: Encrypt before storage
+  1011→    const backupCodes: string[] = [];
+  1012→    for (let i = 0; i < 8; i++) {
+  1013→      backupCodes.push(randomBytes(4).toString('hex').toUpperCase());
+  1014→    }
+  1015→
+  1016→    const encryptedBackupCodes = mfaService.encryptBackupCodes(backupCodes);
+  1017→
+  1018→    // Update encrypted backup codes in DB
+  1019→    await db.update(users)
+  1020→      .set({ mfaBackupCodes: encryptedBackupCodes })
+  1021→      .where(eq(users.id, userId));
+  1022→
+  1023→    // Audit: backup codes regenerated — P2.1.1: No codes in audit log
+  1024→    await auditTrailService.record({
+  1025→      action: 'auth.mfa_enable',
+  1026→      actorId: userId,
+  1027→      actorType: 'user',
+  1028→      resourceType: 'user',
+  1029→      resourceId: userId,
+  1030→      details: { step: 'backup_codes_regenerated' },
+  1031→      ipAddress,
+  1032→      userAgent,
+  1033→      success: true,
+  1034→      riskLevel: 'medium',
+  1035→    });
+  1036→
+  1037→    return c.json({
+  1038→      success: true,
+  1039→      data: { backupCodes }, // Raw codes returned once for user to save
+  1040→    });
+  1041→  } catch {
+  1042→    return c.json({ success: false, error: 'Invalid token' }, 401);
+  1043→  }
+  1044→});
+  1045→
+  1046→// ═══════════════════════════════════════════════════════════
+  1047→// Refresh Token — P2.1.3: Rotation with reuse detection
+  1048→// P2.1.4: Full JWT claims validation
+  1049→// ═══════════════════════════════════════════════════════════
+  1050→
+  1051→auth.post('/refresh', async (c) => {
+  1052→  const { refreshToken } = await c.req.json();
+  1053→  if (!refreshToken) {
+  1054→    return c.json({ success: false, error: 'Refresh token required' }, 400);
+  1055→  }
+  1056→
+  1057→  const doRefresh = async () => {
+  1058→    try {
+  1059→      const payload = await verify(refreshToken, env.JWT_SECRET, 'HS256') as {
+  1060→        sub: string;
+  1061→        type: string;
+  1062→        tid: string;
+  1063→        jti?: string;
+  1064→        iss?: string;
+  1065→        aud?: string;
+  1066→      };
+  1067→
+  1068→      // P2.1.4: Validate token type
+  1069→      if (payload.type !== 'refresh') {
+  1070→        return { result: c.json({ success: false, error: 'Invalid token type' }, 401), userId: payload.sub };
+  1071→      }
+  1072→
+  1073→      // P2.1.4: Validate issuer and audience
+  1074→      if (payload.iss && payload.iss !== env.JWT_ISSUER) {
+  1075→        return { result: c.json({ success: false, error: 'Invalid token issuer' }, 401), userId: payload.sub };
+  1076→      }
+  1077→      if (payload.aud && payload.aud !== env.JWT_AUDIENCE) {
+  1078→        return { result: c.json({ success: false, error: 'Invalid token audience' }, 401), userId: payload.sub };
+  1079→      }
+  1080→
+  1081→      // P2.1.4: Check JWT blacklist
+  1082→      if (payload.jti && await jwtBlacklist.isBlacklisted(payload.jti)) {
+  1083→        return { result: c.json({ success: false, error: 'Token has been revoked' }, 401), userId: payload.sub };
+  1084→      }
+  1085→
+  1086→      // P2.1.3: Find the SPECIFIC refresh token by its hash (not just any user token)
+  1087→      const tokenHashPrefix = payload.tid;
+  1088→      const storedTokens = await db.select().from(refreshTokens).where(
+  1089→        and(
+  1090→          eq(refreshTokens.userId, payload.sub),
+  1091→          eq(refreshTokens.isRevoked, false),
+  1092→        )
+  1093→      ).limit(10); // Get all active tokens for this user
+  1094→
+  1095→      // P2.1.3: Find the specific token by matching the hash prefix
+  1096→      const matchingToken = storedTokens.find(t => t.tokenHash.startsWith(tokenHashPrefix) || t.tokenHash === tokenHashPrefix);
+  1097→
+  1098→      if (!matchingToken) {
+  1099→        // P2.1.3: Token not found — potential reuse attack
+  1100→        // Revoke ALL tokens for this user as a security measure
+  1101→        await db.update(refreshTokens)
+  1102→          .set({ isRevoked: true })
+  1103→          .where(eq(refreshTokens.userId, payload.sub));
+  1104→
+  1105→        // Audit: potential token reuse detected
+  1106→        await auditTrailService.record({
+  1107→          action: 'auth.token_refresh',
+  1108→          actorId: payload.sub,
+  1109→          actorType: 'user',
+  1110→          resourceType: 'user',
+  1111→          resourceId: payload.sub,
+  1112→          details: { reason: 'refresh_token_reuse_detected', allTokensRevoked: true },
+  1113→          ipAddress: getClientIp(c),
+  1114→          userAgent: getUserAgent(c),
+  1115→          success: false,
+  1116→          riskLevel: 'high',
+  1117→        });
+  1118→
+  1119→        return { result: c.json({ success: false, error: 'Token reuse detected. All sessions terminated.' }, 401), userId: payload.sub };
+  1120→      }
+  1121→
+  1122→      // P2.1.3: ROTATE — Revoke the used refresh token immediately
+  1123→      await db.update(refreshTokens)
+  1124→        .set({ isRevoked: true })
+  1125→        .where(eq(refreshTokens.id, matchingToken.id));
+  1126→
+  1127→      // P2.1.4: Blacklist the old JWT's jti to prevent replay
+  1128→      if (payload.jti) {
+  1129→        await jwtBlacklist.blacklist(payload.jti, 7 * 24 * 60 * 60); // 7 days
+  1130→      }
+  1131→
+  1132→      // Fetch the user to get the current tier
+  1133→      const userRows = await db.select().from(users).where(eq(users.id, payload.sub)).limit(1);
+  1134→      const user = userRows[0];
+  1135→
+  1136→      if (!user) {
+  1137→        return { result: c.json({ success: false, error: 'User not found' }, 401), userId: payload.sub };
+  1138→      }
+  1139→
+  1140→      // P2.1.3: Issue NEW refresh token (rotation)
+  1141→      const accessToken = await generateAccessToken(user.id, user.tier);
+  1142→      const { jwt: newRefreshTokenJwt } = await createRefreshToken(user.id);
+  1143→
+  1144→      // Audit: successful token refresh with rotation
+  1145→      await auditTrailService.record({
+  1146→        action: 'auth.token_refresh',
+  1147→        actorId: user.id,
+  1148→        actorType: 'user',
+  1149→        resourceType: 'user',
+  1150→        resourceId: user.id,
+  1151→        details: { rotated: true, oldTokenRevoked: matchingToken.id },
+  1152→        ipAddress: getClientIp(c),
+  1153→        userAgent: getUserAgent(c),
+  1154→        success: true,
+  1155→        riskLevel: 'low',
+  1156→      });
+  1157→
+  1158→      return {
+  1159→        result: c.json({
+  1160→          success: true,
+  1161→          data: { accessToken, refreshToken: newRefreshTokenJwt, expiresIn: 900 },
+  1162→        }),
+  1163→        userId: user.id,
+  1164→      };
+  1165→    } catch {
+  1166→      return { result: c.json({ success: false, error: 'Invalid refresh token' }, 401), userId: undefined };
+  1167→    }
+  1168→  };
+  1169→
+  1170→  if (tracingService.isEnabled()) {
+  1171→    return await tracingService.withSpan(
+  1172→      { name: 'auth.token_refresh', attributes: { 'auth.operation': 'refresh' } },
+  1173→      async (span) => {
+  1174→        const { result, userId } = await doRefresh();
+  1175→        if (userId) {
+  1176→          span.setAttribute('auth.user_id', userId);
+  1177→        }
+  1178→        return result;
+  1179→      },
+  1180→    );
+  1181→  } else {
+  1182→    const { result } = await doRefresh();
+  1183→    return result;
+  1184→  }
+  1185→});
+  1186→
+  1187→// ═══════════════════════════════════════════════════════════
+  1188→// Logout — P2.1.3: Revoke specific token (not all tokens)
+  1189→// P2.1.4: Blacklist the JWT's jti
+  1190→// ═══════════════════════════════════════════════════════════
+  1191→
+  1192→auth.post('/logout', async (c) => {
+  1193→  const { refreshToken } = await c.req.json();
+  1194→  if (!refreshToken) {
+  1195→    return c.json({ success: true, message: 'Logged out' });
+  1196→  }
+  1197→
+  1198→  const doLogout = async () => {
+  1199→    try {
+  1200→      const payload = await verify(refreshToken, env.JWT_SECRET, 'HS256') as { sub: string; tid: string; jti?: string };
+  1201→
+  1202→      // P2.1.3: Revoke the SPECIFIC refresh token (not all user tokens)
+  1203→      const tokenHashPrefix = payload.tid;
+  1204→      const storedTokens = await db.select().from(refreshTokens).where(
+  1205→        and(
+  1206→          eq(refreshTokens.userId, payload.sub),
+  1207→          eq(refreshTokens.isRevoked, false),
+  1208→        )
+  1209→      ).limit(10);
+  1210→
+  1211→      const matchingToken = storedTokens.find(t => t.tokenHash.startsWith(tokenHashPrefix) || t.tokenHash === tokenHashPrefix);
+  1212→
+  1213→      if (matchingToken) {
+  1214→        // Revoke only this specific token
+  1215→        await db.update(refreshTokens)
+  1216→          .set({ isRevoked: true })
+  1217→          .where(eq(refreshTokens.id, matchingToken.id));
+  1218→      }
+  1219→
+  1220→      // P2.1.4: Blacklist the JWT's jti
+  1221→      if (payload.jti) {
+  1222→        await jwtBlacklist.blacklist(payload.jti, 7 * 24 * 60 * 60); // 7 days
+  1223→      }
+  1224→
+  1225→      // Audit: logout
+  1226→      await auditTrailService.record({
+  1227→        action: 'auth.logout',
+  1228→        actorId: payload.sub,
+  1229→        actorType: 'user',
+  1230→        resourceType: 'user',
+  1231→        resourceId: payload.sub,
+  1232→        details: { specificTokenRevoked: !!matchingToken },
+  1233→        ipAddress: getClientIp(c),
+  1234→        userAgent: getUserAgent(c),
+  1235→        success: true,
+  1236→        riskLevel: 'low',
+  1237→      });
+  1238→
+  1239→      return { result: c.json({ success: true, message: 'Logged out successfully' }), userId: payload.sub };
+  1240→    } catch {
+  1241→      return { result: c.json({ success: true, message: 'Logged out' }), userId: undefined };
+  1242→    }
+  1243→  };
+  1244→
+  1245→  if (tracingService.isEnabled()) {
+  1246→    return await tracingService.withSpan(
+  1247→      { name: 'auth.logout', attributes: { 'auth.operation': 'logout' } },
+  1248→      async (span) => {
+  1249→        const { result, userId } = await doLogout();
+  1250→        if (userId) {
+  1251→          span.setAttribute('auth.user_id', userId);
+  1252→        }
+  1253→        return result;
+  1254→      },
+  1255→    );
+  1256→  } else {
+  1257→    const { result } = await doLogout();
+  1258→    return result;
+  1259→  }
+  1260→});
+  1261→
+  1262→export { auth };
+  1263→

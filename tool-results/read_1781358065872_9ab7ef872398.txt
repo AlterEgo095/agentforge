@@ -1,0 +1,767 @@
+     1→     1→// ============================================================
+     2→     2→// AgentForge - Chaos Test: Cascading Failure
+     3→     3→// Verifies system resilience when multiple dependencies fail
+     4→     4→// simultaneously (Redis + PostgreSQL). Tests graceful degradation,
+     5→     5→// no crash under cascading failures, memory leak detection,
+     6→     6→// and recovery after cascading failure is resolved.
+     7→     7→// ============================================================
+     8→     8→
+     9→     9→import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+    10→    10→
+    11→    11→// ─── Mock Environment ────────────────────────────────────────
+    12→    12→
+    13→    13→vi.mock('../../packages/api/src/config/env', () => ({
+    14→    14→  env: {
+    15→    15→    NODE_ENV: 'test',
+    16→    16→    PORT: 3001,
+    17→    17→    DATABASE_URL: 'postgresql://agentforge:agentforge@localhost:5432/agentforge_test',
+    18→    18→    REDIS_URL: 'redis://localhost:6379',
+    19→    19→    JWT_SECRET: 'test-jwt-secret-key-for-chaos-testing-min-32-chars',
+    20→    20→    JWT_ACCESS_EXPIRY: '15m',
+    21→    21→    JWT_REFRESH_EXPIRY: '7d',
+    22→    22→    JWT_ISSUER: 'agentforge',
+    23→    23→    JWT_AUDIENCE: 'agentforge-api',
+    24→    24→    MFA_ENCRYPTION_KEY: 'test-mfa-encryption-key-for-chaos-testing',
+    25→    25→    OPENAI_API_KEY: 'test-openai-key',
+    26→    26→    ANTHROPIC_API_KEY: 'test-anthropic-key',
+    27→    27→    GOOGLE_API_KEY: 'test-google-key',
+    28→    28→    DEEPSEEK_API_KEY: 'test-deepseek-key',
+    29→    29→    MISTRAL_API_KEY: 'test-mistral-key',
+    30→    30→    TOGETHER_API_KEY: 'test-together-key',
+    31→    31→    DASHSCOPE_API_KEY: 'test-dashscope-key',
+    32→    32→    FORCE_HTTPS: 'false',
+    33→    33→    TRUST_PROXY: 'false',
+    34→    34→  },
+    35→    35→}));
+    36→    36→
+    37→    37→// ─── Mock Telemetry ───────────────────────────────────────────
+    38→    38→
+    39→    39→vi.mock('../../packages/api/src/services/telemetry/TracingService', () => ({
+    40→    40→  tracingService: {
+    41→    41→    isEnabled: () => false,
+    42→    42→    addEvent: vi.fn(),
+    43→    43→    withSpan: vi.fn((_opts: any, fn: any) => fn({ setAttribute: vi.fn() })),
+    44→    44→  },
+    45→    45→}));
+    46→    46→
+    47→    47→vi.mock('../../packages/api/src/services/telemetry/MetricsService', () => ({
+    48→    48→  metricsService: {
+    49→    49→    isEnabled: () => false,
+    50→    50→    recordLLMCallDuration: vi.fn(),
+    51→    51→    recordTokenUsage: vi.fn(),
+    52→    52→  },
+    53→    53→}));
+    54→    54→
+    55→    55→vi.mock('../../packages/api/src/services/telemetry/AlertManager', () => ({
+    56→    56→  alertManager: {
+    57→    57→    getActiveAlerts: vi.fn().mockReturnValue([]),
+    58→    58→    getRules: vi.fn().mockReturnValue([]),
+    59→    59→    getAlert: vi.fn().mockReturnValue(null),
+    60→    60→    evaluateMetric: vi.fn(),
+    61→    61→    acknowledge: vi.fn().mockReturnValue(true),
+    62→    62→    getHistory: vi.fn().mockReturnValue([]),
+    63→    63→  },
+    64→    64→}));
+    65→    65→
+    66→    66→vi.mock('../../packages/api/src/services/telemetry', () => ({
+    67→    67→  initTelemetry: vi.fn(),
+    68→    68→  getSDK: vi.fn().mockReturnValue(null),
+    69→    69→  shutdownTelemetry: vi.fn().mockResolvedValue(undefined),
+    70→    70→}));
+    71→    71→
+    72→    72→// ─── Mock Event Manager ──────────────────────────────────────
+    73→    73→
+    74→    74→vi.mock('../../packages/api/src/services/EventManager', () => ({
+    75→    75→  eventManager: {
+    76→    76→    getClientCount: vi.fn().mockReturnValue(0),
+    77→    77→  },
+    78→    78→}));
+    79→    79→
+    80→    80→// ─── Mock Security Services ───────────────────────────────────
+    81→    81→
+    82→    82→vi.mock('../../packages/api/src/services/security/EncryptionService', () => ({
+    83→    83→  encryptionService: {
+    84→    84→    initialize: vi.fn(),
+    85→    85→    encrypt: vi.fn().mockReturnValue({ encrypted: 'test', iv: 'test', tag: 'test' }),
+    86→    86→    decrypt: vi.fn().mockReturnValue('test'),
+    87→    87→  },
+    88→    88→}));
+    89→    89→
+    90→    90→vi.mock('../../packages/api/src/services/security/SecretRotationService', () => ({
+    91→    91→  secretRotationService: {
+    92→    92→    initialize: vi.fn(),
+    93→    93→    startPeriodicCheck: vi.fn(),
+    94→    94→    stopPeriodicCheck: vi.fn(),
+    95→    95→  },
+    96→    96→}));
+    97→    97→
+    98→    98→// ─── Shared Package Mock ─────────────────────────────────────
+    99→    99→
+   100→   100→vi.mock('@agentforge/shared', () => ({
+   101→   101→  LLM_PROVIDERS: {
+   102→   102→    'claude-3.7-sonnet': {
+   103→   103→      id: 'claude-3.7-sonnet',
+   104→   104→      name: 'Claude 3.7 Sonnet',
+   105→   105→      provider: 'anthropic',
+   106→   106→      baseUrl: 'https://api.anthropic.com/v1',
+   107→   107→      model: 'claude-3-7-sonnet-20250219',
+   108→   108→      contextWindow: 200000,
+   109→   109→      maxOutputTokens: 8192,
+   110→   110→    },
+   111→   111→    'gpt-4o': {
+   112→   112→      id: 'gpt-4o',
+   113→   113→      name: 'GPT-4o',
+   114→   114→      provider: 'openai',
+   115→   115→      baseUrl: 'https://api.openai.com/v1',
+   116→   116→      model: 'gpt-4o-2024-11-20',
+   117→   117→      contextWindow: 128000,
+   118→   118→      maxOutputTokens: 16384,
+   119→   119→    },
+   120→   120→    'gemini-2.5-pro': {
+   121→   121→      id: 'gemini-2.5-pro',
+   122→   122→      name: 'Gemini 2.5 Pro',
+   123→   123→      provider: 'google',
+   124→   124→      baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
+   125→   125→      model: 'gemini-2.5-pro-preview-05-06',
+   126→   126→      contextWindow: 1048576,
+   127→   127→      maxOutputTokens: 65536,
+   128→   128→    },
+   129→   129→    'deepseek-r1': {
+   130→   130→      id: 'deepseek-r1',
+   131→   131→      name: 'DeepSeek R1',
+   132→   132→      provider: 'deepseek',
+   133→   133→      baseUrl: 'https://api.deepseek.com/v1',
+   134→   134→      model: 'deepseek-reasoner',
+   135→   135→      contextWindow: 65536,
+   136→   136→      maxOutputTokens: 8192,
+   137→   137→    },
+   138→   138→  },
+   139→   139→  calculateLLMCost: vi.fn().mockReturnValue(0.005),
+   140→   140→}));
+   141→   141→
+   142→   142→// ─── Controllable Redis Mock ──────────────────────────────────
+   143→   143→
+   144→   144→/** Whether Redis is "available" — controls isRedisAvailable() return value */
+   145→   145→let redisAvailable = true;
+   146→   146→
+   147→   147→const mockRedisMethods = {
+   148→   148→  get: vi.fn().mockResolvedValue(null),
+   149→   149→  set: vi.fn().mockResolvedValue('OK'),
+   150→   150→  setex: vi.fn().mockResolvedValue('OK'),
+   151→   151→  del: vi.fn().mockResolvedValue(1),
+   152→   152→  incr: vi.fn().mockResolvedValue(1),
+   153→   153→  pexpire: vi.fn().mockResolvedValue(1),
+   154→   154→  expire: vi.fn().mockResolvedValue(1),
+   155→   155→  sadd: vi.fn().mockResolvedValue(1),
+   156→   156→  srem: vi.fn().mockResolvedValue(1),
+   157→   157→  smembers: vi.fn().mockResolvedValue([]),
+   158→   158→  keys: vi.fn().mockResolvedValue([]),
+   159→   159→  scanStream: vi.fn().mockReturnValue({
+   160→   160→    on: vi.fn().mockImplementation(function(this: any, event: string, cb: Function) {
+   161→   161→      if (event === 'end') setTimeout(() => cb(), 0);
+   162→   162→      return this;
+   163→   163→    }),
+   164→   164→  }),
+   165→   165→  publish: vi.fn().mockResolvedValue(1),
+   166→   166→  subscribe: vi.fn().mockResolvedValue(undefined),
+   167→   167→  ping: vi.fn().mockResolvedValue('PONG'),
+   168→   168→  quit: vi.fn().mockResolvedValue('OK'),
+   169→   169→  on: vi.fn(),
+   170→   170→  connect: vi.fn().mockResolvedValue(undefined),
+   171→   171→  pipeline: vi.fn().mockReturnValue({
+   172→   172→    del: vi.fn().mockReturnThis(),
+   173→   173→    sadd: vi.fn().mockReturnThis(),
+   174→   174→    exec: vi.fn().mockResolvedValue([]),
+   175→   175→  }),
+   176→   176→};
+   177→   177→
+   178→   178→vi.mock('ioredis', () => {
+   179→   179→  const Redis = vi.fn().mockImplementation(() => ({
+   180→   180→    ...mockRedisMethods,
+   181→   181→  }));
+   182→   182→  return { Redis };
+   183→   183→});
+   184→   184→
+   185→   185→// ─── Mock RedisManager with controllable isRedisAvailable ─────
+   186→   186→
+   187→   187→vi.mock('../../packages/api/src/services/RedisManager', () => ({
+   188→   188→  getPrimaryRedis: vi.fn(() => mockRedisMethods),
+   189→   189→  isRedisAvailable: vi.fn(() => redisAvailable),
+   190→   190→  closeAllRedisConnections: vi.fn().mockResolvedValue(undefined),
+   191→   191→  getRedisStats: vi.fn(() => ({
+   192→   192→    primaryReady: redisAvailable,
+   193→   193→    subscriberReady: redisAvailable,
+   194→   194→    primaryConnectionName: 'agentforge-test',
+   195→   195→  })),
+   196→   196→}));
+   197→   197→
+   198→   198→// ─── Database Mock (controllable) ─────────────────────────────
+   199→   199→
+   200→   200→vi.mock('../../packages/api/src/db', () => {
+   201→   201→  const mockChain = {
+   202→   202→    select: vi.fn().mockReturnThis(),
+   203→   203→    from: vi.fn().mockReturnThis(),
+   204→   204→    where: vi.fn().mockReturnThis(),
+   205→   205→    limit: vi.fn().mockResolvedValue([]),
+   206→   206→    insert: vi.fn().mockReturnThis(),
+   207→   207→    values: vi.fn().mockResolvedValue([{ id: 'test-id' }]),
+   208→   208→    update: vi.fn().mockReturnThis(),
+   209→   209→    set: vi.fn().mockReturnThis(),
+   210→   210→    returning: vi.fn().mockResolvedValue([{ id: 'test-id' }]),
+   211→   211→    execute: vi.fn().mockResolvedValue([{ result: 1 }]),
+   212→   212→    orderBy: vi.fn().mockReturnThis(),
+   213→   213→    offset: vi.fn().mockResolvedValue([]),
+   214→   214→  };
+   215→   215→  return { db: mockChain };
+   216→   216→});
+   217→   217→
+   218→   218→vi.mock('../../packages/api/src/db/schema', () => ({
+   219→   219→  analyticsEvents: {
+   220→   220→    id: 'id',
+   221→   221→    userId: 'userId',
+   222→   222→    event: 'event',
+   223→   223→    properties: 'properties',
+   224→   224→    timestamp: 'timestamp',
+   225→   225→  },
+   226→   226→  tenants: {
+   227→   227→    id: 'id',
+   228→   228→    name: 'name',
+   229→   229→    slug: 'slug',
+   230→   230→    plan: 'plan',
+   231→   231→    status: 'status',
+   232→   232→    branding: 'branding',
+   233→   233→    quotas: 'quotas',
+   234→   234→    createdAt: 'createdAt',
+   235→   235→    updatedAt: 'updatedAt',
+   236→   236→  },
+   237→   237→  tenantMembers: {
+   238→   238→    id: 'id',
+   239→   239→    tenantId: 'tenantId',
+   240→   240→    userId: 'userId',
+   241→   241→    role: 'role',
+   242→   242→    joinedAt: 'joinedAt',
+   243→   243→  },
+   244→   244→}));
+   245→   245→
+   246→   246→// ─── Import Modules Under Test ────────────────────────────────
+   247→   247→
+   248→   248→import { JWTBlacklist } from '../../packages/api/src/services/security/JWTBlacklist';
+   249→   249→import { SessionManager } from '../../packages/api/src/services/security/SessionManager';
+   250→   250→import { CacheManager } from '../../packages/api/src/services/CacheManager';
+   251→   251→import { AuditTrailService } from '../../packages/api/src/services/security/AuditTrailService';
+   252→   252→import { db } from '../../packages/api/src/db';
+   253→   253→
+   254→   254→// ─── Helpers ──────────────────────────────────────────────────
+   255→   255→
+   256→   256→function simulateAllDown(): void {
+   257→   257→  // Redis down
+   258→   258→  redisAvailable = false;
+   259→   259→  const redisError = new Error('ECONNREFUSED: Redis connection refused');
+   260→   260→  mockRedisMethods.get.mockRejectedValue(redisError);
+   261→   261→  mockRedisMethods.set.mockRejectedValue(redisError);
+   262→   262→  mockRedisMethods.setex.mockRejectedValue(redisError);
+   263→   263→  mockRedisMethods.del.mockRejectedValue(redisError);
+   264→   264→  mockRedisMethods.incr.mockRejectedValue(redisError);
+   265→   265→  mockRedisMethods.pexpire.mockRejectedValue(redisError);
+   266→   266→  mockRedisMethods.expire.mockRejectedValue(redisError);
+   267→   267→  mockRedisMethods.sadd.mockRejectedValue(redisError);
+   268→   268→  mockRedisMethods.srem.mockRejectedValue(redisError);
+   269→   269→  mockRedisMethods.smembers.mockRejectedValue(redisError);
+   270→   270→  mockRedisMethods.keys.mockRejectedValue(redisError);
+   271→   271→  mockRedisMethods.ping.mockRejectedValue(redisError);
+   272→   272→
+   273→   273→  // DB down
+   274→   274→  const dbError = new Error('ECONNREFUSED: Connection refused to PostgreSQL');
+   275→   275→  (db as any).select = vi.fn().mockImplementation(() => { throw dbError; });
+   276→   276→  (db as any).insert = vi.fn().mockImplementation(() => { throw dbError; });
+   277→   277→  (db as any).update = vi.fn().mockImplementation(() => { throw dbError; });
+   278→   278→  (db as any).execute = vi.fn().mockImplementation(() => { throw dbError; });
+   279→   279→  (db as any).limit = vi.fn().mockRejectedValue(dbError);
+   280→   280→  (db as any).values = vi.fn().mockRejectedValue(dbError);
+   281→   281→  (db as any).returning = vi.fn().mockRejectedValue(dbError);
+   282→   282→  (db as any).offset = vi.fn().mockRejectedValue(dbError);
+   283→   283→}
+   284→   284→
+   285→   285→function simulateAllUp(): void {
+   286→   286→  // Redis up
+   287→   287→  redisAvailable = true;
+   288→   288→  mockRedisMethods.get.mockResolvedValue(null);
+   289→   289→  mockRedisMethods.set.mockResolvedValue('OK');
+   290→   290→  mockRedisMethods.setex.mockResolvedValue('OK');
+   291→   291→  mockRedisMethods.del.mockResolvedValue(1);
+   292→   292→  mockRedisMethods.incr.mockResolvedValue(1);
+   293→   293→  mockRedisMethods.pexpire.mockResolvedValue(1);
+   294→   294→  mockRedisMethods.expire.mockResolvedValue(1);
+   295→   295→  mockRedisMethods.sadd.mockResolvedValue(1);
+   296→   296→  mockRedisMethods.srem.mockResolvedValue(1);
+   297→   297→  mockRedisMethods.smembers.mockResolvedValue([]);
+   298→   298→  mockRedisMethods.keys.mockResolvedValue([]);
+   299→   299→  mockRedisMethods.ping.mockResolvedValue('PONG');
+   300→   300→  mockRedisMethods.pipeline.mockReturnValue({
+   301→   301→    del: vi.fn().mockReturnThis(),
+   302→   302→    sadd: vi.fn().mockReturnThis(),
+   303→   303→    exec: vi.fn().mockResolvedValue([]),
+   304→   304→  });
+   305→   305→
+   306→   306→  // DB up
+   307→   307→  (db as any).select = vi.fn().mockReturnThis();
+   308→   308→  (db as any).from = vi.fn().mockReturnThis();
+   309→   309→  (db as any).where = vi.fn().mockReturnThis();
+   310→   310→  (db as any).limit = vi.fn().mockResolvedValue([]);
+   311→   311→  (db as any).insert = vi.fn().mockReturnThis();
+   312→   312→  (db as any).values = vi.fn().mockResolvedValue([{ id: 'test-id' }]);
+   313→   313→  (db as any).update = vi.fn().mockReturnThis();
+   314→   314→  (db as any).set = vi.fn().mockReturnThis();
+   315→   315→  (db as any).returning = vi.fn().mockResolvedValue([{ id: 'test-id' }]);
+   316→   316→  (db as any).execute = vi.fn().mockResolvedValue([{ result: 1 }]);
+   317→   317→  (db as any).orderBy = vi.fn().mockReturnThis();
+   318→   318→  (db as any).offset = vi.fn().mockResolvedValue([]);
+   319→   319→}
+   320→   320→
+   321→   321→/** Get current memory usage in MB */
+   322→   322→function getMemoryUsageMB(): { heapUsed: number; heapTotal: number; rss: number } {
+   323→   323→  const usage = process.memoryUsage();
+   324→   324→  return {
+   325→   325→    heapUsed: Math.round(usage.heapUsed / 1024 / 1024),
+   326→   326→    heapTotal: Math.round(usage.heapTotal / 1024 / 1024),
+   327→   327→    rss: Math.round(usage.rss / 1024 / 1024),
+   328→   328→  };
+   329→   329→}
+   330→   330→
+   331→   331→// ═══════════════════════════════════════════════════════════════
+   332→   332→// TEST SUITE
+   333→   333→// ═══════════════════════════════════════════════════════════════
+   334→   334→
+   335→   335→describe('Chaos: Cascading Failure (Redis + DB)', () => {
+   336→   336→  let jwtBlacklist: JWTBlacklist;
+   337→   337→  let sessionManager: SessionManager;
+   338→   338→  let cacheManager: CacheManager;
+   339→   339→  let auditTrailService: AuditTrailService;
+   340→   340→
+   341→   341→  beforeEach(() => {
+   342→   342→    vi.clearAllMocks();
+   343→   343→    simulateAllUp();
+   344→   344→
+   345→   345→    jwtBlacklist = new JWTBlacklist();
+   346→   346→    sessionManager = new SessionManager();
+   347→   347→    cacheManager = new CacheManager();
+   348→   348→    auditTrailService = new AuditTrailService();
+   349→   349→  });
+   350→   350→
+   351→   351→  afterEach(() => {
+   352→   352→    vi.restoreAllMocks();
+   353→   353→  });
+   354→   354→
+   355→   355→  // ─── Graceful Degradation ──────────────────────────────────
+   356→   356→
+   357→   357→  describe('Graceful degradation under cascading failure', () => {
+   358→   358→    it('should not crash when Redis AND DB go down simultaneously', async () => {
+   359→   359→      simulateAllDown();
+   360→   360→
+   361→   361→      // None of these should throw
+   362→   362→      const jti = 'cascading-jti-' + Date.now();
+   363→   363→      await expect(jwtBlacklist.blacklist(jti, 3600)).resolves.toBeUndefined();
+   364→   364→      await expect(jwtBlacklist.isBlacklisted(jti)).resolves.toBe(true);
+   365→   365→
+   366→   366→      const session = await sessionManager.createSession(
+   367→   367→        'user-cascade',
+   368→   368→        'fp-cascade',
+   369→   369→        '10.0.0.1',
+   370→   370→        'CascadingAgent'
+   371→   371→      );
+   372→   372→      expect(session).toBeDefined();
+   373→   373→      expect(session.userId).toBe('user-cascade');
+   374→   374→
+   375→   375→      await expect(
+   376→   376→        cacheManager.set('agent-cascade', 'prompt-cascade', { output: 'degraded' })
+   377→   377→      ).resolves.toBeUndefined();
+   378→   378→
+   379→   379→      const auditId = await auditTrailService.record({
+   380→   380→        action: 'security.threat_detected',
+   381→   381→        actorId: 'system',
+   382→   382→        actorType: 'system',
+   383→   383→        resourceType: 'infrastructure',
+   384→   384→        resourceId: 'cascading-failure',
+   385→   385→        details: { redis: 'down', db: 'down' },
+   386→   386→        ipAddress: '10.0.0.1',
+   387→   387→        userAgent: 'ChaosTest',
+   388→   388→        success: false,
+   389→   389→        riskLevel: 'high',
+   390→   390→      });
+   391→   391→      expect(auditId).toBeTruthy();
+   392→   392→    });
+   393→   393→
+   394→   394→    it('should provide degraded but functional API with both Redis and DB down', async () => {
+   395→   395→      simulateAllDown();
+   396→   396→
+   397→   397→      // Sessions should work via L1 in-memory
+   398→   398→      const session = await sessionManager.createSession(
+   399→   399→        'user-degraded',
+   400→   400→        'fp-degraded',
+   401→   401→        '10.0.0.2',
+   402→   402→        'DegradedAgent'
+   403→   403→      );
+   404→   404→
+   405→   405→      const validation = await sessionManager.validateSession(session.id);
+   406→   406→      expect(validation.valid).toBe(true);
+   407→   407→
+   408→   408→      // JWT blacklist should work via local Map
+   409→   409→      await jwtBlacklist.blacklist('degraded-token-1', 3600);
+   410→   410→      expect(await jwtBlacklist.isBlacklisted('degraded-token-1')).toBe(true);
+   411→   411→
+   412→   412→      // Cache should work via L1
+   413→   413→      await cacheManager.set('agent-degraded', 'prompt-degraded', { output: 'l1-only' });
+   414→   414→      const cached = await cacheManager.get('agent-degraded', 'prompt-degraded');
+   415→   415→      expect(cached?.output).toBe('l1-only');
+   416→   416→    });
+   417→   417→
+   418→   418→    it('should report correct health status when all infrastructure is down', () => {
+   419→   419→      simulateAllDown();
+   420→   420→
+   421→   421→      // Simulate health check logic from the API's /readyz endpoint
+   422→   422→      const checks: Record<string, boolean> = {};
+   423→   423→
+   424→   424→      // DB check
+   425→   425→      try {
+   426→   426→        db.execute('SELECT 1');
+   427→   427→        checks.database = true;
+   428→   428→      } catch {
+   429→   429→        checks.database = false;
+   430→   430→      }
+   431→   431→
+   432→   432→      // Redis check
+   433→   433→      try {
+   434→   434→        mockRedisMethods.ping();
+   435→   435→        checks.redis = true;
+   436→   436→      } catch {
+   437→   437→        checks.redis = false;
+   438→   438→      }
+   439→   439→
+   440→   440→      const allHealthy = Object.values(checks).every(v => v);
+   441→   441→      expect(allHealthy).toBe(false);
+   442→   442→      expect(checks.database).toBe(false);
+   443→   443→
+   444→   444→      // Status should be "degraded" with 503
+   445→   445→      const status = allHealthy ? 'ready' : 'degraded';
+   446→   446→      const httpStatus = allHealthy ? 200 : 503;
+   447→   447→      expect(status).toBe('degraded');
+   448→   448→      expect(httpStatus).toBe(503);
+   449→   449→    });
+   450→   450→  });
+   451→   451→
+   452→   452→  // ─── API Stability Under Cascading Failure ─────────────────
+   453→   453→
+   454→   454→  describe('API stability under cascading failures', () => {
+   455→   455→    it('should handle multiple concurrent operations without crashing', async () => {
+   456→   456→      simulateAllDown();
+   457→   457→
+   458→   458→      // Simulate multiple concurrent API requests
+   459→   459→      const operations: Promise<any>[] = [];
+   460→   460→
+   461→   461→      for (let i = 0; i < 20; i++) {
+   462→   462→        operations.push(
+   463→   463→          sessionManager.createSession(
+   464→   464→            `user-concurrent-${i}`,
+   465→   465→            `fp-concurrent-${i}`,
+   466→   466→            `10.0.${Math.floor(i / 255)}.${i % 255}`,
+   467→   467→            'ConcurrentAgent'
+   468→   468→          )
+   469→   469→        );
+   470→   470→      }
+   471→   471→
+   472→   472→      const sessions = await Promise.allSettled(operations);
+   473→   473→
+   474→   474→      // All operations should settle (not reject/throw)
+   475→   475→      const fulfilled = sessions.filter(r => r.status === 'fulfilled');
+   476→   476→      expect(fulfilled.length).toBe(20);
+   477→   477→
+   478→   478→      // All sessions should have valid IDs
+   479→   479→      for (const result of fulfilled) {
+   480→   480→        if (result.status === 'fulfilled') {
+   481→   481→          expect(result.value.id).toBeTruthy();
+   482→   482→          expect(result.value.userId).toMatch(/^user-concurrent-/);
+   483→   483→        }
+   484→   484→      }
+   485→   485→    });
+   486→   486→
+   487→   487→    it('should handle interleaved session create/validate/destroy under failure', async () => {
+   488→   488→      simulateAllDown();
+   489→   489→
+   490→   490→      const session = await sessionManager.createSession(
+   491→   491→        'user-interleave',
+   492→   492→        'fp-interleave',
+   493→   493→        '10.0.0.10',
+   494→   494→        'InterleaveAgent'
+   495→   495→      );
+   496→   496→
+   497→   497→      // Validate
+   498→   498→      const v1 = await sessionManager.validateSession(session.id);
+   499→   499→      expect(v1.valid).toBe(true);
+   500→   500→
+   501→   501→      // Verify MFA
+   502→   502→      const mfaResult = await sessionManager.verifyMfa(session.id);
+   503→   503→      expect(mfaResult).toBe(true);
+   504→   504→
+   505→   505→      // Validate again (should show MFA verified)
+   506→   506→      const v2 = await sessionManager.validateSession(session.id);
+   507→   507→      expect(v2.valid).toBe(true);
+   508→   508→      expect(v2.session?.isMfaVerified).toBe(true);
+   509→   509→
+   510→   510→      // Destroy
+   511→   511→      const destroyed = await sessionManager.destroySession(session.id);
+   512→   512→      expect(destroyed).toBe(true);
+   513→   513→
+   514→   514→      // Should no longer be valid
+   515→   515→      const v3 = await sessionManager.validateSession(session.id);
+   516→   516→      expect(v3.valid).toBe(false);
+   517→   517→    });
+   518→   518→  });
+   519→   519→
+   520→   520→  // ─── Memory Leak Detection ─────────────────────────────────
+   521→   521→
+   522→   522→  describe('Memory leak detection under sustained failure', () => {
+   523→   523→    it('should not leak memory under sustained failure conditions', async () => {
+   524→   524→      simulateAllDown();
+   525→   525→
+   526→   526→      // Force garbage collection if available
+   527→   527→      if (global.gc) global.gc();
+   528→   528→
+   529→   529→      const memoryBefore = getMemoryUsageMB();
+   530→   530→
+   531→   531→      // Perform many operations under failure conditions
+   532→   532→      for (let i = 0; i < 100; i++) {
+   533→   533→        await jwtBlacklist.blacklist(`leak-test-jti-${i}`, 3600);
+   534→   534→        await jwtBlacklist.isBlacklisted(`leak-test-jti-${i}`);
+   535→   535→
+   536→   536→        // Also create and destroy sessions
+   537→   537→        const session = await sessionManager.createSession(
+   538→   538→          `user-leak-${i}`,
+   539→   539→          `fp-leak-${i}`,
+   540→   540→          '10.0.0.1',
+   541→   541→          'LeakAgent'
+   542→   542→        );
+   543→   543→        await sessionManager.destroySession(session.id);
+   544→   544→      }
+   545→   545→
+   546→   546→      // Force garbage collection if available
+   547→   547→      if (global.gc) global.gc();
+   548→   548→
+   549→   549→      const memoryAfter = getMemoryUsageMB();
+   550→   550→
+   551→   551→      // Memory growth should be reasonable (less than 50MB increase)
+   552→   552→      const heapGrowth = memoryAfter.heapUsed - memoryBefore.heapUsed;
+   553→   553→      expect(heapGrowth).toBeLessThan(50);
+   554→   554→    });
+   555→   555→
+   556→   556→    it('should not accumulate unlimited cache entries under failure', async () => {
+   557→   557→      simulateAllDown();
+   558→   558→
+   559→   559→      const statsBefore = cacheManager.getStats();
+   560→   560→
+   561→   561→      // Add many cache entries
+   562→   562→      for (let i = 0; i < 200; i++) {
+   563→   563→        await cacheManager.set(`agent-leak-${i}`, `prompt-leak-${i}`, {
+   564→   564→          output: `result-${i}`,
+   565→   565→        });
+   566→   566→      }
+   567→   567→
+   568→   568→      const statsAfter = cacheManager.getStats();
+   569→   569→
+   570→   570→      // Cache should have an upper bound (L1_MAX_SIZE = 1000 with LRU eviction)
+   571→   571→      // 200 entries is well within bounds, but we verify the eviction mechanism exists
+   572→   572→      expect(statsAfter.l1Size).toBeGreaterThan(statsBefore.l1Size);
+   573→   573→      expect(statsAfter.l1Size).toBeLessThanOrEqual(1000); // L1_MAX_SIZE
+   574→   574→    });
+   575→   575→
+   576→   576→    it('should clean up expired JWT blacklist entries locally', async () => {
+   577→   577→      simulateAllDown();
+   578→   578→
+   579→   579→      // Add entries with very short TTL
+   580→   580→      for (let i = 0; i < 10; i++) {
+   581→   581→        await jwtBlacklist.blacklist(`expiring-jti-${i}`, 1); // 1 second TTL
+   582→   582→      }
+   583→   583→
+   584→   584→      // Wait for entries to expire
+   585→   585→      await new Promise(resolve => setTimeout(resolve, 1100));
+   586→   586→
+   587→   587→      // Check if expired entries are cleaned up on access
+   588→   588→      for (let i = 0; i < 10; i++) {
+   589→   589→        const isBlacklisted = await jwtBlacklist.isBlacklisted(`expiring-jti-${i}`);
+   590→   590→        expect(isBlacklisted).toBe(false);
+   591→   591→      }
+   592→   592→    });
+   593→   593→  });
+   594→   594→
+   595→   595→  // ─── Recovery After Cascading Failure ──────────────────────
+   596→   596→
+   597→   597→  describe('Recovery after cascading failure is resolved', () => {
+   598→   598→    it('should recover full functionality when Redis and DB come back', async () => {
+   599→   599→      // Phase 1: Both down
+   600→   600→      simulateAllDown();
+   601→   601→
+   602→   602→      // Create data in degraded mode
+   603→   603→      const jti = 'recovery-jti-' + Date.now();
+   604→   604→      await jwtBlacklist.blacklist(jti, 3600);
+   605→   605→      expect(await jwtBlacklist.isBlacklisted(jti)).toBe(true);
+   606→   606→
+   607→   607→      const session = await sessionManager.createSession(
+   608→   608→        'user-recovery',
+   609→   609→        'fp-recovery',
+   610→   610→        '10.0.0.100',
+   611→   611→        'RecoveryAgent'
+   612→   612→      );
+   613→   613→      expect(session).toBeDefined();
+   614→   614→
+   615→   615→      await cacheManager.set('agent-recovery', 'prompt-recovery', { output: 'l1-data' });
+   616→   616→      const cached = await cacheManager.get('agent-recovery', 'prompt-recovery');
+   617→   617→      expect(cached?.output).toBe('l1-data');
+   618→   618→
+   619→   619→      // Phase 2: Both come back
+   620→   620→      simulateAllUp();
+   621→   621→
+   622→   622→      // New operations should use Redis
+   623→   623→      const newJti = 'recovery-new-' + Date.now();
+   624→   624→      await jwtBlacklist.blacklist(newJti, 3600);
+   625→   625→      // JWTBlacklist uses redis.set(key, '1', 'EX', ttl) not setex
+   626→   626→      expect(mockRedisMethods.set).toHaveBeenCalled();
+   627→   627→
+   628→   628→      // New sessions should persist to Redis
+   629→   629→      const newSession = await sessionManager.createSession(
+   630→   630→        'user-recovery-2',
+   631→   631→        'fp-recovery-2',
+   632→   632→        '10.0.0.101',
+   633→   633→        'RecoveryAgent2'
+   634→   634→      );
+   635→   635→      expect(newSession).toBeDefined();
+   636→   636→      // SessionManager uses redis.setex
+   637→   637→      expect(mockRedisMethods.setex).toHaveBeenCalled();
+   638→   638→
+   639→   639→      // New cache entries should persist to Redis
+   640→   640→      await cacheManager.set('agent-recovery-2', 'prompt-recovery-2', { output: 'l2-data' });
+   641→   641→      expect(mockRedisMethods.setex).toHaveBeenCalled();
+   642→   642→
+   643→   643→      // Audit trail should work with DB
+   644→   644→      const auditId = await auditTrailService.record({
+   645→   645→        action: 'auth.login',
+   646→   646→        actorId: 'user-recovery',
+   647→   647→        actorType: 'user',
+   648→   648→        resourceType: 'session',
+   649→   649→        resourceId: newSession.id,
+   650→   650→        details: { recovered: true },
+   651→   651→        ipAddress: '10.0.0.100',
+   652→   652→        userAgent: 'RecoveryTest',
+   653→   653→        success: true,
+   654→   654→        riskLevel: 'low',
+   655→   655→      });
+   656→   656→      expect(auditId).toBeTruthy();
+   657→   657→    });
+   658→   658→
+   659→   659→    it('should report healthy status after recovery', () => {
+   660→   660→      // Phase 1: Both down
+   661→   661→      simulateAllDown();
+   662→   662→
+   663→   663→      let checks: Record<string, boolean> = { database: false, redis: false };
+   664→   664→      let allHealthy = Object.values(checks).every(v => v);
+   665→   665→      expect(allHealthy).toBe(false);
+   666→   666→
+   667→   667→      // Phase 2: Both back
+   668→   668→      simulateAllUp();
+   669→   669→
+   670→   670→      checks = { database: true, redis: true };
+   671→   671→      allHealthy = Object.values(checks).every(v => v);
+   672→   672→      expect(allHealthy).toBe(true);
+   673→   673→      expect(allHealthy ? 200 : 503).toBe(200);
+   674→   674→    });
+   675→   675→
+   676→   676→    it('should maintain data consistency after partial recovery', async () => {
+   677→   677→      // Phase 1: Both down — create session in L1 only
+   678→   678→      simulateAllDown();
+   679→   679→
+   680→   680→      const session = await sessionManager.createSession(
+   681→   681→        'user-partial',
+   682→   682→        'fp-partial',
+   683→   683→        '10.0.0.150',
+   684→   684→        'PartialAgent'
+   685→   685→      );
+   686→   686→
+   687→   687→      // Phase 2: Only Redis comes back (DB still down)
+   688→   688→      redisAvailable = true;
+   689→   689→      mockRedisMethods.get.mockResolvedValue(null);
+   690→   690→      mockRedisMethods.set.mockResolvedValue('OK');
+   691→   691→      mockRedisMethods.setex.mockResolvedValue('OK');
+   692→   692→      mockRedisMethods.del.mockResolvedValue(1);
+   693→   693→      mockRedisMethods.incr.mockResolvedValue(1);
+   694→   694→      mockRedisMethods.pexpire.mockResolvedValue(1);
+   695→   695→      mockRedisMethods.expire.mockResolvedValue(1);
+   696→   696→      mockRedisMethods.sadd.mockResolvedValue(1);
+   697→   697→      mockRedisMethods.srem.mockResolvedValue(1);
+   698→   698→      mockRedisMethods.smembers.mockResolvedValue([]);
+   699→   699→      mockRedisMethods.ping.mockResolvedValue('PONG');
+   700→   700→      mockRedisMethods.pipeline.mockReturnValue({
+   701→   701→        del: vi.fn().mockReturnThis(),
+   702→   702→        sadd: vi.fn().mockReturnThis(),
+   703→   703→        exec: vi.fn().mockResolvedValue([]),
+   704→   704→      });
+   705→   705→
+   706→   706→      // Session should still be accessible from L1
+   707→   707→      const validation = await sessionManager.validateSession(session.id);
+   708→   708→      expect(validation.valid).toBe(true);
+   709→   709→
+   710→   710→      // New sessions should persist to Redis
+   711→   711→      const newSession = await sessionManager.createSession(
+   712→   712→        'user-partial-2',
+   713→   713→        'fp-partial-2',
+   714→   714→        '10.0.0.151',
+   715→   715→        'PartialAgent2'
+   716→   716→      );
+   717→   717→      expect(newSession).toBeDefined();
+   718→   718→    });
+   719→   719→  });
+   720→   720→
+   721→   721→  // ─── Timing Under Failure ──────────────────────────────────
+   722→   722→
+   723→   723→  describe('Performance during cascading failure and recovery', () => {
+   724→   724→    it('should complete degraded operations within acceptable time bounds', async () => {
+   725→   725→      simulateAllDown();
+   726→   726→
+   727→   727→      const start = Date.now();
+   728→   728→
+   729→   729→      // Simulate a burst of API requests
+   730→   730→      for (let i = 0; i < 10; i++) {
+   731→   731→        await sessionManager.createSession(
+   732→   732→          `user-burst-${i}`,
+   733→   733→          `fp-burst-${i}`,
+   734→   734→          `10.0.${i}.1`,
+   735→   735→          'BurstAgent'
+   736→   736→        );
+   737→   737→        await jwtBlacklist.blacklist(`burst-jti-${i}`, 3600);
+   738→   738→        await cacheManager.set(`agent-burst-${i}`, `prompt-burst-${i}`, { output: `result-${i}` });
+   739→   739→      }
+   740→   740→
+   741→   741→      const elapsed = Date.now() - start;
+   742→   742→
+   743→   743→      // All operations should complete in under 5 seconds
+   744→   744→      // (no external network calls, just in-memory operations)
+   745→   745→      expect(elapsed).toBeLessThan(5000);
+   746→   746→    });
+   747→   747→
+   748→   748→    it('should measure and report recovery time', async () => {
+   749→   749→      simulateAllDown();
+   750→   750→
+   751→   751→      // Create some state while down
+   752→   752→      await sessionManager.createSession('user-rt', 'fp-rt', '10.0.0.1', 'RTAgent');
+   753→   753→
+   754→   754→      // Simulate recovery
+   755→   755→      const recoveryStart = Date.now();
+   756→   756→      simulateAllUp();
+   757→   757→
+   758→   758→      // First operation after recovery
+   759→   759→      await sessionManager.createSession('user-rt-2', 'fp-rt-2', '10.0.0.2', 'RTAgent2');
+   760→   760→      const recoveryTime = Date.now() - recoveryStart;
+   761→   761→
+   762→   762→      // Recovery should be near-instantaneous (mocked, but verifies no blocking)
+   763→   763→      expect(recoveryTime).toBeLessThan(1000);
+   764→   764→    });
+   765→   765→  });
+   766→   766→});
+   767→   767→
