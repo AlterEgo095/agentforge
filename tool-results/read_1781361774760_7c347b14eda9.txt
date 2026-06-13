@@ -1,0 +1,1277 @@
+     1→// ============================================================
+     2→// AgentForge - DATA Agent Worker
+     3→// Handles data analysis, visualization, and spreadsheet generation.
+     4→// Extends BaseAgentWorker with a pipeline that ingests data,
+     5→// performs statistical analysis, detects anomalies, generates
+     6→// chart specifications, and produces actionable insights.
+     7→// ============================================================
+     8→
+     9→import { BaseAgentWorker, type QualityReport } from './BaseAgentWorker';
+    10→import { v4 as uuidv4 } from 'uuid';
+    11→
+    12→// ─── Type Definitions ──────────────────────────────────────
+    13→
+    14→export interface DataSummary {
+    15→  overview: string;
+    16→  keyMetrics: Record<string, number>;
+    17→  anomalies: string[];
+    18→  recommendations: string[];
+    19→}
+    20→
+    21→export interface ColumnDef {
+    22→  name: string;
+    23→  type: 'string' | 'number' | 'date' | 'boolean' | 'object';
+    24→  nullable: boolean;
+    25→  description?: string;
+    26→}
+    27→
+    28→export interface Dataset {
+    29→  id: string;
+    30→  name: string;
+    31→  columns: ColumnDef[];
+    32→  rows: Record<string, unknown>[];
+    33→  rowCount: number;
+    34→}
+    35→
+    36→export interface ChartSeries {
+    37→  name: string;
+    38→  data: (number | string)[];
+    39→  type?: string;
+    40→  color?: string;
+    41→}
+    42→
+    43→export interface ChartSpec {
+    44→  id: string;
+    45→  type: 'bar' | 'line' | 'pie' | 'scatter' | 'area' | 'heatmap' | 'histogram' | 'boxplot' | 'radar';
+    46→  title: string;
+    47→  xAxis?: { label: string; field: string };
+    48→  yAxis?: { label: string; field: string };
+    49→  series: ChartSeries[];
+    50→  options: Record<string, unknown>;
+    51→  insight: string;
+    52→}
+    53→
+    54→export type DataInsightType = 'trend' | 'anomaly' | 'correlation' | 'outlier' | 'pattern' | 'forecast';
+    55→
+    56→export interface DataInsight {
+    57→  id: string;
+    58→  type: DataInsightType;
+    59→  title: string;
+    60→  description: string;
+    61→  confidence: number;
+    62→  affectedColumns: string[];
+    63→  evidence: string;
+    64→}
+    65→
+    66→export interface StatisticalSummary {
+    67→  column: string;
+    68→  count: number;
+    69→  mean?: number;
+    70→  median?: number;
+    71→  stdDev?: number;
+    72→  min?: number | string;
+    73→  max?: number | string;
+    74→  uniqueValues?: number;
+    75→  topValues?: { value: string; count: number }[];
+    76→}
+    77→
+    78→export interface DataOutput {
+    79→  title: string;
+    80→  summary: DataSummary;
+    81→  datasets: Dataset[];
+    82→  charts: ChartSpec[];
+    83→  insights: DataInsight[];
+    84→  statistics: StatisticalSummary[];
+    85→  metadata: {
+    86→    rowCount: number;
+    87→    columnCount: number;
+    88→    dataTypes: Record<string, string>;
+    89→    qualityScore: number;
+    90→  };
+    91→}
+    92→
+    93→// ─── Data Agent Worker ─────────────────────────────────────
+    94→
+    95→export class DataAgentWorker extends BaseAgentWorker<DataOutput> {
+    96→  constructor() {
+    97→    super('DATA');
+    98→  }
+    99→
+   100→  // ─── Core Pipeline ──────────────────────────────────────
+   101→
+   102→  protected async generate(
+   103→    prompt: string,
+   104→    context: Record<string, unknown>,
+   105→    sessionId: string,
+   106→  ): Promise<DataOutput> {
+   107→    // Phase 1: Data Ingestion
+   108→    this.emitEvent('data_ingest', sessionId, { status: 'started' });
+   109→    const dataset = this.parseDataSource(prompt, context);
+   110→    this.emitEvent('data_ingest', sessionId, {
+   111→      status: 'completed',
+   112→      rowCount: dataset.rowCount,
+   113→      columnCount: dataset.columns.length,
+   114→    });
+   115→
+   116→    // Phase 2: Statistical Analysis
+   117→    this.emitEvent('data_analyze', sessionId, { status: 'started' });
+   118→    const statistics = this.computeStatistics(dataset);
+   119→    const anomalies = this.detectAnomalies(dataset, statistics);
+   120→    this.emitEvent('data_analyze', sessionId, {
+   121→      status: 'completed',
+   122→      columnsAnalyzed: statistics.length,
+   123→      anomaliesFound: anomalies.length,
+   124→    });
+   125→
+   126→    // Phase 3: Visualization
+   127→    this.emitEvent('data_visualize', sessionId, { status: 'started' });
+   128→    const charts = this.recommendCharts(dataset, statistics);
+   129→    this.emitEvent('data_visualize', sessionId, {
+   130→      status: 'completed',
+   131→      chartsGenerated: charts.length,
+   132→    });
+   133→
+   134→    // Phase 4: Insights Generation
+   135→    this.emitEvent('data_insights', sessionId, { status: 'started' });
+   136→    const insights = this.generateInsights(dataset, statistics, charts);
+   137→    this.emitEvent('data_insights', sessionId, {
+   138→      status: 'completed',
+   139→      insightsCount: insights.length,
+   140→    });
+   141→
+   142→    // Assemble output
+   143→    const dataTypes: Record<string, string> = {};
+   144→    for (const col of dataset.columns) {
+   145→      dataTypes[col.name] = col.type;
+   146→    }
+   147→
+   148→    const qualityScore = this.assessDataQuality(dataset, statistics);
+   149→
+   150→    const summary: DataSummary = {
+   151→      overview: this.buildOverview(dataset, statistics, insights),
+   152→      keyMetrics: this.extractKeyMetrics(statistics),
+   153→      anomalies: anomalies,
+   154→      recommendations: this.buildRecommendations(dataset, statistics, anomalies),
+   155→    };
+   156→
+   157→    return {
+   158→      title: this.inferTitle(prompt),
+   159→      summary,
+   160→      datasets: [dataset],
+   161→      charts,
+   162→      insights,
+   163→      statistics,
+   164→      metadata: {
+   165→        rowCount: dataset.rowCount,
+   166→        columnCount: dataset.columns.length,
+   167→        dataTypes,
+   168→        qualityScore,
+   169→      },
+   170→    };
+   171→  }
+   172→
+   173→  // ─── Validation ─────────────────────────────────────────
+   174→
+   175→  protected async validateOutput(output: DataOutput, prompt: string): Promise<QualityReport> {
+   176→    const dimensions: Record<string, number> = {};
+   177→    const suggestions: string[] = [];
+   178→
+   179→    // Accuracy (0-1): Check statistical calculations are consistent
+   180→    dimensions.Accuracy = this.scoreAccuracy(output, suggestions);
+   181→
+   182→    // Visualization (0-1): Validate chart specs match data types
+   183→    dimensions.Visualization = this.scoreVisualization(output, suggestions);
+   184→
+   185→    // Insight Depth (0-1): Validate insights are substantive
+   186→    dimensions['Insight Depth'] = this.scoreInsightDepth(output, suggestions);
+   187→
+   188→    // Code Quality (0-1): Internal pipeline quality
+   189→    dimensions['Code Quality'] = this.scoreCodeQuality(output, suggestions);
+   190→
+   191→    // Documentation (0-1): Check column descriptions, chart insights
+   192→    dimensions.Documentation = this.scoreDocumentation(output, suggestions);
+   193→
+   194→    const overall = this.computeWeightedScore(dimensions);
+   195→    const passed = this.isQualityPassing(overall);
+   196→
+   197→    return { overall, dimensions, passed, suggestions };
+   198→  }
+   199→
+   200→  // ─── Rendering ──────────────────────────────────────────
+   201→
+   202→  protected async renderOutput(output: DataOutput, format?: string): Promise<unknown> {
+   203→    switch (format) {
+   204→      case 'charts':
+   205→        return output.charts;
+   206→
+   207→      case 'summary':
+   208→        return {
+   209→          title: output.title,
+   210→          summary: output.summary,
+   211→          metadata: output.metadata,
+   212→        };
+   213→
+   214→      case 'csv':
+   215→        return this.renderCsv(output);
+   216→
+   217→      case 'xlsx':
+   218→        return this.renderXlsxMeta(output);
+   219→
+   220→      default:
+   221→        return output;
+   222→    }
+   223→  }
+   224→
+   225→  // ─── Helper: Data Source Parsing ────────────────────────
+   226→
+   227→  private parseDataSource(prompt: string, context?: Record<string, unknown>): Dataset {
+   228→    // Check if context provides a dataset directly
+   229→    if (context?.dataset && typeof context.dataset === 'object') {
+   230→      const ds = context.dataset as Dataset;
+   231→      if (ds.id && ds.columns && ds.rows) {
+   232→        return ds;
+   233→      }
+   234→    }
+   235→
+   236→    // Attempt to parse inline CSV from the prompt
+   237→    const csvMatch = prompt.match(/```csv\n([\s\S]*?)```/);
+   238→    if (csvMatch) {
+   239→      return this.parseCsv(csvMatch[1]);
+   240→    }
+   241→
+   242→    // Attempt to parse inline JSON from the prompt
+   243→    const jsonMatch = prompt.match(/```json\n([\s\S]*?)```/);
+   244→    if (jsonMatch) {
+   245→      try {
+   246→        const parsed = JSON.parse(jsonMatch[1]);
+   247→        if (Array.isArray(parsed)) {
+   248→          return this.parseJsonArray(parsed);
+   249→        }
+   250→      } catch {
+   251→        // Fall through to sample generation
+   252→      }
+   253→    }
+   254→
+   255→    // Attempt to parse raw JSON array in the prompt
+   256→    const jsonArrayMatch = prompt.match(/\[[\s\S]*\]/);
+   257→    if (jsonArrayMatch) {
+   258→      try {
+   259→        const parsed = JSON.parse(jsonArrayMatch[0]);
+   260→        if (Array.isArray(parsed) && parsed.length > 0 && typeof parsed[0] === 'object') {
+   261→          return this.parseJsonArray(parsed);
+   262→        }
+   263→      } catch {
+   264→        // Fall through to sample generation
+   265→      }
+   266→    }
+   267→
+   268→    // Generate a sample dataset from the prompt description
+   269→    return this.generateSampleDataset(prompt);
+   270→  }
+   271→
+   272→  private parseCsv(csvText: string): Dataset {
+   273→    const lines = csvText.trim().split('\n').map(line => line.trim()).filter(Boolean);
+   274→    if (lines.length === 0) {
+   275→      return this.generateSampleDataset('empty CSV');
+   276→    }
+   277→
+   278→    const headers = lines[0].split(',').map(h => h.trim().replace(/^"|"$/g, ''));
+   279→    const rows: Record<string, unknown>[] = [];
+   280→
+   281→    for (let i = 1; i < lines.length; i++) {
+   282→      const values = this.splitCsvLine(lines[i]);
+   283→      const row: Record<string, unknown> = {};
+   284→      for (let j = 0; j < headers.length; j++) {
+   285→        const raw = j < values.length ? values[j] : null;
+   286→        row[headers[j]] = this.castValue(raw);
+   287→      }
+   288→      rows.push(row);
+   289→    }
+   290→
+   291→    const columns = headers.map(name => {
+   292→      const values = rows.map(r => r[name]);
+   293→      return {
+   294→        name,
+   295→        type: this.inferColumnType(values) as ColumnDef['type'],
+   296→        nullable: values.some(v => v === null || v === undefined || v === ''),
+   297→        description: undefined,
+   298→      };
+   299→    });
+   300→
+   301→    return {
+   302→      id: uuidv4(),
+   303→      name: 'Parsed CSV',
+   304→      columns,
+   305→      rows,
+   306→      rowCount: rows.length,
+   307→    };
+   308→  }
+   309→
+   310→  private parseJsonArray(data: Record<string, unknown>[]): Dataset {
+   311→    if (data.length === 0) {
+   312→      return this.generateSampleDataset('empty JSON array');
+   313→    }
+   314→
+   315→    const keys = Object.keys(data[0]);
+   316→    const rows = data.map(item => {
+   317→      const row: Record<string, unknown> = {};
+   318→      for (const key of keys) {
+   319→        row[key] = item[key] ?? null;
+   320→      }
+   321→      return row;
+   322→    });
+   323→
+   324→    const columns = keys.map(name => {
+   325→      const values = rows.map(r => r[name]);
+   326→      return {
+   327→        name,
+   328→        type: this.inferColumnType(values) as ColumnDef['type'],
+   329→        nullable: values.some(v => v === null || v === undefined),
+   330→        description: undefined,
+   331→      };
+   332→    });
+   333→
+   334→    return {
+   335→      id: uuidv4(),
+   336→      name: 'Parsed JSON',
+   337→      columns,
+   338→      rows,
+   339→      rowCount: rows.length,
+   340→    };
+   341→  }
+   342→
+   343→  private generateSampleDataset(prompt: string): Dataset {
+   344→    // Derive a small sample dataset from the prompt keywords
+   345→    const lower = prompt.toLowerCase();
+   346→    const isSales = /sales|revenue|profit|income/.test(lower);
+   347→    const isUsers = /user|customer|subscriber|member/.test(lower);
+   348→    const isPerformance = /performance|metric|kpi|score|rating/.test(lower);
+   349→
+   350→    let name: string;
+   351→    let columns: ColumnDef[];
+   352→    let rows: Record<string, unknown>[];
+   353→
+   354→    if (isSales) {
+   355→      name = 'Sales Data';
+   356→      columns = [
+   357→        { name: 'month', type: 'string', nullable: false, description: 'Month of the year' },
+   358→        { name: 'revenue', type: 'number', nullable: false, description: 'Monthly revenue in USD' },
+   359→        { name: 'expenses', type: 'number', nullable: false, description: 'Monthly expenses in USD' },
+   360→        { name: 'profit', type: 'number', nullable: false, description: 'Monthly profit in USD' },
+   361→      ];
+   362→      rows = this.generateSalesRows();
+   363→    } else if (isUsers) {
+   364→      name = 'User Data';
+   365→      columns = [
+   366→        { name: 'userId', type: 'string', nullable: false, description: 'Unique user identifier' },
+   367→        { name: 'signups', type: 'number', nullable: false, description: 'Monthly signups' },
+   368→        { name: 'activeUsers', type: 'number', nullable: false, description: 'Monthly active users' },
+   369→        { name: 'churnRate', type: 'number', nullable: false, description: 'Monthly churn rate (%)' },
+   370→      ];
+   371→      rows = this.generateUserRows();
+   372→    } else if (isPerformance) {
+   373→      name = 'Performance Metrics';
+   374→      columns = [
+   375→        { name: 'department', type: 'string', nullable: false, description: 'Department name' },
+   376→        { name: 'productivity', type: 'number', nullable: false, description: 'Productivity score (0-100)' },
+   377→        { name: 'satisfaction', type: 'number', nullable: false, description: 'Employee satisfaction (0-100)' },
+   378→        { name: 'retention', type: 'number', nullable: false, description: 'Retention rate (%)' },
+   379→      ];
+   380→      rows = this.generatePerformanceRows();
+   381→    } else {
+   382→      name = 'Sample Dataset';
+   383→      columns = [
+   384→        { name: 'category', type: 'string', nullable: false, description: 'Data category' },
+   385→        { name: 'value', type: 'number', nullable: false, description: 'Numeric value' },
+   386→        { name: 'count', type: 'number', nullable: false, description: 'Item count' },
+   387→      ];
+   388→      rows = this.generateGenericRows();
+   389→    }
+   390→
+   391→    return {
+   392→      id: uuidv4(),
+   393→      name,
+   394→      columns,
+   395→      rows,
+   396→      rowCount: rows.length,
+   397→    };
+   398→  }
+   399→
+   400→  // ─── Helper: Statistical Analysis ───────────────────────
+   401→
+   402→  private computeStatistics(dataset: Dataset): StatisticalSummary[] {
+   403→    return dataset.columns.map(col => {
+   404→      const values = dataset.rows
+   405→        .map(r => r[col.name])
+   406→        .filter(v => v !== null && v !== undefined && v !== '');
+   407→
+   408→      if (col.type === 'number') {
+   409→        const numValues = values
+   410→          .map(v => Number(v))
+   411→          .filter(n => !isNaN(n));
+   412→
+   413→        const count = numValues.length;
+   414→        const mean = count > 0 ? numValues.reduce((a, b) => a + b, 0) / count : undefined;
+   415→        const sorted = [...numValues].sort((a, b) => a - b);
+   416→        const median = count > 0
+   417→          ? count % 2 === 0
+   418→            ? (sorted[count / 2 - 1] + sorted[count / 2]) / 2
+   419→            : sorted[Math.floor(count / 2)]
+   420→          : undefined;
+   421→        const variance = count > 1
+   422→          ? numValues.reduce((sum, v) => sum + Math.pow(v - (mean ?? 0), 2), 0) / (count - 1)
+   423→          : undefined;
+   424→        const stdDev = variance !== undefined ? Math.sqrt(variance) : undefined;
+   425→
+   426→        return {
+   427→          column: col.name,
+   428→          count,
+   429→          mean,
+   430→          median,
+   431→          stdDev,
+   432→          min: count > 0 ? sorted[0] : undefined,
+   433→          max: count > 0 ? sorted[sorted.length - 1] : undefined,
+   434→        };
+   435→      }
+   436→
+   437→      // Categorical / other columns
+   438→      const strValues = values.map(String);
+   439→      const freqMap = new Map<string, number>();
+   440→      for (const v of strValues) {
+   441→        freqMap.set(v, (freqMap.get(v) ?? 0) + 1);
+   442→      }
+   443→
+   444→      const topValues = Array.from(freqMap.entries())
+   445→        .sort((a, b) => b[1] - a[1])
+   446→        .slice(0, 5)
+   447→        .map(([value, count]) => ({ value, count }));
+   448→
+   449→      return {
+   450→        column: col.name,
+   451→        count: strValues.length,
+   452→        uniqueValues: freqMap.size,
+   453→        topValues,
+   454→        min: topValues.length > 0 ? topValues[topValues.length - 1].value : undefined,
+   455→        max: topValues.length > 0 ? topValues[0].value : undefined,
+   456→      };
+   457→    });
+   458→  }
+   459→
+   460→  // ─── Helper: Anomaly Detection ──────────────────────────
+   461→
+   462→  private detectAnomalies(dataset: Dataset, stats: StatisticalSummary[]): string[] {
+   463→    const anomalies: string[] = [];
+   464→
+   465→    for (const stat of stats) {
+   466→      // Z-score based outlier detection for numeric columns
+   467→      if (stat.mean !== undefined && stat.stdDev !== undefined && stat.stdDev > 0) {
+   468→        const col = dataset.columns.find(c => c.name === stat.column);
+   469→        if (!col || col.type !== 'number') continue;
+   470→
+   471→        const outlierRows: number[] = [];
+   472→        dataset.rows.forEach((row, idx) => {
+   473→          const val = Number(row[col.name]);
+   474→          if (!isNaN(val)) {
+   475→            const zScore = Math.abs(val - stat.mean!) / stat.stdDev!;
+   476→            if (zScore > 3) {
+   477→              outlierRows.push(idx + 1);
+   478→            }
+   479→          }
+   480→        });
+   481→
+   482→        if (outlierRows.length > 0) {
+   483→          anomalies.push(
+   484→            `Column "${stat.column}" has ${outlierRows.length} outlier(s) at row(s) ${outlierRows.slice(0, 10).join(', ')} (z-score > 3)`,
+   485→          );
+   486→        }
+   487→      }
+   488→
+   489→      // High null-rate detection
+   490→      const col = dataset.columns.find(c => c.name === stat.column);
+   491→      if (col && dataset.rowCount > 0) {
+   492→        const missingCount = dataset.rowCount - stat.count;
+   493→        const missingRate = missingCount / dataset.rowCount;
+   494→        if (missingRate > 0.2) {
+   495→          anomalies.push(
+   496→            `Column "${stat.column}" has ${(missingRate * 100).toFixed(1)}% missing values (${missingCount}/${dataset.rowCount})`,
+   497→          );
+   498→        }
+   499→      }
+   500→
+   501→      // Low cardinality detection for expected-high-cardinality columns
+   502→      if (col?.type === 'string' && stat.uniqueValues !== undefined && dataset.rowCount > 10) {
+   503→        const cardinalityRatio = stat.uniqueValues / dataset.rowCount;
+   504→        if (cardinalityRatio < 0.05 && stat.uniqueValues <= 2 && stat.uniqueValues > 0) {
+   505→          anomalies.push(
+   506→            `Column "${stat.column}" has very low cardinality (${stat.uniqueValues} unique values across ${dataset.rowCount} rows)`,
+   507→          );
+   508→        }
+   509→      }
+   510→    }
+   511→
+   512→    return anomalies;
+   513→  }
+   514→
+   515→  // ─── Helper: Chart Recommendation ────────────────────────
+   516→
+   517→  private recommendCharts(dataset: Dataset, stats: StatisticalSummary[]): ChartSpec[] {
+   518→    const charts: ChartSpec[] = [];
+   519→    const numericCols = dataset.columns.filter(c => c.type === 'number');
+   520→    const stringCols = dataset.columns.filter(c => c.type === 'string');
+   521→
+   522→    // Bar chart: first string column vs first numeric column
+   523→    if (stringCols.length >= 1 && numericCols.length >= 1) {
+   524→      const xCol = stringCols[0];
+   525→      const yCol = numericCols[0];
+   526→      const seriesData = dataset.rows.map(r => Number(r[yCol.name]) || 0);
+   527→      const categories = dataset.rows.map(r => String(r[xCol.name]));
+   528→
+   529→      charts.push({
+   530→        id: uuidv4(),
+   531→        type: 'bar',
+   532→        title: `${yCol.name} by ${xCol.name}`,
+   533→        xAxis: { label: xCol.name, field: xCol.name },
+   534→        yAxis: { label: yCol.name, field: yCol.name },
+   535→        series: [{ name: yCol.name, data: seriesData }],
+   536→        options: {
+   537→          color: ['#F59E0B'],
+   538→          tooltip: { trigger: 'axis' },
+   539→          xAxis: { type: 'category', data: categories },
+   540→          yAxis: { type: 'value' },
+   541→        },
+   542→        insight: `Shows the distribution of ${yCol.name} across ${xCol.name} categories`,
+   543→      });
+   544→    }
+   545→
+   546→    // Line chart: if there are multiple numeric columns (time series feel)
+   547→    if (numericCols.length >= 2) {
+   548→      const xCol = stringCols[0] ?? numericCols[0];
+   549→      const series: ChartSeries[] = numericCols.slice(0, 4).map((col, idx) => ({
+   550→        name: col.name,
+   551→        data: dataset.rows.map(r => Number(r[col.name]) || 0),
+   552→        color: this.getChartColor(idx),
+   553→      }));
+   554→      const categories = dataset.rows.map(r => String(r[xCol.name]));
+   555→
+   556→      charts.push({
+   557→        id: uuidv4(),
+   558→        type: 'line',
+   559→        title: `Trends: ${numericCols.slice(0, 4).map(c => c.name).join(', ')}`,
+   560→        xAxis: { label: xCol.name, field: xCol.name },
+   561→        yAxis: { label: 'Value', field: 'value' },
+   562→        series,
+   563→        options: {
+   564→          tooltip: { trigger: 'axis' },
+   565→          legend: { data: series.map(s => s.name) },
+   566→          xAxis: { type: 'category', data: categories },
+   567→          yAxis: { type: 'value' },
+   568→        },
+   569→        insight: `Tracks trends across ${numericCols.slice(0, 4).map(c => c.name).join(', ')} over ${xCol.name}`,
+   570→      });
+   571→    }
+   572→
+   573→    // Pie chart: distribution of first string column
+   574→    if (stringCols.length >= 1) {
+   575→      const col = stringCols[0];
+   576→      const freqMap = new Map<string, number>();
+   577→      for (const row of dataset.rows) {
+   578→        const val = String(row[col.name]);
+   579→        freqMap.set(val, (freqMap.get(val) ?? 0) + 1);
+   580→      }
+   581→      const pieData = Array.from(freqMap.entries()).map(([name, value]) => ({ name, value }));
+   582→      const topPie = pieData.sort((a, b) => b.value - a.value).slice(0, 10);
+   583→
+   584→      charts.push({
+   585→        id: uuidv4(),
+   586→        type: 'pie',
+   587→        title: `Distribution of ${col.name}`,
+   588→        series: [{
+   589→          name: col.name,
+   590→          data: topPie.map(p => p.value),
+   591→        }],
+   592→        options: {
+   593→          tooltip: { trigger: 'item' },
+   594→          legend: { orient: 'vertical', left: 'left' },
+   595→          series: [{
+   596→            type: 'pie',
+   597→            radius: '60%',
+   598→            data: topPie.map(p => ({ name: p.name, value: p.value })),
+   599→          }],
+   600→        },
+   601→        insight: `Shows the proportional distribution of ${col.name} values`,
+   602→      });
+   603→    }
+   604→
+   605→    // Scatter chart: if 2+ numeric columns exist
+   606→    if (numericCols.length >= 2) {
+   607→      const xCol = numericCols[0];
+   608→      const yCol = numericCols[1];
+   609→
+   610→      charts.push({
+   611→        id: uuidv4(),
+   612→        type: 'scatter',
+   613→        title: `${yCol.name} vs ${xCol.name}`,
+   614→        xAxis: { label: xCol.name, field: xCol.name },
+   615→        yAxis: { label: yCol.name, field: yCol.name },
+   616→        series: [{
+   617→          name: `${xCol.name} vs ${yCol.name}`,
+   618→          data: dataset.rows.map(r => [Number(r[xCol.name]) || 0, Number(r[yCol.name]) || 0]).flat() as (number | string)[],
+   619→        }],
+   620→        options: {
+   621→          tooltip: { trigger: 'item' },
+   622→          xAxis: { type: 'value', name: xCol.name },
+   623→          yAxis: { type: 'value', name: yCol.name },
+   624→          series: [{
+   625→            type: 'scatter',
+   626→            data: dataset.rows.map(r => [Number(r[xCol.name]) || 0, Number(r[yCol.name]) || 0]),
+   627→          }],
+   628→        },
+   629→        insight: `Reveals correlation patterns between ${xCol.name} and ${yCol.name}`,
+   630→      });
+   631→    }
+   632→
+   633→    // Histogram for each numeric column
+   634→    for (const col of numericCols.slice(0, 2)) {
+   635→      const numValues = dataset.rows
+   636→        .map(r => Number(r[col.name]))
+   637→        .filter(n => !isNaN(n));
+   638→
+   639→      if (numValues.length < 3) continue;
+   640→
+   641→      const min = Math.min(...numValues);
+   642→      const max = Math.max(...numValues);
+   643→      const binCount = Math.min(10, Math.ceil(Math.sqrt(numValues.length)));
+   644→      const binWidth = (max - min) / binCount || 1;
+   645→      const bins = Array(binCount).fill(0);
+   646→      const binLabels: string[] = [];
+   647→
+   648→      for (let i = 0; i < binCount; i++) {
+   649→        const low = min + i * binWidth;
+   650→        const high = low + binWidth;
+   651→        binLabels.push(`${low.toFixed(1)}-${high.toFixed(1)}`);
+   652→      }
+   653→
+   654→      for (const v of numValues) {
+   655→        let binIdx = Math.floor((v - min) / binWidth);
+   656→        if (binIdx >= binCount) binIdx = binCount - 1;
+   657→        bins[binIdx]++;
+   658→      }
+   659→
+   660→      charts.push({
+   661→        id: uuidv4(),
+   662→        type: 'histogram',
+   663→        title: `Distribution of ${col.name}`,
+   664→        xAxis: { label: col.name, field: col.name },
+   665→        yAxis: { label: 'Frequency', field: 'count' },
+   666→        series: [{ name: col.name, data: bins }],
+   667→        options: {
+   668→          tooltip: { trigger: 'axis' },
+   669→          xAxis: { type: 'category', data: binLabels },
+   670→          yAxis: { type: 'value' },
+   671→          series: [{ type: 'bar', data: bins, barWidth: '90%' }],
+   672→        },
+   673→        insight: `Shows the frequency distribution of ${col.name} values across ${binCount} bins`,
+   674→      });
+   675→    }
+   676→
+   677→    return charts;
+   678→  }
+   679→
+   680→  // ─── Helper: Insight Generation ──────────────────────────
+   681→
+   682→  private generateInsights(
+   683→    dataset: Dataset,
+   684→    stats: StatisticalSummary[],
+   685→    charts: ChartSpec[],
+   686→  ): DataInsight[] {
+   687→    const insights: DataInsight[] = [];
+   688→    const numericStats = stats.filter(s => s.mean !== undefined);
+   689→
+   690→    // Trend insights
+   691→    for (const stat of numericStats) {
+   692→      const col = dataset.columns.find(c => c.name === stat.column);
+   693→      if (!col || col.type !== 'number') continue;
+   694→
+   695→      const values = dataset.rows
+   696→        .map(r => Number(r[col.name]))
+   697→        .filter(n => !isNaN(n));
+   698→
+   699→      if (values.length < 3) continue;
+   700→
+   701→      // Simple linear trend
+   702→      const firstHalf = values.slice(0, Math.floor(values.length / 2));
+   703→      const secondHalf = values.slice(Math.floor(values.length / 2));
+   704→      const firstAvg = firstHalf.reduce((a, b) => a + b, 0) / firstHalf.length;
+   705→      const secondAvg = secondHalf.reduce((a, b) => a + b, 0) / secondHalf.length;
+   706→
+   707→      const percentChange = firstAvg !== 0 ? ((secondAvg - firstAvg) / Math.abs(firstAvg)) * 100 : 0;
+   708→
+   709→      if (Math.abs(percentChange) > 10) {
+   710→        insights.push({
+   711→          id: uuidv4(),
+   712→          type: 'trend',
+   713→          title: `${percentChange > 0 ? 'Upward' : 'Downward'} trend in ${stat.column}`,
+   714→          description: `${stat.column} shows a ${Math.abs(percentChange).toFixed(1)}% ${percentChange > 0 ? 'increase' : 'decrease'} from the first half to the second half of the data (avg: ${firstAvg.toFixed(2)} → ${secondAvg.toFixed(2)})`,
+   715→          confidence: Math.min(0.95, 0.6 + Math.abs(percentChange) / 200),
+   716→          affectedColumns: [stat.column],
+   717→          evidence: `First half avg: ${firstAvg.toFixed(2)}, Second half avg: ${secondAvg.toFixed(2)}, Change: ${percentChange.toFixed(1)}%`,
+   718→        });
+   719→      }
+   720→    }
+   721→
+   722→    // Correlation insights (Pearson)
+   723→    for (let i = 0; i < numericStats.length; i++) {
+   724→      for (let j = i + 1; j < numericStats.length; j++) {
+   725→        const colA = numericStats[i].column;
+   726→        const colB = numericStats[j].column;
+   727→
+   728→        const correlation = this.pearsonCorrelation(dataset, colA, colB);
+   729→        if (correlation !== null && Math.abs(correlation) > 0.7) {
+   730→          insights.push({
+   731→            id: uuidv4(),
+   732→            type: 'correlation',
+   733→            title: `Strong ${correlation > 0 ? 'positive' : 'negative'} correlation: ${colA} & ${colB}`,
+   734→            description: `${colA} and ${colB} have a Pearson correlation of ${correlation.toFixed(3)}, indicating a strong ${correlation > 0 ? 'positive' : 'negative'} relationship`,
+   735→            confidence: Math.min(0.95, 0.5 + Math.abs(correlation) / 2),
+   736→            affectedColumns: [colA, colB],
+   737→            evidence: `Pearson r = ${correlation.toFixed(3)}`,
+   738→          });
+   739→        }
+   740→      }
+   741→    }
+   742→
+   743→    // Outlier insights
+   744→    for (const stat of numericStats) {
+   745→      if (stat.stdDev === undefined || stat.stdDev === 0 || stat.mean === undefined) continue;
+   746→
+   747→      const col = dataset.columns.find(c => c.name === stat.column);
+   748→      if (!col) continue;
+   749→
+   750→      const outlierCount = dataset.rows.filter(r => {
+   751→        const val = Number(r[col.name]);
+   752→        return !isNaN(val) && Math.abs(val - stat.mean!) / stat.stdDev! > 3;
+   753→      }).length;
+   754→
+   755→      if (outlierCount > 0) {
+   756→        insights.push({
+   757→          id: uuidv4(),
+   758→          type: 'outlier',
+   759→          title: `Outliers detected in ${stat.column}`,
+   760→          description: `${outlierCount} value(s) in ${stat.column} are more than 3 standard deviations from the mean (${stat.mean.toFixed(2)} ± ${stat.stdDev.toFixed(2)})`,
+   761→          confidence: 0.85,
+   762→          affectedColumns: [stat.column],
+   763→          evidence: `Mean: ${stat.mean.toFixed(2)}, StdDev: ${stat.stdDev.toFixed(2)}, Outliers: ${outlierCount}`,
+   764→        });
+   765→      }
+   766→    }
+   767→
+   768→    // Pattern insights — value distribution for categorical columns
+   769→    const categoricalStats = stats.filter(s => s.topValues && s.topValues.length > 0);
+   770→    for (const stat of categoricalStats) {
+   771→      if (!stat.topValues || stat.uniqueValues === undefined) continue;
+   772→
+   773→      const topVal = stat.topValues[0];
+   774→      const dominanceRatio = topVal.count / stat.count;
+   775→
+   776→      if (dominanceRatio > 0.5 && stat.uniqueValues > 2) {
+   777→        insights.push({
+   778→          id: uuidv4(),
+   779→          type: 'pattern',
+   780→          title: `Dominant value in ${stat.column}`,
+   781→          description: `"${topVal.value}" accounts for ${(dominanceRatio * 100).toFixed(1)}% of ${stat.column} values (${topVal.count}/${stat.count}), potentially skewing analysis`,
+   782→          confidence: 0.75,
+   783→          affectedColumns: [stat.column],
+   784→          evidence: `Top value: "${topVal.value}" (${topVal.count} occurrences), ${stat.uniqueValues} unique values total`,
+   785→        });
+   786→      }
+   787→    }
+   788→
+   789→    return insights;
+   790→  }
+   791→
+   792→  // ─── Helper: Column Type Inference ───────────────────────
+   793→
+   794→  private inferColumnType(values: unknown[]): 'string' | 'number' | 'date' | 'boolean' | 'object' {
+   795→    const nonNull = values.filter(v => v !== null && v !== undefined && v !== '');
+   796→    if (nonNull.length === 0) return 'string';
+   797→
+   798→    // Check boolean
+   799→    const boolStrings = new Set(['true', 'false', 'yes', 'no', '0', '1']);
+   800→    if (nonNull.every(v => boolStrings.has(String(v).toLowerCase()))) {
+   801→      return 'boolean';
+   802→    }
+   803→
+   804→    // Check number
+   805→    if (nonNull.every(v => !isNaN(Number(v)))) {
+   806→      return 'number';
+   807→    }
+   808→
+   809→    // Check date
+   810→    const datePattern = /^\d{4}[-/]\d{1,2}[-/]\d{1,2}/;
+   811→    if (nonNull.every(v => datePattern.test(String(v)))) {
+   812→      return 'date';
+   813→    }
+   814→
+   815→    // Check object
+   816→    if (nonNull.every(v => typeof v === 'object' && !Array.isArray(v))) {
+   817→      return 'object';
+   818→    }
+   819→
+   820→    return 'string';
+   821→  }
+   822→
+   823→  // ─── Validation Scoring Helpers ──────────────────────────
+   824→
+   825→  private scoreAccuracy(output: DataOutput, suggestions: string[]): number {
+   826→    let score = 1.0;
+   827→    let checks = 0;
+   828→
+   829→    // Check that statistical means fall between min and max
+   830→    for (const stat of output.statistics) {
+   831→      if (stat.mean !== undefined && stat.min !== undefined && stat.max !== undefined) {
+   832→        checks++;
+   833→        const mean = stat.mean;
+   834→        const min = typeof stat.min === 'number' ? stat.min : -Infinity;
+   835→        const max = typeof stat.max === 'number' ? stat.max : Infinity;
+   836→        if (mean < min || mean > max) {
+   837→          score -= 0.3;
+   838→          suggestions.push(`Statistical inconsistency: mean of "${stat.column}" (${mean.toFixed(2)}) is outside min/max range [${min}, ${max}]`);
+   839→        }
+   840→      }
+   841→
+   842→      // Check stdDev is non-negative
+   843→      if (stat.stdDev !== undefined) {
+   844→        checks++;
+   845→        if (stat.stdDev < 0) {
+   846→          score -= 0.3;
+   847→          suggestions.push(`Invalid stdDev for "${stat.column}": cannot be negative`);
+   848→        }
+   849→      }
+   850→    }
+   851→
+   852→    // Check dataset rowCount matches actual rows
+   853→    for (const ds of output.datasets) {
+   854→      checks++;
+   855→      if (ds.rowCount !== ds.rows.length) {
+   856→        score -= 0.2;
+   857→        suggestions.push(`Dataset "${ds.name}" rowCount (${ds.rowCount}) doesn't match actual rows (${ds.rows.length})`);
+   858→      }
+   859→    }
+   860→
+   861→    // Check metadata consistency
+   862→    checks++;
+   863→    const primaryDs = output.datasets[0];
+   864→    if (primaryDs) {
+   865→      if (output.metadata.rowCount !== primaryDs.rowCount) {
+   866→        score -= 0.15;
+   867→        suggestions.push('Metadata rowCount does not match primary dataset rowCount');
+   868→      }
+   869→      if (output.metadata.columnCount !== primaryDs.columns.length) {
+   870→        score -= 0.15;
+   871→        suggestions.push('Metadata columnCount does not match primary dataset column count');
+   872→      }
+   873→    }
+   874→
+   875→    return checks > 0 ? Math.max(0, Math.min(1, score)) : 0.5;
+   876→  }
+   877→
+   878→  private scoreVisualization(output: DataOutput, suggestions: string[]): number {
+   879→    if (output.charts.length === 0) {
+   880→      suggestions.push('No charts generated — consider adding visualizations');
+   881→      return 0.3;
+   882→    }
+   883→
+   884→    let score = 0.6; // Base score for having charts
+   885→
+   886→    // Check chart types are appropriate for data
+   887→    const numericCols = output.datasets[0]?.columns.filter(c => c.type === 'number') ?? [];
+   888→    const stringCols = output.datasets[0]?.columns.filter(c => c.type === 'string') ?? [];
+   889→
+   890→    for (const chart of output.charts) {
+   891→      // Pie charts should use categorical data
+   892→      if (chart.type === 'pie' && stringCols.length === 0) {
+   893→        suggestions.push(`Pie chart "${chart.title}" may not be appropriate without categorical columns`);
+   894→        score -= 0.05;
+   895→      }
+   896→
+   897→      // Scatter charts need 2 numeric axes
+   898→      if (chart.type === 'scatter' && numericCols.length < 2) {
+   899→        suggestions.push(`Scatter chart "${chart.title}" requires at least 2 numeric columns`);
+   900→        score -= 0.1;
+   901→      }
+   902→
+   903→      // Histogram should be for numeric data
+   904→      if (chart.type === 'histogram' && numericCols.length === 0) {
+   905→        suggestions.push(`Histogram "${chart.title}" is not meaningful without numeric data`);
+   906→        score -= 0.1;
+   907→      }
+   908→
+   909→      // Chart should have non-empty series
+   910→      if (chart.series.length === 0 || chart.series.some(s => s.data.length === 0)) {
+   911→        suggestions.push(`Chart "${chart.title}" has empty series data`);
+   912→        score -= 0.1;
+   913→      }
+   914→
+   915→      // Chart should have an insight
+   916→      if (chart.insight && chart.insight.length > 10) {
+   917→        score += 0.05;
+   918→      }
+   919→    }
+   920→
+   921→    // Bonus for chart variety
+   922→    const chartTypes = new Set(output.charts.map(c => c.type));
+   923→    score += Math.min(0.2, chartTypes.size * 0.05);
+   924→
+   925→    return Math.max(0, Math.min(1, score));
+   926→  }
+   927→
+   928→  private scoreInsightDepth(output: DataOutput, suggestions: string[]): number {
+   929→    if (output.insights.length === 0) {
+   930→      suggestions.push('No insights generated — analysis may be too shallow');
+   931→      return 0.2;
+   932→    }
+   933→
+   934→    let score = 0.5;
+   935→
+   936→    // Variety of insight types
+   937→    const types = new Set(output.insights.map(i => i.type));
+   938→    score += Math.min(0.2, types.size * 0.05);
+   939→
+   940→    // Average confidence
+   941→    const avgConfidence = output.insights.reduce((sum, i) => sum + i.confidence, 0) / output.insights.length;
+   942→    score += avgConfidence * 0.15;
+   943→
+   944→    // Insight substantiveness — check that descriptions and evidence exist
+   945→    const substantive = output.insights.filter(
+   946→      i => i.description.length > 20 && i.evidence.length > 5 && i.affectedColumns.length > 0,
+   947→    );
+   948→    score += (substantive.length / output.insights.length) * 0.15;
+   949→
+   950→    if (substantive.length < output.insights.length) {
+   951→      suggestions.push('Some insights lack sufficient description, evidence, or affected column references');
+   952→    }
+   953→
+   954→    return Math.max(0, Math.min(1, score));
+   955→  }
+   956→
+   957→  private scoreCodeQuality(output: DataOutput, suggestions: string[]): number {
+   958→    let score = 0.7; // Base — pipeline executed successfully
+   959→
+   960→    // Check column type coverage
+   961→    const ds = output.datasets[0];
+   962→    if (ds) {
+   963→      const typedColumns = ds.columns.filter(c => c.type).length;
+   964→      const typeCoverage = typedColumns / ds.columns.length;
+   965→      if (typeCoverage < 1) {
+   966→        score -= 0.15;
+   967→        suggestions.push('Not all columns have type inference');
+   968→      }
+   969→
+   970→      // Nullable consistency
+   971→      const nullableMarked = ds.columns.filter(c => c.nullable !== undefined).length;
+   972→      if (nullableMarked < ds.columns.length) {
+   973→        score -= 0.05;
+   974→        suggestions.push('Not all columns have nullable information');
+   975→      }
+   976→    }
+   977→
+   978→    // Check statistics coverage
+   979→    if (output.statistics.length > 0 && ds) {
+   980→      const statsCoverage = output.statistics.length / ds.columns.length;
+   981→      if (statsCoverage < 1) {
+   982→        score -= 0.1;
+   983→        suggestions.push('Statistical analysis does not cover all columns');
+   984→      }
+   985→    }
+   986→
+   987→    // Quality score exists
+   988→    if (output.metadata.qualityScore >= 0) {
+   989→      score += 0.1;
+   990→    }
+   991→
+   992→    return Math.max(0, Math.min(1, score));
+   993→  }
+   994→
+   995→  private scoreDocumentation(output: DataOutput, suggestions: string[]): number {
+   996→    let score = 0.4;
+   997→
+   998→    const ds = output.datasets[0];
+   999→    if (ds) {
+  1000→      // Column descriptions
+  1001→      const described = ds.columns.filter(c => c.description && c.description.length > 0).length;
+  1002→      const descRatio = described / ds.columns.length;
+  1003→      score += descRatio * 0.25;
+  1004→
+  1005→      if (descRatio < 1) {
+  1006→        suggestions.push(`${ds.columns.length - described} column(s) lack descriptions`);
+  1007→      }
+  1008→
+  1009→      // Chart insights
+  1010→      const chartsWithInsight = output.charts.filter(c => c.insight && c.insight.length > 10).length;
+  1011→      if (output.charts.length > 0) {
+  1012→        const insightRatio = chartsWithInsight / output.charts.length;
+  1013→        score += insightRatio * 0.2;
+  1014→
+  1015→        if (insightRatio < 1) {
+  1016→          suggestions.push(`${output.charts.length - chartsWithInsight} chart(s) lack meaningful insights`);
+  1017→        }
+  1018→      }
+  1019→
+  1020→      // Summary overview
+  1021→      if (output.summary.overview.length > 50) {
+  1022→        score += 0.1;
+  1023→      }
+  1024→
+  1025→      // Recommendations
+  1026→      if (output.summary.recommendations.length > 0) {
+  1027→        score += 0.05;
+  1028→      }
+  1029→    }
+  1030→
+  1031→    return Math.max(0, Math.min(1, score));
+  1032→  }
+  1033→
+  1034→  // ─── Rendering Helpers ───────────────────────────────────
+  1035→
+  1036→  private renderCsv(output: DataOutput): string {
+  1037→    const ds = output.datasets[0];
+  1038→    if (!ds) return '';
+  1039→
+  1040→    const headers = ds.columns.map(c => c.name).join(',');
+  1041→    const rows = ds.rows.map(row =>
+  1042→      ds.columns.map(col => {
+  1043→        const val = row[col.name];
+  1044→        const str = val === null || val === undefined ? '' : String(val);
+  1045→        return str.includes(',') || str.includes('"') || str.includes('\n')
+  1046→          ? `"${str.replace(/"/g, '""')}"`
+  1047→          : str;
+  1048→      }).join(','),
+  1049→    );
+  1050→
+  1051→    return [headers, ...rows].join('\n');
+  1052→  }
+  1053→
+  1054→  private renderXlsxMeta(output: DataOutput): unknown {
+  1055→    const ds = output.datasets[0];
+  1056→    return {
+  1057→      title: output.title,
+  1058→      sheets: output.datasets.map(d => ({
+  1059→        name: d.name,
+  1060→        columns: d.columns.map(c => ({
+  1061→          header: c.name,
+  1062→          type: c.type,
+  1063→          width: Math.max(12, Math.min(30, c.name.length * 2)),
+  1064→        })),
+  1065→        rowCount: d.rowCount,
+  1066→      })),
+  1067→      charts: output.charts.map(c => ({
+  1068→        type: c.type,
+  1069→        title: c.title,
+  1070→        sheet: ds?.name ?? 'Sheet1',
+  1071→      })),
+  1072→      metadata: output.metadata,
+  1073→    };
+  1074→  }
+  1075→
+  1076→  // ─── Utility Helpers ─────────────────────────────────────
+  1077→
+  1078→  private splitCsvLine(line: string): string[] {
+  1079→    const result: string[] = [];
+  1080→    let current = '';
+  1081→    let inQuotes = false;
+  1082→
+  1083→    for (let i = 0; i < line.length; i++) {
+  1084→      const ch = line[i];
+  1085→      if (inQuotes) {
+  1086→        if (ch === '"' && line[i + 1] === '"') {
+  1087→          current += '"';
+  1088→          i++;
+  1089→        } else if (ch === '"') {
+  1090→          inQuotes = false;
+  1091→        } else {
+  1092→          current += ch;
+  1093→        }
+  1094→      } else {
+  1095→        if (ch === '"') {
+  1096→          inQuotes = true;
+  1097→        } else if (ch === ',') {
+  1098→          result.push(current.trim());
+  1099→          current = '';
+  1100→        } else {
+  1101→          current += ch;
+  1102→        }
+  1103→      }
+  1104→    }
+  1105→    result.push(current.trim());
+  1106→    return result;
+  1107→  }
+  1108→
+  1109→  private castValue(raw: string | null): unknown {
+  1110→    if (raw === null || raw === '') return null;
+  1111→    if (raw === 'true' || raw === 'TRUE') return true;
+  1112→    if (raw === 'false' || raw === 'FALSE') return false;
+  1113→    const num = Number(raw);
+  1114→    if (!isNaN(num) && raw.trim() !== '') return num;
+  1115→    return raw;
+  1116→  }
+  1117→
+  1118→  private pearsonCorrelation(dataset: Dataset, colA: string, colB: string): number | null {
+  1119→    const pairs = dataset.rows
+  1120→      .map(r => [Number(r[colA]), Number(r[colB])])
+  1121→      .filter(([a, b]) => !isNaN(a) && !isNaN(b));
+  1122→
+  1123→    const n = pairs.length;
+  1124→    if (n < 3) return null;
+  1125→
+  1126→    const sumA = pairs.reduce((s, [a]) => s + a, 0);
+  1127→    const sumB = pairs.reduce((s, [, b]) => s + b, 0);
+  1128→    const sumAB = pairs.reduce((s, [a, b]) => s + a * b, 0);
+  1129→    const sumA2 = pairs.reduce((s, [a]) => s + a * a, 0);
+  1130→    const sumB2 = pairs.reduce((s, [, b]) => s + b * b, 0);
+  1131→
+  1132→    const numerator = n * sumAB - sumA * sumB;
+  1133→    const denominator = Math.sqrt((n * sumA2 - sumA * sumA) * (n * sumB2 - sumB * sumB));
+  1134→
+  1135→    if (denominator === 0) return null;
+  1136→    return numerator / denominator;
+  1137→  }
+  1138→
+  1139→  private assessDataQuality(dataset: Dataset, stats: StatisticalSummary[]): number {
+  1140→    let score = 1.0;
+  1141→
+  1142→    for (const col of dataset.columns) {
+  1143→      const stat = stats.find(s => s.column === col.name);
+  1144→      if (!stat) continue;
+  1145→
+  1146→      // Penalize missing data
+  1147→      const completeness = stat.count / dataset.rowCount;
+  1148→      score *= completeness;
+  1149→    }
+  1150→
+  1151→    return Math.round(score * 100) / 100;
+  1152→  }
+  1153→
+  1154→  private buildOverview(dataset: Dataset, stats: StatisticalSummary[], insights: DataInsight[]): string {
+  1155→    const numCols = dataset.columns.filter(c => c.type === 'number').length;
+  1156→    const catCols = dataset.columns.filter(c => c.type === 'string').length;
+  1157→    const insightTypes = insights.map(i => i.type);
+  1158→    const hasTrend = insightTypes.includes('trend');
+  1159→    const hasCorrelation = insightTypes.includes('correlation');
+  1160→
+  1161→    let overview = `Dataset "${dataset.name}" contains ${dataset.rowCount} rows and ${dataset.columns.length} columns (${numCols} numeric, ${catCols} categorical). `;
+  1162→
+  1163→    if (hasTrend) overview += 'Trend patterns were identified in the data. ';
+  1164→    if (hasCorrelation) overview += 'Significant correlations were found between variables. ';
+  1165→    if (insights.some(i => i.type === 'outlier')) overview += 'Outliers were detected that may warrant investigation. ';
+  1166→
+  1167→    return overview.trim();
+  1168→  }
+  1169→
+  1170→  private extractKeyMetrics(stats: StatisticalSummary[]): Record<string, number> {
+  1171→    const metrics: Record<string, number> = {};
+  1172→    for (const stat of stats) {
+  1173→      if (stat.mean !== undefined) {
+  1174→        metrics[`${stat.column}_mean`] = Math.round(stat.mean * 100) / 100;
+  1175→      }
+  1176→      if (stat.stdDev !== undefined) {
+  1177→        metrics[`${stat.column}_stdDev`] = Math.round(stat.stdDev * 100) / 100;
+  1178→      }
+  1179→      if (stat.uniqueValues !== undefined) {
+  1180→        metrics[`${stat.column}_unique`] = stat.uniqueValues;
+  1181→      }
+  1182→    }
+  1183→    return metrics;
+  1184→  }
+  1185→
+  1186→  private buildRecommendations(
+  1187→    dataset: Dataset,
+  1188→    stats: StatisticalSummary[],
+  1189→    anomalies: string[],
+  1190→  ): string[] {
+  1191→    const recs: string[] = [];
+  1192→
+  1193→    if (anomalies.length > 0) {
+  1194→      recs.push(`Investigate ${anomalies.length} detected anomaly/anomalies before drawing conclusions`);
+  1195→    }
+  1196→
+  1197→    const highNullCols = dataset.columns.filter(col => {
+  1198→      const stat = stats.find(s => s.column === col.name);
+  1199→      return stat && stat.count < dataset.rowCount * 0.8;
+  1200→    });
+  1201→
+  1202→    if (highNullCols.length > 0) {
+  1203→      recs.push(`Consider imputing or removing columns with high null rates: ${highNullCols.map(c => c.name).join(', ')}`);
+  1204→    }
+  1205→
+  1206→    const numericCols = dataset.columns.filter(c => c.type === 'number');
+  1207→    if (numericCols.length >= 3) {
+  1208→      recs.push('With multiple numeric columns, consider multivariate analysis for deeper insights');
+  1209→    }
+  1210→
+  1211→    if (dataset.rowCount < 30) {
+  1212→      recs.push('Dataset is small — statistical significance may be limited; consider collecting more data');
+  1213→    }
+  1214→
+  1215→    if (recs.length === 0) {
+  1216→      recs.push('Data quality looks good — proceed with deeper domain-specific analysis');
+  1217→    }
+  1218→
+  1219→    return recs;
+  1220→  }
+  1221→
+  1222→  private inferTitle(prompt: string): string {
+  1223→    // Try to extract a title from the prompt
+  1224→    const titleMatch = prompt.match(/(?:analyze|analyze|visualize|show|chart|report)\s+(?:the\s+)?(.+?)(?:\s+(?:data|dataset|table|spreadsheet))?$/i);
+  1225→    if (titleMatch && titleMatch[1].length > 2 && titleMatch[1].length < 80) {
+  1226→      return titleMatch[1].replace(/\s+/g, ' ').trim();
+  1227→    }
+  1228→    // Fallback: first 50 chars
+  1229→    return prompt.slice(0, 50).trim() || 'Data Analysis';
+  1230→  }
+  1231→
+  1232→  private getChartColor(index: number): string {
+  1233→    const palette = ['#F59E0B', '#3B82F6', '#10B981', '#EF4444', '#8B5CF6', '#EC4899', '#06B6D4', '#84CC16'];
+  1234→    return palette[index % palette.length];
+  1235→  }
+  1236→
+  1237→  // ─── Sample Data Generators ──────────────────────────────
+  1238→
+  1239→  private generateSalesRows(): Record<string, unknown>[] {
+  1240→    const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  1241→    return months.map((month, i) => {
+  1242→      const revenue = 50000 + Math.floor(Math.random() * 30000) + i * 2000;
+  1243→      const expenses = 30000 + Math.floor(Math.random() * 10000) + i * 500;
+  1244→      return { month, revenue, expenses, profit: revenue - expenses };
+  1245→    });
+  1246→  }
+  1247→
+  1248→  private generateUserRows(): Record<string, unknown>[] {
+  1249→    const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  1250→    return months.map((month, i) => ({
+  1251→      userId: `U${(i + 1).toString().padStart(3, '0')}`,
+  1252→      signups: 200 + Math.floor(Math.random() * 100) + i * 15,
+  1253→      activeUsers: 1500 + Math.floor(Math.random() * 500) + i * 80,
+  1254→      churnRate: Math.round((5 + Math.random() * 3 - i * 0.2) * 10) / 10,
+  1255→    }));
+  1256→  }
+  1257→
+  1258→  private generatePerformanceRows(): Record<string, unknown>[] {
+  1259→    const departments = ['Engineering', 'Marketing', 'Sales', 'Support', 'Design', 'Operations'];
+  1260→    return departments.map(dept => ({
+  1261→      department: dept,
+  1262→      productivity: 60 + Math.floor(Math.random() * 35),
+  1263→      satisfaction: 55 + Math.floor(Math.random() * 40),
+  1264→      retention: 70 + Math.floor(Math.random() * 25),
+  1265→    }));
+  1266→  }
+  1267→
+  1268→  private generateGenericRows(): Record<string, unknown>[] {
+  1269→    const categories = ['Alpha', 'Beta', 'Gamma', 'Delta', 'Epsilon', 'Zeta', 'Eta', 'Theta'];
+  1270→    return categories.map(category => ({
+  1271→      category,
+  1272→      value: Math.floor(Math.random() * 100) + 10,
+  1273→      count: Math.floor(Math.random() * 500) + 50,
+  1274→    }));
+  1275→  }
+  1276→}
+  1277→

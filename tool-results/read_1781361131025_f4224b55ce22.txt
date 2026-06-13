@@ -1,0 +1,868 @@
+     1→// ============================================================
+     2→// AgentForge - MoA (Mixture-of-Agents) Code Generator
+     3→// Full Genspark-inspired cascading: Proposer → Critic → Refiner
+     4→// Phase 2: 9 parallel models, multi-criteria weighted voting,
+     5→// feedback injection, Jaccard-like deduplication, configurable
+     6→// round strategies, and consensus detection
+     7→// ============================================================
+     8→
+     9→import type {
+    10→  AgentConfig,
+    11→  DAGNode,
+    12→  LLMId,
+    13→  LLMMessage,
+    14→  MoAProposal,
+    15→  MoAResult,
+    16→  MoAVotingConfig,
+    17→  MoAVotingDetails,
+    18→  MoARoundConfig,
+    19→  MoAAgentConfig,
+    20→} from '@agentforge/shared';
+    21→import { calculateLLMCost } from '@agentforge/shared';
+    22→import { LLMRouter } from '../../services/LLMRouter';
+    23→import { tracingService } from '../../services/telemetry/TracingService';
+    24→import { EventEmitter } from 'events';
+    25→
+    26→// MoA Round types for cascading
+    27→type MoARound = 'propose' | 'critique' | 'refine';
+    28→
+    29→interface MoARoundResult {
+    30→  round: MoARound;
+    31→  proposals: MoAProposal[];
+    32→  aggregatedOutput: string;
+    33→  tokensUsed: number;
+    34→  cost: number;
+    35→  latencyMs: number;
+    36→}
+    37→
+    38→interface GenerationResult {
+    39→  nodeId: string;
+    40→  output: string;
+    41→  tokensUsed: number;
+    42→  cost: number;
+    43→  latencyMs: number;
+    44→  moaResult?: MoAResult;
+    45→}
+    46→
+    47→// Event types for live streaming
+    48→export interface MoAEvent {
+    49→  type: 'round_start' | 'proposal_received' | 'round_complete' | 'generation_complete' | 'deduplication' | 'consensus_reached' | 'feedback_injected';
+    50→  nodeId: string;
+    51→  round?: MoARound;
+    52→  provider?: LLMId;
+    53→  confidence?: number;
+    54→  data?: unknown;
+    55→  timestamp: number;
+    56→}
+    57→
+    58→// Default voting config used when agent has no moaConfig
+    59→const DEFAULT_VOTING_CONFIG: MoAVotingConfig = {
+    60→  criteriaWeights: { quality: 0.4, costEfficiency: 0.3, speed: 0.3 },
+    61→  minConsensus: 0.7,
+    62→  deduplicationThreshold: 0.7,
+    63→};
+    64→
+    65→// Default round configs (legacy behaviour)
+    66→const DEFAULT_ROUND_CONFIGS: MoARoundConfig[] = [
+    67→  { round: 'propose', providerCount: 3, temperature: 0.3, strategy: 'all' },
+    68→  { round: 'critique', providerCount: 2, temperature: 0.2, strategy: 'top_n' },
+    69→  { round: 'refine', providerCount: 3, temperature: 0.3, strategy: 'top_n' },
+    70→];
+    71→
+    72→export class CodeGenerator extends EventEmitter {
+    73→  private llmRouter: LLMRouter;
+    74→  private readonly MAX_MOA_ROUNDS = 3;
+    75→  private readonly MIN_PROPOSALS_FOR_CONSENSUS = 2;
+    76→  private readonly CONFIDENCE_THRESHOLD = 0.85;
+    77→
+    78→  constructor(llmRouter?: LLMRouter) {
+    79→    super();
+    80→    this.llmRouter = llmRouter || new LLMRouter();
+    81→  }
+    82→
+    83→  // ═══════════════════════════════════════════════════════
+    84→  // Public API
+    85→  // ═══════════════════════════════════════════════════════
+    86→
+    87→  /**
+    88→   * Generate output for a DAG node using full MoA cascading.
+    89→   * Signature preserved for backward compatibility.
+    90→   *
+    91→   * Round 1 (Propose): Configurable number of LLMs propose independently
+    92→   * Round 2 (Critique): LLMs critique each other's proposals
+    93→   * Round 3 (Refine): LLMs refine based on critiques (+ optional feedback)
+    94→   */
+    95→  async generate(
+    96→    node: DAGNode,
+    97→    input: string,
+    98→    config: AgentConfig,
+    99→    providers: LLMId[]
+   100→  ): Promise<GenerationResult> {
+   101→    return this.generateWithFeedback(node, input, config, providers);
+   102→  }
+   103→
+   104→  /**
+   105→   * Extended generation with reflection feedback injection.
+   106→   * When `feedback` is provided it is merged into the Refine round prompt,
+   107→   * giving the LLMs context from previous reflection cycles.
+   108→   */
+   109→  async generateWithFeedback(
+   110→    node: DAGNode,
+   111→    input: string,
+   112→    config: AgentConfig,
+   113→    providers: LLMId[],
+   114→    feedback?: string
+   115→  ): Promise<GenerationResult> {
+   116→    const doGenerate = async () => {
+   117→      const startTime = Date.now();
+   118→      const moaConfig = config.moaConfig;
+   119→      const votingConfig = moaConfig?.voting ?? DEFAULT_VOTING_CONFIG;
+   120→      const roundConfigs = this.resolveRoundConfigs(moaConfig);
+   121→
+   122→      // Build the full provider pool from the agent config (primary + secondary + fallback)
+   123→      const allProviders = this.resolveAllProviders(config);
+   124→
+   125→      const allRounds: MoARoundResult[] = [];
+   126→      let totalTokens = 0;
+   127→      let totalCost = 0;
+   128→      let deduplicationCount = 0;
+   129→
+   130→      // ═══════════════════════════════════════════════
+   131→      // ROUND 1: PROPOSE — All (or configured) LLMs generate independently
+   132→      // ═══════════════════════════════════════════════
+   133→      const proposeRoundConfig = roundConfigs.find(r => r.round === 'propose')!;
+   134→      this.emitEvent('round_start', node.id, 'propose', undefined, {
+   135→        providerCount: proposeRoundConfig.providerCount,
+   136→        strategy: proposeRoundConfig.strategy,
+   137→      });
+   138→
+   139→      const proposeProviders = this.selectProvidersForRound(
+   140→        proposeRoundConfig,
+   141→        allProviders.length > 0 ? allProviders : providers
+   142→      );
+   143→      const proposeMessages = this.buildProposeMessages(node, input, config);
+   144→      const rawProposals = await this.callAllProviders(
+   145→        proposeProviders,
+   146→        proposeMessages,
+   147→        config,
+   148→        proposeRoundConfig.temperature
+   149→      );
+   150→
+   151→      // Deduplicate proposals using Jaccard-like similarity
+   152→      const proposals = this.deduplicateProposals(rawProposals, votingConfig.deduplicationThreshold);
+   153→      deduplicationCount += rawProposals.length - proposals.length;
+   154→
+   155→      this.emitEvent('deduplication', node.id, 'propose', undefined, {
+   156→        originalCount: rawProposals.length,
+   157→        deduplicatedCount: proposals.length,
+   158→        removedCount: deduplicationCount,
+   159→      });
+   160→
+   161→      this.emitEvent('round_complete', node.id, 'propose', undefined, {
+   162→        proposalCount: proposals.length,
+   163→      });
+   164→
+   165→      // Multi-criteria weighted voting for best proposal
+   166→      const { bestProposal, votingDetails } = this.weightedVote(proposals, votingConfig);
+   167→
+   168→      const proposeResult: MoARoundResult = {
+   169→        round: 'propose',
+   170→        proposals,
+   171→        aggregatedOutput: bestProposal?.content || proposals[0]?.content || '',
+   172→        tokensUsed: proposals.reduce((s, p) => s + p.tokensUsed, 0),
+   173→        cost: proposals.reduce((s, p) => s + p.cost, 0),
+   174→        latencyMs: Date.now() - startTime,
+   175→      };
+   176→      allRounds.push(proposeResult);
+   177→      totalTokens += proposeResult.tokensUsed;
+   178→      totalCost += proposeResult.cost;
+   179→
+   180→      // Early exit if high confidence with consensus (per configurable threshold)
+   181→      const consensusResult = this.hasConsensusWithDetails(proposals, votingConfig.minConsensus);
+   182→      if (consensusResult.consensus) {
+   183→        this.emitEvent('consensus_reached', node.id, 'propose', undefined, {
+   184→          proposalsAboveThreshold: consensusResult.proposalsAboveThreshold,
+   185→          totalProposals: proposals.length,
+   186→          threshold: votingConfig.minConsensus,
+   187→        });
+   188→
+   189→        return this.buildResult(
+   190→          node.id, proposeResult.aggregatedOutput, totalTokens, totalCost, startTime, allRounds,
+   191→          { ...votingDetails, consensusReached: true, consensusThreshold: votingConfig.minConsensus, proposalsAboveThreshold: consensusResult.proposalsAboveThreshold, deduplicationCount }
+   192→        );
+   193→      }
+   194→
+   195→      // ═══════════════════════════════════════════════
+   196→      // ROUND 2: CRITIQUE — LLMs review each other's work
+   197→      // ═══════════════════════════════════════════════
+   198→      const critiqueRoundConfig = roundConfigs.find(r => r.round === 'critique')!;
+   199→      this.emitEvent('round_start', node.id, 'critique', undefined, {
+   200→        providerCount: critiqueRoundConfig.providerCount,
+   201→        strategy: critiqueRoundConfig.strategy,
+   202→      });
+   203→
+   204→      const critiqueMessages = this.buildCritiqueMessages(
+   205→        node, input, config, proposals, proposeResult.aggregatedOutput
+   206→      );
+   207→      const critiqueProviders = this.selectProvidersForRound(
+   208→        critiqueRoundConfig,
+   209→        allProviders.length > 0 ? allProviders : providers
+   210→      );
+   211→      const critiques = await this.callAllProviders(
+   212→        critiqueProviders,
+   213→        critiqueMessages,
+   214→        config,
+   215→        critiqueRoundConfig.temperature
+   216→      );
+   217→
+   218→      this.emitEvent('round_complete', node.id, 'critique', undefined, {
+   219→        critiqueCount: critiques.length,
+   220→      });
+   221→
+   222→      // Synthesize critiques into actionable feedback
+   223→      const synthesizedFeedback = this.synthesizeCritiques(critiques);
+   224→      const critiqueResult: MoARoundResult = {
+   225→        round: 'critique',
+   226→        proposals: critiques,
+   227→        aggregatedOutput: synthesizedFeedback,
+   228→        tokensUsed: critiques.reduce((s, p) => s + p.tokensUsed, 0),
+   229→        cost: critiques.reduce((s, p) => s + p.cost, 0),
+   230→        latencyMs: Date.now() - startTime,
+   231→      };
+   232→      allRounds.push(critiqueResult);
+   233→      totalTokens += critiqueResult.tokensUsed;
+   234→      totalCost += critiqueResult.cost;
+   235→
+   236→      // ═══════════════════════════════════════════════
+   237→      // ROUND 3: REFINE — LLMs refine based on critiques + feedback
+   238→      // ═══════════════════════════════════════════════
+   239→      const refineRoundConfig = roundConfigs.find(r => r.round === 'refine')!;
+   240→      this.emitEvent('round_start', node.id, 'refine', undefined, {
+   241→        providerCount: refineRoundConfig.providerCount,
+   242→        strategy: refineRoundConfig.strategy,
+   243→      });
+   244→
+   245→      // Inject reflection feedback if available and enabled
+   246→      const combinedFeedback = this.combineFeedback(synthesizedFeedback, feedback, moaConfig);
+   247→      if (feedback && moaConfig?.feedbackInjection) {
+   248→        this.emitEvent('feedback_injected', node.id, 'refine', undefined, {
+   249→          feedbackLength: feedback.length,
+   250→          critiqueLength: synthesizedFeedback.length,
+   251→        });
+   252→      }
+   253→
+   254→      const refineMessages = this.buildRefineMessages(
+   255→        node, input, config, proposeResult.aggregatedOutput, combinedFeedback
+   256→      );
+   257→      const refineProviders = this.selectProvidersForRound(
+   258→        refineRoundConfig,
+   259→        allProviders.length > 0 ? allProviders : providers
+   260→      );
+   261→      const refinements = await this.callAllProviders(
+   262→        refineProviders,
+   263→        refineMessages,
+   264→        config,
+   265→        refineRoundConfig.temperature
+   266→      );
+   267→
+   268→      this.emitEvent('round_complete', node.id, 'refine', undefined, {
+   269→        refinementCount: refinements.length,
+   270→      });
+   271→
+   272→      // Weighted voting for the best refinement
+   273→      const { bestProposal: bestRefinement, votingDetails: refineVoting } = this.weightedVote(refinements, votingConfig);
+   274→      const refineResult: MoARoundResult = {
+   275→        round: 'refine',
+   276→        proposals: refinements,
+   277→        aggregatedOutput: bestRefinement?.content || refinements[0]?.content || proposeResult.aggregatedOutput,
+   278→        tokensUsed: refinements.reduce((s, p) => s + p.tokensUsed, 0),
+   279→        cost: refinements.reduce((s, p) => s + p.cost, 0),
+   280→        latencyMs: Date.now() - startTime,
+   281→      };
+   282→      allRounds.push(refineResult);
+   283→      totalTokens += refineResult.tokensUsed;
+   284→      totalCost += refineResult.cost;
+   285→
+   286→      // Final output: Use the best refinement, or fall back to best proposal
+   287→      const finalOutput = refineResult.aggregatedOutput || proposeResult.aggregatedOutput;
+   288→
+   289→      this.emitEvent('generation_complete', node.id, undefined, undefined, {
+   290→        totalRounds: allRounds.length,
+   291→        finalConfidence: bestRefinement?.confidence || 0,
+   292→      });
+   293→
+   294→      // Merge voting details from both rounds (use refine round as final)
+   295→      const mergedVotingDetails: MoAVotingDetails = {
+   296→        ...refineVoting,
+   297→        consensusReached: false,
+   298→        consensusThreshold: votingConfig.minConsensus,
+   299→        proposalsAboveThreshold: 0,
+   300→        deduplicationCount,
+   301→      };
+   302→
+   303→      return this.buildResult(
+   304→        node.id, finalOutput, totalTokens, totalCost, startTime, allRounds, mergedVotingDetails
+   305→      );
+   306→    };
+   307→
+   308→    // Wrap with tracing spans for agent.execute and agent.moa_round
+   309→    if (tracingService.isEnabled()) {
+   310→      return tracingService.withSpan(
+   311→        { name: 'agent.execute', attributes: { 'agent.node_id': node.id, 'agent.role': node.agentRole } },
+   312→        async (span) => {
+   313→          const result = await doGenerate();
+   314→          span.setAttribute('agent.tokens_used', result.tokensUsed);
+   315→          span.setAttribute('agent.cost', result.cost);
+   316→          span.setAttribute('agent.latency_ms', result.latencyMs);
+   317→          if (result.moaResult) {
+   318→            span.setAttribute('agent.moa_rounds', result.moaResult.proposals.length);
+   319→          }
+   320→          return result;
+   321→        },
+   322→      );
+   323→    }
+   324→    return doGenerate();
+   325→  }
+   326→
+   327→  // ═══════════════════════════════════════════════════════
+   328→  // Round Config Resolution
+   329→  // ═══════════════════════════════════════════════════════
+   330→
+   331→  /**
+   332→   * Resolve round configs from agent moaConfig, falling back to defaults.
+   333→   */
+   334→  private resolveRoundConfigs(moaConfig?: MoAAgentConfig): MoARoundConfig[] {
+   335→    if (moaConfig?.rounds && moaConfig.rounds.length >= 3) {
+   336→      return moaConfig.rounds;
+   337→    }
+   338→    return DEFAULT_ROUND_CONFIGS;
+   339→  }
+   340→
+   341→  /**
+   342→   * Build the full provider list from the agent's LLM pool.
+   343→   * Returns all providers across primary/secondary/fallback.
+   344→   */
+   345→  private resolveAllProviders(config: AgentConfig): LLMId[] {
+   346→    const all = [
+   347→      ...config.llmPool.primary.map(p => p.id as LLMId),
+   348→      ...config.llmPool.secondary.map(p => p.id as LLMId),
+   349→      ...config.llmPool.fallback.map(p => p.id as LLMId),
+   350→    ];
+   351→    return [...new Set(all)];
+   352→  }
+   353→
+   354→  /**
+   355→   * Select providers for a round based on the round config strategy.
+   356→   * - 'all': use all available providers up to providerCount
+   357→   * - 'top_n': select top-N by quality ranking
+   358→   * - 'epsilon_greedy': mostly top-N with a small chance of random exploration
+   359→   */
+   360→  private selectProvidersForRound(
+   361→    roundConfig: MoARoundConfig,
+   362→    availableProviders: LLMId[]
+   363→  ): LLMId[] {
+   364→    const count = Math.min(roundConfig.providerCount, availableProviders.length);
+   365→
+   366→    switch (roundConfig.strategy) {
+   367→      case 'all':
+   368→        return availableProviders.slice(0, count);
+   369→
+   370→      case 'top_n':
+   371→        return this.selectTopProviders(availableProviders, count);
+   372→
+   373→      case 'epsilon_greedy': {
+   374→        // 80% exploitation (top-N), 20% exploration (random)
+   375→        if (Math.random() < 0.2 && availableProviders.length > count) {
+   376→          const shuffled = [...availableProviders].sort(() => Math.random() - 0.5);
+   377→          return shuffled.slice(0, count);
+   378→        }
+   379→        return this.selectTopProviders(availableProviders, count);
+   380→      }
+   381→
+   382→      default:
+   383→        return availableProviders.slice(0, count);
+   384→    }
+   385→  }
+   386→
+   387→  // ═══════════════════════════════════════════════════════
+   388→  // Message Builders for each MoA round
+   389→  // ═══════════════════════════════════════════════════════
+   390→
+   391→  private buildProposeMessages(node: DAGNode, input: string, config: AgentConfig): LLMMessage[] {
+   392→    return [
+   393→      {
+   394→        role: 'system',
+   395→        content: `${config.systemPrompt}\n\nYour current role: ${node.agentRole}\nTask: ${node.label}\n\nYou are in the PROPOSAL phase. Generate the best possible solution. Be thorough, creative, and production-ready. Include error handling, type safety, and clean code structure.`,
+   396→      },
+   397→      {
+   398→        role: 'user',
+   399→        content: input,
+   400→      },
+   401→    ];
+   402→  }
+   403→
+   404→  private buildCritiqueMessages(
+   405→    node: DAGNode,
+   406→    input: string,
+   407→    config: AgentConfig,
+   408→    proposals: MoAProposal[],
+   409→    bestOutput: string
+   410→  ): LLMMessage[] {
+   411→    // Build a summary of all proposals for context
+   412→    const proposalSummary = proposals
+   413→      .slice(0, 6) // Allow more proposals for 9-model context
+   414→      .map((p, i) => `--- Proposal ${i + 1} (from ${p.provider}) ---\n${p.content.substring(0, 2000)}`)
+   415→      .join('\n\n');
+   416→
+   417→    return [
+   418→      {
+   419→        role: 'system',
+   420→        content: `You are a senior ${node.agentRole} reviewer. You are in the CRITIQUE phase.\n\nYour job is to critically review the following proposals and identify:\n1. Critical bugs or errors\n2. Missing edge cases\n3. Performance issues\n4. Security vulnerabilities\n5. Code quality improvements\n6. Missing error handling\n7. Type safety issues\n\nBe specific and actionable. Focus on what MUST be fixed, not nice-to-haves.`,
+   421→      },
+   422→      {
+   423→        role: 'user',
+   424→        content: `Original request: ${input.substring(0, 1000)}\n\nBest proposal so far:\n${bestOutput.substring(0, 4000)}\n\nOther proposals for reference:\n${proposalSummary}\n\nProvide a detailed critique with specific, actionable improvements. Format as a numbered list of issues with suggested fixes.`,
+   425→      },
+   426→    ];
+   427→  }
+   428→
+   429→  private buildRefineMessages(
+   430→    node: DAGNode,
+   431→    input: string,
+   432→    config: AgentConfig,
+   433→    bestOutput: string,
+   434→    critique: string
+   435→  ): LLMMessage[] {
+   436→    return [
+   437→      {
+   438→        role: 'system',
+   439→        content: `${config.systemPrompt}\n\nYour current role: ${node.agentRole}\nTask: ${node.label}\n\nYou are in the REFINEMENT phase. Take the best proposal and apply all the critique feedback to produce the final, production-ready output.\n\nRules:\n- Apply ALL critical fixes from the critique\n- Maintain the overall structure and approach\n- Improve error handling and type safety\n- Ensure no regressions from the original proposal\n- Return the COMPLETE refined output, not just changes`,
+   440→      },
+   441→      {
+   442→        role: 'user',
+   443→        content: `Original request: ${input.substring(0, 1000)}`,
+   444→      },
+   445→      {
+   446→        role: 'assistant',
+   447→        content: bestOutput.substring(0, 6000),
+   448→      },
+   449→      {
+   450→        role: 'user',
+   451→        content: `Critique to address:\n${critique.substring(0, 4000)}\n\nPlease produce the refined, production-ready output addressing ALL the issues above. Return the complete output.`,
+   452→      },
+   453→    ];
+   454→  }
+   455→
+   456→  // ═══════════════════════════════════════════════════════
+   457→  // Provider Management
+   458→  // ═══════════════════════════════════════════════════════
+   459→
+   460→  private async callAllProviders(
+   461→    providers: LLMId[],
+   462→    messages: LLMMessage[],
+   463→    config: AgentConfig,
+   464→    roundTemperature?: number
+   465→  ): Promise<MoAProposal[]> {
+   466→    const results = await Promise.allSettled(
+   467→      providers.map(provider => {
+   468→        const providerConfig = config.llmPool.primary.find(p => p.id === provider)
+   469→          ?? config.llmPool.secondary.find(p => p.id === provider)
+   470→          ?? config.llmPool.fallback.find(p => p.id === provider);
+   471→
+   472→        const temperature = roundTemperature ?? providerConfig?.temperature ?? 0.3;
+   473→        const maxTokens = providerConfig?.maxTokens ?? 4096;
+   474→
+   475→        return this.llmRouter.call(provider, messages, { temperature, maxTokens });
+   476→      })
+   477→    );
+   478→
+   479→    return results
+   480→      .map((result, i) => {
+   481→        if (result.status === 'fulfilled' && result.value.content !== null) {
+   482→          const provider = providers[i];
+   483→          const confidence = this.estimateConfidence(result.value.content);
+   484→          this.emitEvent('proposal_received', '', undefined, provider, { confidence });
+   485→          return {
+   486→            provider,
+   487→            content: result.value.content,
+   488→            confidence,
+   489→            tokensUsed: result.value.tokensUsed || 0,
+   490→            cost: result.value.cost || 0,
+   491→            latencyMs: result.value.latencyMs || 0,
+   492→          } satisfies MoAProposal;
+   493→        }
+   494→        return null;
+   495→      })
+   496→      .filter((p): p is MoAProposal => p !== null);
+   497→  }
+   498→
+   499→  private selectTopProviders(providers: LLMId[], count: number): LLMId[] {
+   500→    // Prioritize by known quality (Claude > GPT-4o > DeepSeek > Gemini > others)
+   501→    const qualityOrder: Record<string, number> = {
+   502→      'claude-3.7-sonnet': 10,
+   503→      'gpt-4o': 9,
+   504→      'gpt-o1': 8,
+   505→      'deepseek-r1': 7,
+   506→      'gemini-2.5-pro': 6,
+   507→      'mistral-large': 5,
+   508→      'qwen-2.5': 4,
+   509→      'llama-3.3': 3,
+   510→      'gemini-2.0-flash': 2,
+   511→    };
+   512→
+   513→    return [...providers]
+   514→      .sort((a, b) => (qualityOrder[b] || 0) - (qualityOrder[a] || 0))
+   515→      .slice(0, count);
+   516→  }
+   517→
+   518→  // ═══════════════════════════════════════════════════════
+   519→  // Multi-Criteria Weighted Voting
+   520→  // ═══════════════════════════════════════════════════════
+   521→
+   522→  /**
+   523→   * Perform multi-criteria weighted voting across proposals.
+   524→   * Each proposal is scored against every criterion in the voting config,
+   525→   * and the proposal with the highest weighted total wins.
+   526→   */
+   527→  private weightedVote(
+   528→    proposals: MoAProposal[],
+   529→    votingConfig: MoAVotingConfig
+   530→  ): { bestProposal: MoAProposal | null; votingDetails: MoAVotingDetails } {
+   531→    if (proposals.length === 0) {
+   532→      return {
+   533→        bestProposal: null,
+   534→        votingDetails: {
+   535→          proposalScores: [],
+   536→          deduplicationCount: 0,
+   537→          consensusReached: false,
+   538→          consensusThreshold: votingConfig.minConsensus,
+   539→          proposalsAboveThreshold: 0,
+   540→          winner: 'gemini-2.0-flash' as LLMId,
+   541→        },
+   542→      };
+   543→    }
+   544→
+   545→    if (proposals.length === 1) {
+   546→      return {
+   547→        bestProposal: proposals[0],
+   548→        votingDetails: {
+   549→          proposalScores: [{
+   550→            provider: proposals[0].provider,
+   551→            weightedScore: proposals[0].confidence,
+   552→            criteriaBreakdown: { quality: proposals[0].confidence },
+   553→          }],
+   554→          deduplicationCount: 0,
+   555→          consensusReached: true,
+   556→          consensusThreshold: votingConfig.minConsensus,
+   557→          proposalsAboveThreshold: 1,
+   558→          winner: proposals[0].provider,
+   559→        },
+   560→      };
+   561→    }
+   562→
+   563→    const { criteriaWeights } = votingConfig;
+   564→    const criteriaNames = Object.keys(criteriaWeights);
+   565→    const totalWeight = Object.values(criteriaWeights).reduce((s, w) => s + w, 0) || 1;
+   566→
+   567→    // Score each proposal against each criterion
+   568→    const proposalScores: MoAVotingDetails['proposalScores'] = proposals.map(proposal => {
+   569→      const criteriaBreakdown: Record<string, number> = {};
+   570→
+   571→      for (const criterion of criteriaNames) {
+   572→        switch (criterion) {
+   573→          case 'quality':
+   574→            criteriaBreakdown.quality = proposal.confidence;
+   575→            break;
+   576→          case 'costEfficiency': {
+   577→            const maxCost = Math.max(...proposals.map(p => p.cost), 0.001);
+   578→            criteriaBreakdown.costEfficiency = 1 - (proposal.cost / maxCost);
+   579→            break;
+   580→          }
+   581→          case 'speed': {
+   582→            const maxLatency = Math.max(...proposals.map(p => p.latencyMs), 1);
+   583→            criteriaBreakdown.speed = 1 - (proposal.latencyMs / maxLatency);
+   584→            break;
+   585→          }
+   586→          default:
+   587→            // For unknown criteria, fall back to confidence
+   588→            criteriaBreakdown[criterion] = proposal.confidence;
+   589→        }
+   590→      }
+   591→
+   592→      const weightedScore = criteriaNames.reduce((sum, name) => {
+   593→        return sum + (criteriaBreakdown[name] ?? 0) * (criteriaWeights[name] / totalWeight);
+   594→      }, 0);
+   595→
+   596→      return {
+   597→        provider: proposal.provider,
+   598→        weightedScore,
+   599→        criteriaBreakdown,
+   600→      };
+   601→    });
+   602→
+   603→    // Find winner
+   604→    const sortedScores = [...proposalScores].sort((a, b) => b.weightedScore - a.weightedScore);
+   605→    const winner = sortedScores[0];
+   606→    const bestProposal = proposals.find(p => p.provider === winner.provider) || proposals[0];
+   607→
+   608→    // Count proposals above consensus threshold
+   609→    const threshold = votingConfig.minConsensus;
+   610→    const proposalsAboveThreshold = proposalScores.filter(s => s.weightedScore >= threshold).length;
+   611→
+   612→    return {
+   613→      bestProposal,
+   614→      votingDetails: {
+   615→        proposalScores,
+   616→        deduplicationCount: 0, // will be overwritten by caller if needed
+   617→        consensusReached: proposalsAboveThreshold >= this.MIN_PROPOSALS_FOR_CONSENSUS,
+   618→        consensusThreshold: threshold,
+   619→        proposalsAboveThreshold,
+   620→        winner: winner.provider,
+   621→      },
+   622→    };
+   623→  }
+   624→
+   625→  // ═══════════════════════════════════════════════════════
+   626→  // Proposal Deduplication (Jaccard-like similarity)
+   627→  // ═══════════════════════════════════════════════════════
+   628→
+   629→  /**
+   630→   * Remove near-duplicate proposals using Jaccard-like content similarity.
+   631→   * For each pair of proposals, computes token-set overlap. If similarity
+   632→   * exceeds the threshold, the lower-confidence proposal is removed.
+   633→   */
+   634→  private deduplicateProposals(
+   635→    proposals: MoAProposal[],
+   636→    threshold: number
+   637→  ): MoAProposal[] {
+   638→    if (proposals.length <= 1 || threshold >= 1) return proposals;
+   639→
+   640→    const tokenSets = proposals.map(p => this.tokenize(p.content));
+   641→    const removed = new Set<number>();
+   642→
+   643→    for (let i = 0; i < proposals.length; i++) {
+   644→      if (removed.has(i)) continue;
+   645→      for (let j = i + 1; j < proposals.length; j++) {
+   646→        if (removed.has(j)) continue;
+   647→
+   648→        const similarity = this.jaccardSimilarity(tokenSets[i], tokenSets[j]);
+   649→        if (similarity >= threshold) {
+   650→          // Remove the lower-confidence one
+   651→          if (proposals[i].confidence >= proposals[j].confidence) {
+   652→            removed.add(j);
+   653→          } else {
+   654→            removed.add(i);
+   655→            break; // i is removed, no need to compare further
+   656→          }
+   657→        }
+   658→      }
+   659→    }
+   660→
+   661→    if (removed.size === 0) return proposals;
+   662→
+   663→    return proposals.filter((_, idx) => !removed.has(idx));
+   664→  }
+   665→
+   666→  /**
+   667→   * Simple whitespace + punctuation tokenizer for Jaccard comparison.
+   668→   * Normalises to lowercase and strips non-alphanumeric chars.
+   669→   */
+   670→  private tokenize(content: string): Set<string> {
+   671→    const tokens = content
+   672→      .toLowerCase()
+   673→      .replace(/[^\w\s]/g, ' ')
+   674→      .split(/\s+/)
+   675→      .filter(t => t.length > 2); // Ignore very short tokens
+   676→    return new Set(tokens);
+   677→  }
+   678→
+   679→  /**
+   680→   * Jaccard similarity: |A ∩ B| / |A ∪ B|
+   681→   */
+   682→  private jaccardSimilarity(a: Set<string>, b: Set<string>): number {
+   683→    if (a.size === 0 && b.size === 0) return 1;
+   684→    if (a.size === 0 || b.size === 0) return 0;
+   685→
+   686→    let intersection = 0;
+   687→    for (const token of a) {
+   688→      if (b.has(token)) intersection++;
+   689→    }
+   690→
+   691→    const union = a.size + b.size - intersection;
+   692→    return union === 0 ? 0 : intersection / union;
+   693→  }
+   694→
+   695→  // ═══════════════════════════════════════════════════════
+   696→  // Consensus Detection (configurable thresholds)
+   697→  // ═══════════════════════════════════════════════════════
+   698→
+   699→  /**
+   700→   * Legacy consensus check (kept for backward compat).
+   701→   */
+   702→  private hasConsensus(proposals: MoAProposal[], threshold: number): boolean {
+   703→    if (proposals.length < this.MIN_PROPOSALS_FOR_CONSENSUS) return false;
+   704→    const highConfidenceCount = proposals.filter(p => p.confidence >= threshold).length;
+   705→    return highConfidenceCount >= this.MIN_PROPOSALS_FOR_CONSENSUS;
+   706→  }
+   707→
+   708→  /**
+   709→   * Enhanced consensus detection with details.
+   710→   * A fraction (minConsensus) of proposals must have confidence >= threshold.
+   711→   */
+   712→  private hasConsensusWithDetails(
+   713→    proposals: MoAProposal[],
+   714→    minConsensus: number
+   715→  ): { consensus: boolean; proposalsAboveThreshold: number } {
+   716→    if (proposals.length < this.MIN_PROPOSALS_FOR_CONSENSUS) {
+   717→      return { consensus: false, proposalsAboveThreshold: 0 };
+   718→    }
+   719→
+   720→    // Use the agent's confidence threshold
+   721→    const threshold = this.CONFIDENCE_THRESHOLD;
+   722→    const proposalsAboveThreshold = proposals.filter(p => p.confidence >= threshold).length;
+   723→
+   724→    // Consensus if enough proposals pass the threshold
+   725→    const fraction = proposalsAboveThreshold / proposals.length;
+   726→    const consensus = fraction >= minConsensus && proposalsAboveThreshold >= this.MIN_PROPOSALS_FOR_CONSENSUS;
+   727→
+   728→    return { consensus, proposalsAboveThreshold };
+   729→  }
+   730→
+   731→  // ═══════════════════════════════════════════════════════
+   732→  // Feedback Injection
+   733→  // ═══════════════════════════════════════════════════════
+   734→
+   735→  /**
+   736→   * Combine critique feedback with reflection feedback.
+   737→   * If feedback injection is enabled in the agent's moaConfig,
+   738→   * the reflection feedback is appended to the critique so the
+   739→   * Refine round LLMs see both.
+   740→   */
+   741→  private combineFeedback(
+   742→    critiqueFeedback: string,
+   743→    reflectionFeedback: string | undefined,
+   744→    moaConfig?: MoAAgentConfig
+   745→  ): string {
+   746→    if (!reflectionFeedback || !moaConfig?.feedbackInjection) {
+   747→      return critiqueFeedback;
+   748→    }
+   749→
+   750→    return [
+   751→      critiqueFeedback,
+   752→      '',
+   753→      '═══ PREVIOUS REFLECTION FEEDBACK ═══',
+   754→      'The following issues were identified in a previous reflection cycle. Address these in addition to the critique above:',
+   755→      '',
+   756→      reflectionFeedback,
+   757→    ].join('\n');
+   758→  }
+   759→
+   760→  // ═══════════════════════════════════════════════════════
+   761→  // Aggregation & Selection (legacy, kept for compat)
+   762→  // ═══════════════════════════════════════════════════════
+   763→
+   764→  private selectBestProposal(proposals: MoAProposal[]): MoAProposal | null {
+   765→    if (proposals.length === 0) return null;
+   766→    if (proposals.length === 1) return proposals[0];
+   767→
+   768→    // Multi-factor scoring: confidence (40%) + cost-efficiency (30%) + speed (30%)
+   769→    const maxCost = Math.max(...proposals.map(p => p.cost), 0.001);
+   770→    const maxLatency = Math.max(...proposals.map(p => p.latencyMs), 1);
+   771→
+   772→    return proposals.reduce((best, current) => {
+   773→      const bestScore = (best.confidence * 0.4) +
+   774→        ((1 - best.cost / maxCost) * 0.3) +
+   775→        ((1 - best.latencyMs / maxLatency) * 0.3);
+   776→      const currentScore = (current.confidence * 0.4) +
+   777→        ((1 - current.cost / maxCost) * 0.3) +
+   778→        ((1 - current.latencyMs / maxLatency) * 0.3);
+   779→      return currentScore > bestScore ? current : best;
+   780→    });
+   781→  }
+   782→
+   783→  private synthesizeCritiques(critiques: MoAProposal[]): string {
+   784→    if (critiques.length === 0) return '';
+   785→    if (critiques.length === 1) return critiques[0].content;
+   786→
+   787→    // Merge critiques, deduplicating similar points
+   788→    const allPoints: string[] = [];
+   789→    const seen = new Set<string>();
+   790→
+   791→    for (const critique of critiques) {
+   792→      const points = critique.content.split(/\n\d+[\.\)]\s*/).filter(p => p.trim().length > 10);
+   793→      for (const point of points) {
+   794→        const key = point.substring(0, 50).toLowerCase().replace(/\s+/g, '');
+   795→        if (!seen.has(key)) {
+   796→          seen.add(key);
+   797→          allPoints.push(point.trim());
+   798→        }
+   799→      }
+   800→    }
+   801→
+   802→    return allPoints.join('\n\n');
+   803→  }
+   804→
+   805→  /**
+   806→   * Estimate confidence of a proposal based on content quality signals.
+   807→   * This is a heuristic - the real confidence comes from the Reflection Agent.
+   808→   */
+   809→  private estimateConfidence(content: string): number {
+   810→    let score = 0.5; // Base score
+   811→
+   812→    // Positive signals
+   813→    if (content.includes('error') || content.includes('catch')) score += 0.05; // Error handling
+   814→    if (content.includes('interface') || content.includes('type ')) score += 0.05; // Types
+   815→    if (content.includes('test') || content.includes('describe(')) score += 0.05; // Tests
+   816→    if (content.includes('export') || content.includes('module')) score += 0.03; // Modules
+   817→    if (/function|const|class/.test(content)) score += 0.05; // Code structure
+   818→    if (content.length > 500) score += 0.05; // Substantial content
+   819→    if (content.includes('TODO') || content.includes('FIXME')) score -= 0.05; // Incomplete
+   820→    if (content.includes('any') && /:\s*any/.test(content)) score -= 0.03; // Type safety
+   821→    if (content.includes('console.log')) score -= 0.02; // Debug code
+   822→
+   823→    return Math.min(Math.max(score, 0.1), 1.0);
+   824→  }
+   825→
+   826→  // ═══════════════════════════════════════════════════════
+   827→  // Helpers
+   828→  // ═══════════════════════════════════════════════════════
+   829→
+   830→  private emitEvent(type: MoAEvent['type'], nodeId: string, round?: MoARound, provider?: LLMId, data?: unknown): void {
+   831→    this.emit('moa-event', {
+   832→      type,
+   833→      nodeId,
+   834→      round,
+   835→      provider,
+   836→      data,
+   837→      timestamp: Date.now(),
+   838→    } satisfies MoAEvent);
+   839→  }
+   840→
+   841→  private buildResult(
+   842→    nodeId: string,
+   843→    output: string,
+   844→    tokensUsed: number,
+   845→    cost: number,
+   846→    startTime: number,
+   847→    rounds: MoARoundResult[],
+   848→    votingDetails?: MoAVotingDetails
+   849→  ): GenerationResult {
+   850→    return {
+   851→      nodeId,
+   852→      output,
+   853→      tokensUsed,
+   854→      cost,
+   855→      latencyMs: Date.now() - startTime,
+   856→      moaResult: {
+   857→        proposals: rounds.flatMap(r => r.proposals),
+   858→        aggregationStrategy: 'cascade',
+   859→        finalOutput: output,
+   860→        totalTokens: tokensUsed,
+   861→        totalCost: cost,
+   862→        totalLatencyMs: Date.now() - startTime,
+   863→        votingDetails,
+   864→      },
+   865→    };
+   866→  }
+   867→}
+   868→

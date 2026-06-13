@@ -1,0 +1,708 @@
+     1→// ============================================================
+     2→// AgentForge - SuperAgent Orchestrator
+     3→// Full DAG-based parallel execution with MoA cascading,
+     4→// Reflection loops, 3-Level Auto-Fix, and real-time events
+     5→// Phase 2: Feedback loop integration, CostOptimizer recording,
+     6→// configurable MoA strategies per agent, execution timeline
+     7→// ============================================================
+     8→
+     9→import type { AgentConfig, AgentId, MoAResult, LLMId, AgentExecution, DAGExecutionState, ReflectionScore, AutoFixAttempt, DAGNode, TokenBudget } from '@agentforge/shared';
+    10→import { AGENT_REGISTRY } from '@agentforge/shared';
+    11→import { topologicalSort, validateDAG } from '@agentforge/shared';
+    12→import { ReflectionAgent } from '../reflection/ReflectionAgent';
+    13→import { CodeGenerator, type MoAEvent } from '../generator/CodeGenerator';
+    14→import { distributedCache, type DistributedCache } from '../../services/queue/DistributedCache';
+    15→import { CostOptimizer } from '../../services/CostOptimizer';
+    16→import { LLMRouter } from '../../services/LLMRouter';
+    17→import { ContextGraph } from '../../services/ContextGraph';
+    18→import { DependencyResolver } from '../../services/DependencyResolver';
+    19→import { TokenBudgetManager } from '../../services/TokenBudgetManager';
+    20→import { ContextCompressionService } from '../../services/ContextCompressionService';
+    21→import { TokenEstimator } from '../../services/TokenEstimator';
+    22→import { EventEmitter } from 'events';
+    23→import { v4 as uuidv4 } from 'uuid';
+    24→
+    25→// ── Execution Timeline Entry ──
+    26→
+    27→export interface TimelineEntry {
+    28→  timestamp: number;
+    29→  phase: 'cache_check' | 'provider_selection' | 'context_build' | 'dag_level' | 'reflection' | 'autofix' | 'finalization';
+    30→  detail: string;
+    31→  durationMs?: number;
+    32→}
+    33→
+    34→// Orchestrator event types
+    35→export interface OrchestratorEvent {
+    36→  type: 'execution_start' | 'dag_level_start' | 'dag_node_start' | 'dag_node_complete' |
+    37→        'dag_level_complete' | 'reflection_start' | 'reflection_complete' |
+    38→        'autofix_start' | 'autofix_complete' | 'execution_complete' | 'execution_error' |
+    39→        'moa_round' | 'cache_hit' | 'feedback_injected' | 'timeline_entry';
+    40→  executionId: string;
+    41→  agentId: AgentId;
+    42→  data?: unknown;
+    43→  timestamp: number;
+    44→}
+    45→
+    46→export class SuperAgentOrchestrator extends EventEmitter {
+    47→  private reflectionAgent: ReflectionAgent;
+    48→  private codeGenerator: CodeGenerator;
+    49→  private cache: DistributedCache;
+    50→  private costOptimizer: CostOptimizer;
+    51→  private llmRouter: LLMRouter;
+    52→  private contextGraph: ContextGraph;
+    53→  private dependencyResolver: DependencyResolver;
+    54→  private tokenBudgetManager: TokenBudgetManager;
+    55→  private contextCompressionService: ContextCompressionService;
+    56→  private tokenEstimator: TokenEstimator;
+    57→
+    58→  // Active executions for cancellation
+    59→  private activeExecutions: Map<string, AbortController> = new Map();
+    60→
+    61→  constructor() {
+    62→    super();
+    63→    this.llmRouter = new LLMRouter();
+    64→    this.reflectionAgent = new ReflectionAgent(this.llmRouter);
+    65→    this.codeGenerator = new CodeGenerator(this.llmRouter);
+    66→    this.cache = distributedCache;
+    67→    this.costOptimizer = new CostOptimizer();
+    68→    this.contextGraph = new ContextGraph();
+    69→    this.dependencyResolver = new DependencyResolver();
+    70→    this.tokenEstimator = new TokenEstimator();
+    71→    this.tokenBudgetManager = new TokenBudgetManager(this.tokenEstimator);
+    72→    this.contextCompressionService = new ContextCompressionService();
+    73→
+    74→    // Forward MoA events from CodeGenerator
+    75→    this.codeGenerator.on('moa-event', (event: MoAEvent) => {
+    76→      // Will be forwarded with execution context in execute()
+    77→    });
+    78→  }
+    79→
+    80→  async execute(agentId: AgentId, prompt: string, userId: string, projectId: string): Promise<AgentExecution> {
+    81→    const config = AGENT_REGISTRY[agentId];
+    82→    if (!config) throw new Error(`Unknown agent: ${agentId}`);
+    83→
+    84→    // Validate DAG structure
+    85→    const dagValidation = validateDAG(config.dagTemplate);
+    86→    if (!dagValidation.valid) {
+    87→      throw new Error(`Invalid DAG for agent ${agentId}: ${dagValidation.errors.join(', ')}`);
+    88→    }
+    89→
+    90→    const execution: AgentExecution = {
+    91→      id: uuidv4(),
+    92→      agentId,
+    93→      userId,
+    94→      projectId,
+    95→      status: 'running',
+    96→      input: prompt,
+    97→      dagExecution: {
+    98→        currentLevel: 0,
+    99→        completedNodes: [],
+   100→        activeNodes: [],
+   101→        pendingNodes: config.dagTemplate.nodes.map(n => n.id),
+   102→        results: {},
+   103→      },
+   104→      reflectionScores: [],
+   105→      iterations: 0,
+   106→      totalTokensUsed: 0,
+   107→      totalCost: 0,
+   108→      createdAt: new Date(),
+   109→    };
+   110→
+   111→    // Execution timeline for observability
+   112→    const timeline: TimelineEntry[] = [];
+   113→    const addTimeline = (phase: TimelineEntry['phase'], detail: string, durationMs?: number) => {
+   114→      const entry: TimelineEntry = { timestamp: Date.now(), phase, detail, durationMs };
+   115→      timeline.push(entry);
+   116→      this.emitEvent('timeline_entry', execution.id, agentId, entry);
+   117→    };
+   118→
+   119→    // Register abort controller
+   120→    const abortController = new AbortController();
+   121→    this.activeExecutions.set(execution.id, abortController);
+   122→
+   123→    this.emitEvent('execution_start', execution.id, agentId, { prompt: prompt.substring(0, 200) });
+   124→
+   125→    try {
+   126→      // ═══════════════════════════════════════════
+   127→      // STEP 1: Check Cache
+   128→      // ═══════════════════════════════════════════
+   129→      const cacheStart = Date.now();
+   130→      const cached = await this.cache.getByAgentPrompt(agentId, prompt);
+   131→      addTimeline('cache_check', cached ? 'Cache HIT' : 'Cache MISS', Date.now() - cacheStart);
+   132→
+   133→      if (cached) {
+   134→        this.emitEvent('cache_hit', execution.id, agentId, { cacheHit: true });
+   135→        execution.output = cached.output;
+   136→        execution.status = 'completed';
+   137→        execution.totalCost = 0;
+   138→        execution.completedAt = new Date();
+   139→        return execution;
+   140→      }
+   141→
+   142→      // ═══════════════════════════════════════════
+   143→      // STEP 2: Optimize LLM Selection (RL-inspired)
+   144→      // ═══════════════════════════════════════════
+   145→      const selectStart = Date.now();
+   146→      const selectedProviders = this.costOptimizer.selectProviders(config);
+   147→      addTimeline('provider_selection', `Selected ${selectedProviders.length} providers: ${selectedProviders.join(', ')}`, Date.now() - selectStart);
+   148→
+   149→      this.emitEvent('execution_start', execution.id, agentId, {
+   150→        providers: selectedProviders,
+   151→        dagNodes: config.dagTemplate.nodes.length,
+   152→      });
+   153→
+   154→      // ═══════════════════════════════════════════
+   155→      // STEP 2.5: Build Project Context (if prompt references files)
+   156→      // ═══════════════════════════════════════════
+   157→      let currentOutput = prompt;
+   158→      const contextStart = Date.now();
+   159→      const projectContext = this.buildProjectContext(prompt, 8000);
+   160→      if (projectContext) {
+   161→        currentOutput = projectContext + '\n\n' + currentOutput;
+   162→        addTimeline('context_build', `Built project context: ${this.tokenEstimator.estimate(projectContext)} tokens injected`, Date.now() - contextStart);
+   163→      } else {
+   164→        addTimeline('context_build', 'No project context needed', Date.now() - contextStart);
+   165→      }
+   166→
+   167→      // ═══════════════════════════════════════════
+   168→      // STEP 3: Execute DAG Level by Level (Parallel)
+   169→      // ═══════════════════════════════════════════
+   170→      const levels = topologicalSort(config.dagTemplate);
+   171→      let lastReflectionFeedback: string | undefined;
+   172→
+   173→      for (let levelIndex = 0; levelIndex < levels.length; levelIndex++) {
+   174→        // Check for cancellation
+   175→        if (abortController.signal.aborted) {
+   176→          execution.status = 'cancelled';
+   177→          execution.completedAt = new Date();
+   178→          return execution;
+   179→        }
+   180→
+   181→        execution.dagExecution.currentLevel = levelIndex;
+   182→        execution.dagExecution.activeNodes = levels[levelIndex].map(n => n.id);
+   183→
+   184→        const levelStart = Date.now();
+   185→        this.emitEvent('dag_level_start', execution.id, agentId, {
+   186→          level: levelIndex,
+   187→          nodes: levels[levelIndex].map(n => ({ id: n.id, label: n.label })),
+   188→        });
+   189→
+   190→        // Execute all nodes in this level IN PARALLEL
+   191→        // Pass reflection feedback into MoA for feedback injection
+   192→        const levelPromises = levels[levelIndex].map(node =>
+   193→          this.executeNode(
+   194→            node, currentOutput, config, selectedProviders, execution.id, agentId,
+   195→            lastReflectionFeedback
+   196→          )
+   197→        );
+   198→        const levelResults = await Promise.allSettled(levelPromises);
+   199→
+   200→        // Process results
+   201→        const successfulResults = levelResults
+   202→          .map((r, i) => {
+   203→            if (r.status === 'fulfilled') {
+   204→              return { node: levels[levelIndex][i], result: r.value };
+   205→            }
+   206→            console.error(`[SuperAgent] Node ${levels[levelIndex][i].id} failed:`, r.reason);
+   207→            return null;
+   208→          })
+   209→          .filter((r): r is { node: DAGNode; result: { output: string; tokensUsed: number; cost: number } } => r !== null);
+   210→
+   211→        for (const { node, result } of successfulResults) {
+   212→          execution.dagExecution.results[node.id] = result.output;
+   213→          execution.dagExecution.completedNodes.push(node.id);
+   214→          execution.totalTokensUsed += result.tokensUsed || 0;
+   215→          execution.totalCost += result.cost || 0;
+   216→
+   217→          this.emitEvent('dag_node_complete', execution.id, agentId, {
+   218→            nodeId: node.id,
+   219→            nodeLabel: node.label,
+   220→            outputLength: result.output.length,
+   221→          });
+   222→        }
+   223→
+   224→        // Merge outputs for next level — smart merge based on node types
+   225→        currentOutput = this.mergeLevelOutputs(levels[levelIndex], successfulResults);
+   226→
+   227→        execution.dagExecution.pendingNodes = execution.dagExecution.pendingNodes.filter(
+   228→          id => !execution.dagExecution.completedNodes.includes(id)
+   229→        );
+   230→
+   231→        addTimeline('dag_level', `Level ${levelIndex}: ${successfulResults.length}/${levels[levelIndex].length} nodes completed`, Date.now() - levelStart);
+   232→
+   233→        this.emitEvent('dag_level_complete', execution.id, agentId, {
+   234→          level: levelIndex,
+   235→          completedCount: successfulResults.length,
+   236→        });
+   237→      }
+   238→
+   239→      // ═══════════════════════════════════════════
+   240→      // STEP 4: Reflection Loop with 3-Level Auto-Fix
+   241→      // ═══════════════════════════════════════════
+   242→      execution.status = 'reflecting';
+   243→      const reflectionStart = Date.now();
+   244→      this.emitEvent('reflection_start', execution.id, agentId, { iteration: 0 });
+   245→
+   246→      let reflectionResult = await this.reflectionAgent.evaluate(
+   247→        currentOutput,
+   248→        config.reflectionCriteria,
+   249→        config.confidenceThreshold
+   250→      );
+   251→
+   252→      execution.reflectionScores.push(...reflectionResult.scores);
+   253→      execution.iterations = 1;
+   254→      lastReflectionFeedback = reflectionResult.feedback;
+   255→
+   256→      addTimeline('reflection', `Iteration 1: passed=${reflectionResult.passed}, confidence=${reflectionResult.confidence.toFixed(2)}`, Date.now() - reflectionStart);
+   257→
+   258→      this.emitEvent('reflection_complete', execution.id, agentId, {
+   259→        passed: reflectionResult.passed,
+   260→        confidence: reflectionResult.confidence,
+   261→        iteration: 1,
+   262→      });
+   263→
+   264→      // Auto-fix loop if below threshold
+   265→      let autoFixAttempt = 0;
+   266→      const maxFixAttempts = config.maxIterations;
+   267→      const autoFixAttempts: AutoFixAttempt[] = [];
+   268→
+   269→      while (!reflectionResult.passed && autoFixAttempt < maxFixAttempts) {
+   270→        autoFixAttempt++;
+   271→        execution.status = 'fixing';
+   272→        const fixStart = Date.now();
+   273→
+   274→        this.emitEvent('autofix_start', execution.id, agentId, {
+   275→          attempt: autoFixAttempt,
+   276→          maxAttempts: maxFixAttempts,
+   277→        });
+   278→
+   279→        const fixResult = await this.executeAutoFix(
+   280→          currentOutput,
+   281→          reflectionResult.feedback,
+   282→          selectedProviders,
+   283→          autoFixAttempt,
+   284→          maxFixAttempts
+   285→        );
+   286→
+   287→        autoFixAttempts.push(fixResult);
+   288→
+   289→        if (fixResult.success) {
+   290→          currentOutput = fixResult.output;
+   291→
+   292→          // Re-evaluate after fix
+   293→          const reEvalStart = Date.now();
+   294→          this.emitEvent('reflection_start', execution.id, agentId, { iteration: autoFixAttempt + 1 });
+   295→          reflectionResult = await this.reflectionAgent.evaluate(
+   296→            currentOutput,
+   297→            config.reflectionCriteria,
+   298→            config.confidenceThreshold
+   299→          );
+   300→          execution.reflectionScores.push(...reflectionResult.scores);
+   301→          execution.iterations = 1 + autoFixAttempt;
+   302→          lastReflectionFeedback = reflectionResult.feedback;
+   303→
+   304→          addTimeline('reflection', `Re-eval iteration ${autoFixAttempt + 1}: passed=${reflectionResult.passed}, confidence=${reflectionResult.confidence.toFixed(2)}`, Date.now() - reEvalStart);
+   305→
+   306→          this.emitEvent('reflection_complete', execution.id, agentId, {
+   307→            passed: reflectionResult.passed,
+   308→            confidence: reflectionResult.confidence,
+   309→            iteration: autoFixAttempt + 1,
+   310→          });
+   311→        }
+   312→
+   313→        addTimeline('autofix', `Attempt ${autoFixAttempt}: success=${fixResult.success}, level=${fixResult.level}`, Date.now() - fixStart);
+   314→
+   315→        this.emitEvent('autofix_complete', execution.id, agentId, {
+   316→          attempt: autoFixAttempt,
+   317→          success: fixResult.success,
+   318→          level: fixResult.level,
+   319→        });
+   320→      }
+   321→
+   322→      // ═══════════════════════════════════════════
+   323→      // STEP 5: Feedback Loop — Re-run MoA refine with reflection feedback
+   324→      // ═══════════════════════════════════════════
+   325→      if (!reflectionResult.passed && lastReflectionFeedback && config.moaConfig?.feedbackInjection) {
+   326→        const feedbackStart = Date.now();
+   327→        this.emitEvent('feedback_injected', execution.id, agentId, {
+   328→          feedbackLength: lastReflectionFeedback.length,
+   329→          reason: 'Reflection did not pass — injecting feedback into MoA refine',
+   330→        });
+   331→
+   332→        // Run a targeted MoA refine with the reflection feedback
+   333→        const feedbackRefineResult = await this.executeFeedbackRefine(
+   334→          currentOutput,
+   335→          lastReflectionFeedback,
+   336→          config,
+   337→          selectedProviders
+   338→        );
+   339→
+   340→        if (feedbackRefineResult) {
+   341→          currentOutput = feedbackRefineResult;
+   342→          addTimeline('dag_level', 'Feedback-refine loop applied', Date.now() - feedbackStart);
+   343→        }
+   344→      }
+   345→
+   346→      // ═══════════════════════════════════════════
+   347→      // STEP 6: Record execution result for CostOptimizer RL
+   348→      // ═══════════════════════════════════════════
+   349→      try {
+   350→        for (const provider of selectedProviders) {
+   351→          await this.costOptimizer.recordExecutionResult(
+   352→            provider,
+   353→            config.id,
+   354→            reflectionResult.confidence,
+   355→            execution.totalCost / selectedProviders.length,
+   356→            execution.totalTokensUsed > 0
+   357→              ? Math.round(execution.totalTokensUsed / selectedProviders.length)
+   358→              : 0,
+   359→            0, // rough latency per provider
+   360→            agentId,
+   361→          );
+   362→        }
+   363→      } catch (err) {
+   364→        console.error('[SuperAgent] Failed to record execution result for CostOptimizer:', err);
+   365→      }
+   366→
+   367→      // ═══════════════════════════════════════════
+   368→      // STEP 7: Finalize & Cache
+   369→      // ═══════════════════════════════════════════
+   370→      execution.output = currentOutput;
+   371→      execution.status = reflectionResult.passed ? 'completed' : 'completed_with_warnings';
+   372→      execution.completedAt = new Date();
+   373→
+   374→      // Cache the result (DistributedCache with cross-instance invalidation)
+   375→      await this.cache.setByAgentPrompt(agentId, prompt, { output: currentOutput });
+   376→
+   377→      addTimeline('finalization', `Status: ${execution.status}, cost: $${execution.totalCost.toFixed(4)}, tokens: ${execution.totalTokensUsed}`);
+   378→
+   379→      this.emitEvent('execution_complete', execution.id, agentId, {
+   380→        status: execution.status,
+   381→        tokensUsed: execution.totalTokensUsed,
+   382→        cost: execution.totalCost,
+   383→        iterations: execution.iterations,
+   384→        confidence: reflectionResult.confidence,
+   385→        timelineEntries: timeline.length,
+   386→      });
+   387→
+   388→      return execution;
+   389→    } catch (error) {
+   390→      execution.status = 'failed';
+   391→      execution.error = error instanceof Error ? error.message : 'Unknown error';
+   392→      execution.completedAt = new Date();
+   393→
+   394→      addTimeline('finalization', `FAILED: ${execution.error}`);
+   395→
+   396→      this.emitEvent('execution_error', execution.id, agentId, {
+   397→        error: execution.error,
+   398→      });
+   399→
+   400→      return execution;
+   401→    } finally {
+   402→      this.activeExecutions.delete(execution.id);
+   403→    }
+   404→  }
+   405→
+   406→  /**
+   407→   * Cancel a running execution
+   408→   */
+   409→  cancel(executionId: string): boolean {
+   410→    const controller = this.activeExecutions.get(executionId);
+   411→    if (controller) {
+   412→      controller.abort();
+   413→      return true;
+   414→    }
+   415→    return false;
+   416→  }
+   417→
+   418→  // ═══════════════════════════════════════════════════════
+   419→  // Node Execution (with MoA cascading + feedback injection)
+   420→  // ═══════════════════════════════════════════════════════
+   421→
+   422→  private async executeNode(
+   423→    node: DAGNode,
+   424→    input: string,
+   425→    config: AgentConfig,
+   426→    providers: LLMId[],
+   427→    executionId: string,
+   428→    agentId: AgentId,
+   429→    reflectionFeedback?: string
+   430→  ): Promise<{ output: string; tokensUsed: number; cost: number }> {
+   431→    this.emitEvent('dag_node_start', executionId, agentId, {
+   432→      nodeId: node.id,
+   433→      nodeLabel: node.label,
+   434→      agentRole: node.agentRole,
+   435→    });
+   436→
+   437→    // Forward MoA events with execution context
+   438→    const moaHandler = (event: MoAEvent) => {
+   439→      this.emitEvent('moa_round', executionId, agentId, {
+   440→        nodeId: event.nodeId || node.id,
+   441→        round: event.round,
+   442→        provider: event.provider,
+   443→        data: event.data,
+   444→      });
+   445→    };
+   446→
+   447→    this.codeGenerator.on('moa-event', moaHandler);
+   448→    try {
+   449→      const result = await this.codeGenerator.generateWithFeedback(
+   450→        node, input, config, providers, reflectionFeedback
+   451→      );
+   452→      return {
+   453→        output: result.output,
+   454→        tokensUsed: result.tokensUsed,
+   455→        cost: result.cost,
+   456→      };
+   457→    } finally {
+   458→      this.codeGenerator.off('moa-event', moaHandler);
+   459→    }
+   460→  }
+   461→
+   462→  // ═══════════════════════════════════════════════════════
+   463→  // Feedback Refine Loop — MoA refine with reflection feedback
+   464→  // ═══════════════════════════════════════════════════════
+   465→
+   466→  /**
+   467→   * When the reflection loop doesn't pass after all auto-fix attempts,
+   468→   * inject the reflection feedback into a targeted MoA refine round.
+   469→   * This creates a synthetic DAG node that runs only the refine round
+   470→   * with the accumulated feedback.
+   471→   */
+   472→  private async executeFeedbackRefine(
+   473→    currentOutput: string,
+   474→    reflectionFeedback: string,
+   475→    config: AgentConfig,
+   476→    providers: LLMId[]
+   477→  ): Promise<string | null> {
+   478→    try {
+   479→      // Create a synthetic node for the feedback refine
+   480→      const syntheticNode: DAGNode = {
+   481→        id: 'feedback-refine',
+   482→        label: 'Feedback Refine',
+   483→        level: 999,
+   484→        type: 'process',
+   485→        agentRole: 'refiner',
+   486→      };
+   487→
+   488→      const result = await this.codeGenerator.generateWithFeedback(
+   489→        syntheticNode,
+   490→        currentOutput,
+   491→        config,
+   492→        providers,
+   493→        reflectionFeedback
+   494→      );
+   495→
+   496→      return result.output || null;
+   497→    } catch (error) {
+   498→      console.error('[SuperAgent] Feedback refine loop failed:', error);
+   499→      return null;
+   500→    }
+   501→  }
+   502→
+   503→  // ═══════════════════════════════════════════════════════
+   504→  // Smart Output Merging per Level
+   505→  // ═══════════════════════════════════════════════════════
+   506→
+   507→  private mergeLevelOutputs(
+   508→    nodes: DAGNode[],
+   509→    results: Array<{ node: DAGNode; result: { output: string; tokensUsed: number; cost: number } }>
+   510→  ): string {
+   511→    if (results.length === 0) return '';
+   512→    if (results.length === 1) return results[0].result.output;
+   513→
+   514→    // For multiple nodes at same level, merge contextually
+   515→    const merged = results.map(({ node, result }) => {
+   516→      const header = `=== ${node.label.toUpperCase()} ===`;
+   517→      return `${header}\n${result.output}`;
+   518→    }).join('\n\n');
+   519→
+   520→    return merged;
+   521→  }
+   522→
+   523→  // ═══════════════════════════════════════════════════════
+   524→  // 3-Level Auto-Fix Engine (delegated to ReflectionAgent)
+   525→  // ═══════════════════════════════════════════════════════
+   526→
+   527→  private async executeAutoFix(
+   528→    output: string,
+   529→    feedback: string,
+   530→    providers: LLMId[],
+   531→    attempt: number,
+   532→    maxAttempts: number
+   533→  ): Promise<AutoFixAttempt> {
+   534→    const fixAttempt: AutoFixAttempt = {
+   535→      level: 'pattern',
+   536→      attempt,
+   537→      maxAttempts,
+   538→      input: output,
+   539→      output: '',
+   540→      success: false,
+   541→    };
+   542→
+   543→    // Level 1: Pattern-based fixes (fastest, cheapest)
+   544→    const patternFixed = this.reflectionAgent.patternFix(output, feedback);
+   545→    if (patternFixed) {
+   546→      fixAttempt.level = 'pattern';
+   547→      fixAttempt.success = true;
+   548→      fixAttempt.output = patternFixed;
+   549→      return fixAttempt;
+   550→    }
+   551→
+   552→    // Level 2: AST-based structural fixes (moderate cost)
+   553→    const astFixed = await this.reflectionAgent.astFix(output, feedback);
+   554→    if (astFixed) {
+   555→      fixAttempt.level = 'ast';
+   556→      fixAttempt.success = true;
+   557→      fixAttempt.output = astFixed;
+   558→      return fixAttempt;
+   559→    }
+   560→
+   561→    // Level 3: LLM-based fixes (most expensive, most capable)
+   562→    const llmFixed = await this.reflectionAgent.llmFix(output, feedback, providers);
+   563→    if (llmFixed) {
+   564→      fixAttempt.level = 'llm';
+   565→      fixAttempt.success = true;
+   566→      fixAttempt.output = llmFixed;
+   567→      return fixAttempt;
+   568→    }
+   569→
+   570→    return fixAttempt;
+   571→  }
+   572→
+   573→  // ═══════════════════════════════════════════════════════
+   574→  // Project Context Building (Phase 5)
+   575→  // ═══════════════════════════════════════════════════════
+   576→
+   577→  /**
+   578→   * Build project context from project files for injection into the prompt.
+   579→   * Uses the ContextGraph, DependencyResolver, TokenBudgetManager, and
+   580→   * ContextCompressionService pipeline to build, scope, budget, and compress
+   581→   * project context for LLM consumption.
+   582→   *
+   583→   * @param prompt - The user's prompt (used to detect file references)
+   584→   * @param maxTokens - Maximum tokens to allocate for context
+   585→   * @returns Compressed context string or null if no project files are referenced
+   586→   */
+   587→  buildProjectContext(prompt: string, maxTokens: number): string | null {
+   588→    // Detect if the prompt references project files
+   589→    // Look for common patterns: file paths, "in my project", "my code", etc.
+   590→    const fileReferencePatterns = [
+   591→      /(?:src|lib|app|components?|services?|utils?|hooks?|pages?|api|routes?)\/[\w./-]+\.\w+/gi,
+   592→      /file[s]?\s*(?:at|in|named|called)\s+["']?[\w./-]+\.\w+/gi,
+   593→      /(?:my|the|this)\s+(?:project|code|app|codebase)/i,
+   594→      /(?:update|modify|change|fix|refactor)\s+(?:the\s+)?(?:file|module|component)/i,
+   595→    ];
+   596→
+   597→    const hasFileReferences = fileReferencePatterns.some(p => p.test(prompt));
+   598→    if (!hasFileReferences) return null;
+   599→
+   600→    // Reset the context graph for this execution
+   601→    const graph = new ContextGraph();
+   602→
+   603→    // If there are files in the existing context graph, use them
+   604→    // Otherwise, we have no files to build context from — return null
+   605→    const graphStats = this.contextGraph.getStats();
+   606→    if (graphStats.totalFiles === 0) return null;
+   607→
+   608→    // Use the existing context graph to build context
+   609→    const allFiles = this.contextGraph.getTopologicalOrder();
+   610→
+   611→    // Build a priority map: entry point files get higher priority
+   612→    const priorities = new Map<string, number>();
+   613→    for (const filePath of allFiles) {
+   614→      // Entry points (main.ts, index.ts, app.ts) get highest priority
+   615→      if (/^(main|index|app|server)\.(ts|tsx|js|jsx)$/i.test(filePath.split('/').pop() || '')) {
+   616→        priorities.set(filePath, 1.0);
+   617→      }
+   618→      // Route/controller files get high priority
+   619→      else if (/(route|controller|handler|api)/i.test(filePath)) {
+   620→        priorities.set(filePath, 0.8);
+   621→      }
+   622→      // Service files get medium priority
+   623→      else if (/(service|repository|store)/i.test(filePath)) {
+   624→        priorities.set(filePath, 0.6);
+   625→      }
+   626→      // Utility/helper files get lower priority
+   627→      else if (/(util|helper|hook|type|interface|constant)/i.test(filePath)) {
+   628→        priorities.set(filePath, 0.4);
+   629→      }
+   630→      // Everything else gets default priority
+   631→      else {
+   632→        priorities.set(filePath, 0.5);
+   633→      }
+   634→    }
+   635→
+   636→    // Allocate token budget across files
+   637→    const budget = this.tokenBudgetManager.allocateBudget(maxTokens, allFiles, priorities);
+   638→
+   639→    // Build files map for compression
+   640→    const filesMap = new Map<string, string>();
+   641→    for (const filePath of allFiles) {
+   642→      const deps = this.contextGraph.getDirectDependencies(filePath);
+   643→      // We don't have direct access to file content from the graph,
+   644→      // so we create a placeholder structure for context
+   645→      filesMap.set(filePath, `// File: ${filePath}\n// Dependencies: ${deps.join(', ') || 'none'}`);
+   646→    }
+   647→
+   648→    // Build the token budget object for compression
+   649→    const perFile: Record<string, number> = {};
+   650→    for (const [file, tokens] of budget) {
+   651→      perFile[file] = tokens;
+   652→    }
+   653→
+   654→    const tokenBudget: TokenBudget = {
+   655→      total: maxTokens,
+   656→      used: 0,
+   657→      perFile,
+   658→    };
+   659→
+   660→    // Compress context within budget
+   661→    const compressed = this.contextCompressionService.compressForContext(filesMap, tokenBudget);
+   662→
+   663→    // Build the final context string
+   664→    const contextParts: string[] = [];
+   665→    contextParts.push('=== PROJECT CONTEXT ===');
+   666→    contextParts.push(`Total files: ${allFiles.length}`);
+   667→    contextParts.push(`Token budget: ${maxTokens}`);
+   668→    contextParts.push('');
+   669→
+   670→    for (const [filePath, content] of compressed) {
+   671→      contextParts.push(`--- ${filePath} ---`);
+   672→      contextParts.push(content);
+   673→      contextParts.push('');
+   674→    }
+   675→
+   676→    return contextParts.join('\n');
+   677→  }
+   678→
+   679→  /**
+   680→   * Add a project file to the context graph for future executions.
+   681→   */
+   682→  addProjectFile(path: string, content: string): void {
+   683→    const deps = this.dependencyResolver.resolveImports(path, content);
+   684→    this.contextGraph.addFile(path, content, deps);
+   685→  }
+   686→
+   687→  /**
+   688→   * Get the context graph statistics.
+   689→   */
+   690→  getContextGraphStats(): { totalFiles: number; totalEdges: number; avgDependencies: number } {
+   691→    return this.contextGraph.getStats();
+   692→  }
+   693→
+   694→  // ═══════════════════════════════════════════════════════
+   695→  // Event Emission
+   696→  // ═══════════════════════════════════════════════════════
+   697→
+   698→  private emitEvent(type: OrchestratorEvent['type'], executionId: string, agentId: AgentId, data?: unknown): void {
+   699→    this.emit('orchestrator-event', {
+   700→      type,
+   701→      executionId,
+   702→      agentId,
+   703→      data,
+   704→      timestamp: Date.now(),
+   705→    } satisfies OrchestratorEvent);
+   706→  }
+   707→}
+   708→

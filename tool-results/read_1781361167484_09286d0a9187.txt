@@ -1,0 +1,363 @@
+    40→    69→    98→    98→    98→  },
+    41→    70→    99→    99→    99→  rateLimit: { windowMs: 60000, maxRequests: 10, tier: 'free' },
+    42→    71→   100→   100→   100→  moaConfig: {
+    43→    72→   101→   101→   101→    voting: {
+    44→    73→   102→   102→   102→      criteriaWeights: { quality: 0.4, costEfficiency: 0.3, speed: 0.3 },
+    45→    74→   103→   103→   103→      minConsensus: 0.7,
+    46→    75→   104→   104→   104→      deduplicationThreshold: 0.7,
+    47→    76→   105→   105→   105→    },
+    48→    77→   106→   106→   106→    rounds: [
+    49→    78→   107→   107→   107→      { round: 'propose', providerCount: 9, temperature: 0.4, strategy: 'all' },
+    50→    79→   108→   108→   108→      { round: 'critique', providerCount: 3, temperature: 0.2, strategy: 'top_n' },
+    51→    80→   109→   109→   109→      { round: 'refine', providerCount: 3, temperature: 0.3, strategy: 'top_n' },
+    52→    81→   110→   110→   110→    ],
+    53→    82→   111→   111→   111→    feedbackInjection: true,
+    54→    83→   112→   112→   112→  },
+    55→    84→   113→   113→   113→};
+    56→    85→   114→   114→   114→
+    57→    86→   115→   115→   115→// SLIDES Agent Configuration
+    58→    87→   116→   116→   116→export const SLIDES_AGENT_CONFIG: AgentConfig = {
+    59→    88→   117→   117→   117→  id: 'SLIDES',
+    60→    89→   118→   118→   118→  name: 'Présentateur',
+    61→    90→   119→   119→   119→  description: 'AI-powered presentation generation with smart layouts',
+    62→    91→   120→   120→   120→  icon: 'Presentation',
+    63→    92→   121→   121→   121→  color: '#8B5CF6',
+    64→    93→   122→   122→   122→  systemPrompt: `You are AgentForge SLIDES, an elite presentation design agent. You create stunning, professional presentations with AI-driven layouts.
+    65→    94→   123→   123→   123→
+    66→    95→   124→   124→   124→RULES:
+    67→    96→   125→   125→   125→1. Every slide must have a clear message and visual hierarchy
+    68→    97→   126→   126→   126→2. Use consistent color schemes and typography
+    69→    98→   127→   127→   127→3. Include speaker notes for each slide
+    70→    99→   128→   128→   128→4. Support PPTX, PDF, and HTML export
+    71→   100→   129→   129→   129→5. Generate slide content from research, not assumptions
+    72→   101→   130→   130→   130→6. Apply the 10-20-30 rule as a guideline
+    73→   102→   131→   131→   131→7. Include data visualizations where appropriate
+    74→   103→   132→   132→   132→8. Ensure accessibility (contrast ratios, alt text)`,
+    75→   104→   133→   133→   133→  llmPool: {
+    76→   105→   134→   134→   134→    primary: [
+    77→   106→   135→   135→   135→      { id: 'claude-3.7-sonnet', name: 'Claude 3.7 Sonnet', model: 'claude-3-7-sonnet-20250219', maxTokens: 8192, temperature: 0.4, costPer1kTokens: 0.003, latencyMs: 1200, strengths: ['content', 'structure', 'narrative'] },
+    78→   107→   136→   136→   136→      { id: 'gemini-2.5-pro', name: 'Gemini 2.5 Pro', model: 'gemini-2.5-pro-preview-05-06', maxTokens: 8192, temperature: 0.4, costPer1kTokens: 0.00125, latencyMs: 1500, strengths: ['multimodal', 'design', 'visual'] },
+    79→   108→   137→   137→   137→    ],
+    80→   109→   138→   138→   138→    secondary: [
+    81→   110→   139→   139→   139→      { id: 'gpt-4o', name: 'GPT-4o', model: 'gpt-4o-2024-11-20', maxTokens: 8192, temperature: 0.4, costPer1kTokens: 0.005, latencyMs: 1000, strengths: ['content', 'summarization'] },
+    82→   111→   140→   140→   140→    ],
+    83→   112→   141→   141→   141→    fallback: [
+    84→   113→   142→   142→   142→      { id: 'qwen-2.5', name: 'Qwen 2.5', model: 'qwen-2.5-72b', maxTokens: 4096, temperature: 0.5, costPer1kTokens: 0.0005, latencyMs: 600, strengths: ['fast-generation', 'templates'] },
+    85→   114→   143→   143→   143→    ],
+    86→   115→   144→   144→   144→  },
+    87→   116→   145→   145→   145→  reflectionCriteria: [
+    88→   117→   146→   146→   146→    { name: 'Content Quality', weight: 0.30, description: 'Clear, accurate, well-structured content', scoringGuide: '0-2: Vague, 3-5: Adequate, 6-8: Clear and precise, 9-10: Outstanding' },
+    89→   118→   147→   147→   147→    { name: 'Visual Design', weight: 0.25, description: 'Professional and visually appealing slides', scoringGuide: '0-2: Cluttered, 3-5: Basic, 6-8: Professional, 9-10: Award-winning' },
+    90→   119→   148→   148→   148→    { name: 'Narrative Flow', weight: 0.20, description: 'Logical progression through the presentation', scoringGuide: '0-2: Disconnected, 3-5: Linear, 6-8: Engaging, 9-10: Compelling' },
+    91→   120→   149→   149→   149→    { name: 'Data Accuracy', weight: 0.15, description: 'All data and claims are accurate', scoringGuide: '0-2: Errors, 3-5: Mostly right, 6-8: Accurate, 9-10: Verified' },
+    92→   121→   150→   150→   150→    { name: 'Accessibility', weight: 0.10, description: 'Accessible to all audiences', scoringGuide: '0-2: Not accessible, 3-5: Partial, 6-8: Good, 9-10: Fully accessible' },
+    93→   122→   151→   151→   151→  ],
+    94→   123→   152→   152→   152→  maxIterations: 2,
+    95→   124→   153→   153→   153→  confidenceThreshold: 0.90,
+    96→   125→   154→   154→   154→  sandboxEnabled: false,
+    97→   126→   155→   155→   155→  deploymentTarget: 'none',
+    98→   127→   156→   156→   156→  outputFormat: { type: 'slides', extensions: ['.pptx', '.pdf', '.html'], mimeType: 'application/vnd.openxmlformats-officedocument.presentationml.presentation' },
+    99→   128→   157→   157→   157→  dagTemplate: {
+   100→   129→   158→   158→   158→    nodes: [
+   101→   130→   159→   159→   159→      { id: 'research', label: 'Topic Research', level: 0, type: 'input', agentRole: 'researcher' },
+   102→   131→   160→   160→   160→      { id: 'outline', label: 'Slide Outline', level: 1, type: 'process', agentRole: 'structurer' },
+   103→   132→   161→   161→   161→      { id: 'content', label: 'Content Generation', level: 2, type: 'process', agentRole: 'writer' },
+   104→   133→   162→   162→   162→      { id: 'design', label: 'Visual Design', level: 3, type: 'process', agentRole: 'designer' },
+   105→   134→   163→   163→   163→      { id: 'export', label: 'Export & Package', level: 4, type: 'output', agentRole: 'packager' },
+   106→   135→   164→   164→   164→    ],
+   107→   136→   165→   165→   165→    edges: [
+   108→   137→   166→   166→   166→      { from: 'research', to: 'outline' },
+   109→   138→   167→   167→   167→      { from: 'outline', to: 'content' },
+   110→   139→   168→   168→   168→      { from: 'content', to: 'design' },
+   111→   140→   169→   169→   169→      { from: 'design', to: 'export' },
+   112→   141→   170→   170→   170→    ],
+   113→   142→   171→   171→   171→  },
+   114→   143→   172→   172→   172→  rateLimit: { windowMs: 60000, maxRequests: 5, tier: 'free' },
+   115→   144→   173→   173→   173→  moaConfig: {
+   116→   145→   174→   174→   174→    voting: {
+   117→   146→   175→   175→   175→      criteriaWeights: { quality: 0.4, costEfficiency: 0.3, speed: 0.3 },
+   118→   147→   176→   176→   176→      minConsensus: 0.65,
+   119→   148→   177→   177→   177→      deduplicationThreshold: 0.7,
+   120→   149→   178→   178→   178→    },
+   121→   150→   179→   179→   179→    rounds: [
+   122→   151→   180→   180→   180→      { round: 'propose', providerCount: 4, temperature: 0.4, strategy: 'all' },
+   123→   152→   181→   181→   181→      { round: 'critique', providerCount: 2, temperature: 0.2, strategy: 'top_n' },
+   124→   153→   182→   182→   182→      { round: 'refine', providerCount: 2, temperature: 0.3, strategy: 'top_n' },
+   125→   154→   183→   183→   183→    ],
+   126→   155→   184→   184→   184→    feedbackInjection: true,
+   127→   156→   185→   185→   185→  },
+   128→   157→   186→   186→   186→};
+   129→   158→   187→   187→   187→
+   130→   159→   188→   188→   188→// DOC Agent Configuration
+   131→   160→   189→   189→   189→export const DOC_AGENT_CONFIG: AgentConfig = {
+   132→   161→   190→   190→   190→  id: 'DOC',
+   133→   162→   191→   191→   191→  name: 'Documentateur',
+   134→   163→   192→   192→   192→  description: 'Professional document generation (PDF, DOCX, reports)',
+   135→   164→   193→   193→   193→  icon: 'FileText',
+   136→   165→   194→   194→   194→  color: '#10B981',
+   137→   166→   195→   195→   195→  systemPrompt: `You are AgentForge DOC, an elite document generation agent. You create professional documents, reports, and manuscripts.
+   138→   167→   196→   196→   196→
+   139→   168→   197→   197→   197→RULES:
+   140→   169→   198→   198→   198→1. Follow proper document structure (cover, TOC, sections, appendix)
+   141→   170→   199→   199→   199→2. Use professional formatting and typography
+   142→   171→   200→   200→   200→3. Include tables, charts, and visual elements where appropriate
+   143→   172→   201→   201→   201→4. Cite sources and provide references
+   144→   173→   202→   202→   202→5. Ensure content depth (minimum 150-200 words per section)
+   145→   174→   203→   203→   203→6. Apply consistent styling throughout
+   146→   175→   204→   204→   204→7. Support PDF, DOCX, and Markdown export
+   147→   176→   205→   205→   205→8. Include metadata and document properties`,
+   148→   177→   206→   206→   206→  llmPool: {
+   149→   178→   207→   207→   207→    primary: [
+   150→   179→   208→   208→   208→      { id: 'claude-3.7-sonnet', name: 'Claude 3.7 Sonnet', model: 'claude-3-7-sonnet-20250219', maxTokens: 8192, temperature: 0.3, costPer1kTokens: 0.003, latencyMs: 1200, strengths: ['writing', 'structure', 'research'] },
+   151→   180→   209→   209→   209→      { id: 'gpt-4o', name: 'GPT-4o', model: 'gpt-4o-2024-11-20', maxTokens: 8192, temperature: 0.3, costPer1kTokens: 0.005, latencyMs: 1000, strengths: ['writing', 'summarization'] },
+   152→   181→   210→   210→   210→    ],
+   153→   182→   211→   211→   211→    secondary: [
+   154→   183→   212→   212→   212→      { id: 'deepseek-r1', name: 'DeepSeek R1', model: 'deepseek-reasoner', maxTokens: 8192, temperature: 0.5, costPer1kTokens: 0.0014, latencyMs: 2500, strengths: ['analysis', 'depth'] },
+   155→   184→   213→   213→   213→    ],
+   156→   185→   214→   214→   214→    fallback: [
+   157→   186→   215→   215→   215→      { id: 'gemini-2.0-flash', name: 'Gemini 2.0 Flash', model: 'gemini-2.0-flash-001', maxTokens: 8192, temperature: 0.5, costPer1kTokens: 0.0001, latencyMs: 400, strengths: ['speed', 'drafts'] },
+   158→   187→   216→   216→   216→    ],
+   159→   188→   217→   217→   217→  },
+   160→   189→   218→   218→   218→  reflectionCriteria: [
+   161→   190→   219→   219→   219→    { name: 'Content Depth', weight: 0.30, description: 'Thorough, well-researched content with substantial information', scoringGuide: '0-2: Shallow, 3-5: Adequate depth, 6-8: Comprehensive, 9-10: Authoritative' },
+   162→   191→   220→   220→   220→    { name: 'Structure & Organization', weight: 0.25, description: 'Logical flow, clear headings, proper document hierarchy', scoringGuide: '0-2: Disorganized, 3-5: Basic structure, 6-8: Well-organized, 9-10: Flawless' },
+   163→   192→   221→   221→   221→    { name: 'Formatting & Typography', weight: 0.20, description: 'Professional formatting, consistent styling, proper typography', scoringGuide: '0-2: Raw text, 3-5: Basic formatting, 6-8: Professional, 9-10: Publication-ready' },
+   164→   193→   222→   222→   222→    { name: 'Accuracy & Citations', weight: 0.15, description: 'Factual correctness with proper source citations', scoringGuide: '0-2: Unverified, 3-5: Some sources, 6-8: Well-cited, 9-10: Rigorously sourced' },
+   165→   194→   223→   223→   223→    { name: 'Clarity & Readability', weight: 0.10, description: 'Clear language, appropriate tone, accessible to target audience', scoringGuide: '0-2: Confusing, 3-5: Readable, 6-8: Clear, 9-10: Compelling' },
+   166→   195→   224→   224→   224→  ],
+   167→   196→   225→   225→   225→  maxIterations: 2,
+   168→   197→   226→   226→   226→  confidenceThreshold: 0.90,
+   169→   198→   227→   227→   227→  sandboxEnabled: false,
+   170→   199→   228→   228→   228→  deploymentTarget: 'none',
+   171→   200→   229→   229→   229→  outputFormat: { type: 'document', extensions: ['.pdf', '.docx', '.md'], mimeType: 'application/pdf' },
+   172→   201→   230→   230→   230→  dagTemplate: {
+   173→   202→   231→   231→   231→    nodes: [
+   174→   203→   232→   232→   232→      { id: 'requirements', label: 'Document Requirements', level: 0, type: 'input', agentRole: 'analyst' },
+   175→   204→   233→   233→   233→      { id: 'outline', label: 'Document Outline', level: 1, type: 'process', agentRole: 'architect' },
+   176→   205→   234→   234→   234→      { id: 'content', label: 'Content Generation', level: 2, type: 'process', agentRole: 'writer' },
+   177→   206→   235→   235→   235→      { id: 'format', label: 'Formatting & Layout', level: 3, type: 'process', agentRole: 'designer' },
+   178→   207→   236→   236→   236→      { id: 'export', label: 'Export Document', level: 4, type: 'output', agentRole: 'packager' },
+   179→   208→   237→   237→   237→    ],
+   180→   209→   238→   238→   238→    edges: [
+   181→   210→   239→   239→   239→      { from: 'requirements', to: 'outline' },
+   182→   211→   240→   240→   240→      { from: 'outline', to: 'content' },
+   183→   212→   241→   241→   241→      { from: 'content', to: 'format' },
+   184→   213→   242→   242→   242→      { from: 'format', to: 'export' },
+   185→   214→   243→   243→   243→    ],
+   186→   215→   244→   244→   244→  },
+   187→   216→   245→   245→   245→  rateLimit: { windowMs: 60000, maxRequests: 8, tier: 'free' },
+   188→   217→   246→   246→   246→  moaConfig: {
+   189→   218→   247→   247→   247→    voting: {
+   190→   219→   248→   248→   248→      criteriaWeights: { quality: 0.4, costEfficiency: 0.3, speed: 0.3 },
+   191→   220→   249→   249→   249→      minConsensus: 0.65,
+   192→   221→   250→   250→   250→      deduplicationThreshold: 0.7,
+   193→   222→   251→   251→   251→    },
+   194→   223→   252→   252→   252→    rounds: [
+   195→   224→   253→   253→   253→      { round: 'propose', providerCount: 4, temperature: 0.3, strategy: 'all' },
+   196→   225→   254→   254→   254→      { round: 'critique', providerCount: 2, temperature: 0.2, strategy: 'top_n' },
+   197→   226→   255→   255→   255→      { round: 'refine', providerCount: 2, temperature: 0.3, strategy: 'top_n' },
+   198→   227→   256→   256→   256→    ],
+   199→   228→   257→   257→   257→    feedbackInjection: true,
+   200→   229→   258→   258→   258→  },
+   201→   230→   259→   259→   259→};
+   202→   231→   260→   260→   260→
+   203→   232→   261→   261→   261→// DATA Agent Configuration
+   204→   233→   262→   262→   262→export const DATA_AGENT_CONFIG: AgentConfig = {
+   205→   234→   263→   263→   263→  id: 'DATA',
+   206→   235→   264→   264→   264→  name: 'Analyste',
+   207→   236→   265→   265→   265→  description: 'Data analysis, visualization, and spreadsheet generation',
+   208→   237→   266→   266→   266→  icon: 'BarChart3',
+   209→   238→   267→   267→   267→  color: '#F59E0B',
+   210→   239→   268→   268→   268→  systemPrompt: `You are AgentForge DATA, an elite data analysis agent. You analyze data, create visualizations, and generate spreadsheets.
+   211→   240→   269→   269→   269→
+   212→   241→   270→   270→   270→RULES:
+   213→   242→   271→   271→   271→1. Always validate and clean data before analysis
+   214→   243→   272→   272→   272→2. Use appropriate chart types for the data
+   215→   244→   273→   273→   273→3. Include statistical summaries and insights
+   216→   245→   274→   274→   274→4. Support CSV, XLSX, JSON, and SQL data sources
+   217→   246→   275→   275→   275→5. Generate interactive charts with ECharts/Chart.js
+   218→   247→   276→   276→   276→6. Apply proper color theory to visualizations
+   219→   248→   277→   277→   277→7. Include data quality reports
+   220→   249→   278→   278→   278→8. Support pivot tables and aggregations`,
+   221→   250→   279→   279→   279→  llmPool: {
+   222→   251→   280→   280→   280→    primary: [
+   223→   252→   281→   281→   281→      { id: 'gpt-4o', name: 'GPT-4o', model: 'gpt-4o-2024-11-20', maxTokens: 8192, temperature: 0.2, costPer1kTokens: 0.005, latencyMs: 1000, strengths: ['analysis', 'sql', 'python'] },
+   224→   253→   282→   282→   282→      { id: 'deepseek-r1', name: 'DeepSeek R1', model: 'deepseek-reasoner', maxTokens: 8192, temperature: 0.4, costPer1kTokens: 0.0014, latencyMs: 2500, strengths: ['reasoning', 'statistics', 'ml'] },
+   225→   254→   283→   283→   283→    ],
+   226→   255→   284→   284→   284→    secondary: [
+   227→   256→   285→   285→   285→      { id: 'claude-3.7-sonnet', name: 'Claude 3.7 Sonnet', model: 'claude-3-7-sonnet-20250219', maxTokens: 8192, temperature: 0.3, costPer1kTokens: 0.003, latencyMs: 1200, strengths: ['python', 'visualization'] },
+   228→   257→   286→   286→   286→    ],
+   229→   258→   287→   287→   287→    fallback: [
+   230→   259→   288→   288→   288→      { id: 'gemini-2.0-flash', name: 'Gemini 2.0 Flash', model: 'gemini-2.0-flash-001', maxTokens: 8192, temperature: 0.5, costPer1kTokens: 0.0001, latencyMs: 400, strengths: ['speed', 'simple-charts'] },
+   231→   260→   289→   289→   289→    ],
+   232→   261→   290→   290→   290→  },
+   233→   262→   291→   291→   291→  reflectionCriteria: [
+   234→   263→   292→   292→   292→    { name: 'Accuracy', weight: 0.35, description: 'Data analysis accuracy', scoringGuide: '0-2: Wrong analysis, 3-5: Minor errors, 6-8: Accurate, 9-10: Perfect' },
+   235→   264→   293→   293→   293→    { name: 'Visualization', weight: 0.25, description: 'Chart quality and appropriateness', scoringGuide: '0-2: Misleading, 3-5: Basic, 6-8: Professional, 9-10: Insightful' },
+   236→   265→   294→   294→   294→    { name: 'Insight Depth', weight: 0.20, description: 'Quality of insights and recommendations', scoringGuide: '0-2: Obvious, 3-5: Some value, 6-8: Valuable, 9-10: Transformative' },
+   237→   266→   295→   295→   295→    { name: 'Code Quality', weight: 0.15, description: 'Clean, efficient analysis code', scoringGuide: '0-2: Spaghetti, 3-5: Works, 6-8: Clean, 9-10: Elegant' },
+   238→   267→   296→   296→   296→    { name: 'Documentation', weight: 0.05, description: 'Well-documented analysis steps', scoringGuide: '0-2: None, 3-5: Basic, 6-8: Good, 9-10: Comprehensive' },
+   239→   268→   297→   297→   297→  ],
+   240→   269→   298→   298→   298→  maxIterations: 2,
+   241→   270→   299→   299→   299→  confidenceThreshold: 0.90,
+   242→   271→   300→   300→   300→  sandboxEnabled: true,
+   243→   272→   301→   301→   301→  deploymentTarget: 'none',
+   244→   273→   302→   302→   302→  outputFormat: { type: 'data', extensions: ['.xlsx', '.csv', '.json', '.png'], mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' },
+   245→   274→   303→   303→   303→  dagTemplate: {
+   246→   275→   304→   304→   304→    nodes: [
+   247→   276→   305→   305→   305→      { id: 'ingest', label: 'Data Ingestion', level: 0, type: 'input', agentRole: 'ingestor' },
+   248→   277→   306→   306→   306→      { id: 'clean', label: 'Data Cleaning', level: 1, type: 'process', agentRole: 'cleaner' },
+   249→   278→   307→   307→   307→      { id: 'analyze', label: 'Statistical Analysis', level: 2, type: 'process', agentRole: 'analyst' },
+   250→   279→   308→   308→   308→      { id: 'visualize', label: 'Data Visualization', level: 3, type: 'process', agentRole: 'visualizer' },
+   251→   280→   309→   309→   309→      { id: 'report', label: 'Report Generation', level: 4, type: 'output', agentRole: 'reporter' },
+   252→   281→   310→   310→   310→    ],
+   253→   282→   311→   311→   311→    edges: [
+   254→   283→   312→   312→   312→      { from: 'ingest', to: 'clean' },
+   255→   284→   313→   313→   313→      { from: 'clean', to: 'analyze' },
+   256→   285→   314→   314→   314→      { from: 'analyze', to: 'visualize' },
+   257→   286→   315→   315→   315→      { from: 'visualize', to: 'report' },
+   258→   287→   316→   316→   316→    ],
+   259→   288→   317→   317→   317→  },
+   260→   289→   318→   318→   318→  rateLimit: { windowMs: 60000, maxRequests: 8, tier: 'free' },
+   261→   290→   319→   319→   319→  moaConfig: {
+   262→   291→   320→   320→   320→    voting: {
+   263→   292→   321→   321→   321→      criteriaWeights: { quality: 0.4, costEfficiency: 0.25, speed: 0.35 },
+   264→   293→   322→   322→   322→      minConsensus: 0.65,
+   265→   294→   323→   323→   323→      deduplicationThreshold: 0.7,
+   266→   295→   324→   324→   324→    },
+   267→   296→   325→   325→   325→    rounds: [
+   268→   297→   326→   326→   326→      { round: 'propose', providerCount: 4, temperature: 0.3, strategy: 'all' },
+   269→   298→   327→   327→   327→      { round: 'critique', providerCount: 2, temperature: 0.2, strategy: 'top_n' },
+   270→   299→   328→   328→   328→      { round: 'refine', providerCount: 2, temperature: 0.3, strategy: 'top_n' },
+   271→   300→   329→   329→   329→    ],
+   272→   301→   330→   330→   330→    feedbackInjection: true,
+   273→   302→   331→   331→   331→  },
+   274→   303→   332→   332→   332→};
+   275→   304→   333→   333→   333→
+   276→   305→   334→   334→   334→// RECHERCHE Agent Configuration
+   277→   306→   335→   335→   335→export const RECHERCHE_AGENT_CONFIG: AgentConfig = {
+   278→   307→   336→   336→   336→  id: 'RECHERCHE',
+   279→   308→   337→   337→   337→  name: 'Chercheur',
+   280→   309→   338→   338→   338→  description: 'Deep research with web search and synthesis',
+   281→   310→   339→   339→   339→  icon: 'Search',
+   282→   311→   340→   340→   340→  color: '#EF4444',
+   283→   312→   341→   341→   341→  systemPrompt: `You are AgentForge RECHERCHE, an elite research agent. You conduct deep research using web search and synthesize comprehensive reports.
+   284→   313→   342→   342→   342→
+   285→   314→   343→   343→   343→RULES:
+   286→   315→   344→   344→   344→1. Always cite sources with URLs and dates
+   287→   316→   345→   345→   345→2. Cross-reference information from multiple sources
+   288→   317→   346→   346→   346→3. Distinguish between facts, opinions, and speculation
+   289→   318→   347→   347→   347→4. Provide confidence levels for claims
+   290→   319→   348→   348→   348→5. Include methodology section
+   291→   320→   349→   349→   349→6. Cover multiple perspectives
+   292→   321→   350→   350→   350→7. Update research with latest available data
+   293→   322→   351→   351→   351→8. Generate executive summaries and detailed reports`,
+   294→   323→   352→   352→   352→  llmPool: {
+   295→   324→   353→   353→   353→    primary: [
+   296→   325→   354→   354→   354→      { id: 'gemini-2.5-pro', name: 'Gemini 2.5 Pro', model: 'gemini-2.5-pro-preview-05-06', maxTokens: 8192, temperature: 0.3, costPer1kTokens: 0.00125, latencyMs: 1500, strengths: ['search', 'multimodal', 'comprehensive'] },
+   297→   326→   355→   355→   355→      { id: 'gpt-o1', name: 'GPT-o1', model: 'o1-2024-12-17', maxTokens: 16384, temperature: 0.5, costPer1kTokens: 0.015, latencyMs: 3000, strengths: ['deep-reasoning', 'analysis', 'synthesis'] },
+   298→   327→   356→   356→   356→    ],
+   299→   328→   357→   357→   357→    secondary: [
+   300→   329→   358→   358→   358→      { id: 'claude-3.7-sonnet', name: 'Claude 3.7 Sonnet', model: 'claude-3-7-sonnet-20250219', maxTokens: 8192, temperature: 0.3, costPer1kTokens: 0.003, latencyMs: 1200, strengths: ['writing', 'structure'] },
+   301→   330→   359→   359→   359→    ],
+   302→   331→   360→   360→   360→    fallback: [
+   303→   332→   361→   361→   361→      { id: 'mistral-large', name: 'Mistral Large', model: 'mistral-large-2411', maxTokens: 8192, temperature: 0.4, costPer1kTokens: 0.002, latencyMs: 900, strengths: ['speed', 'factual'] },
+   304→   333→   362→   362→   362→    ],
+   305→   334→   363→   363→   363→  },
+   306→   335→   364→   364→   364→  reflectionCriteria: [
+   307→   336→   365→   365→   365→    { name: 'Source Quality', weight: 0.30, description: 'Reliability and diversity of sources', scoringGuide: '0-2: Unreliable, 3-5: Some good sources, 6-8: Diverse & reliable, 9-10: Authoritative' },
+   308→   337→   366→   366→   366→    { name: 'Comprehensiveness', weight: 0.25, description: 'Coverage of the topic', scoringGuide: '0-2: Shallow, 3-5: Basic coverage, 6-8: Thorough, 9-10: Exhaustive' },
+   309→   338→   367→   367→   367→    { name: 'Accuracy', weight: 0.20, description: 'Factual correctness', scoringGuide: '0-2: Errors, 3-5: Minor issues, 6-8: Accurate, 9-10: Verified' },
+   310→   339→   368→   368→   368→    { name: 'Synthesis', weight: 0.15, description: 'Quality of connecting insights', scoringGuide: '0-2: Disconnected, 3-5: Basic summary, 6-8: Well-connected, 9-10: Groundbreaking' },
+   311→   340→   369→   369→   369→    { name: 'Presentation', weight: 0.10, description: 'Clear and organized output', scoringGuide: '0-2: Chaotic, 3-5: Organized, 6-8: Professional, 9-10: Outstanding' },
+   312→   341→   370→   370→   370→  ],
+   313→   342→   371→   371→   371→  maxIterations: 3,
+   314→   343→   372→   372→   372→  confidenceThreshold: 0.92,
+   315→   344→   373→   373→   373→  sandboxEnabled: false,
+   316→   345→   374→   374→   374→  deploymentTarget: 'none',
+   317→   346→   375→   375→   375→  outputFormat: { type: 'report', extensions: ['.pdf', '.md', '.docx'], mimeType: 'application/pdf' },
+   318→   347→   376→   376→   376→  dagTemplate: {
+   319→   348→   377→   377→   377→    nodes: [
+   320→   349→   378→   378→   378→      { id: 'query', label: 'Query Planning', level: 0, type: 'input', agentRole: 'planner' },
+   321→   350→   379→   379→   379→      { id: 'search', label: 'Web Search', level: 1, type: 'process', agentRole: 'searcher' },
+   322→   351→   380→   380→   380→      { id: 'extract', label: 'Content Extraction', level: 2, type: 'process', agentRole: 'extractor' },
+   323→   352→   381→   381→   381→      { id: 'synthesize', label: 'Synthesis', level: 3, type: 'process', agentRole: 'synthesizer' },
+   324→   353→   382→   382→   382→      { id: 'report', label: 'Report Generation', level: 4, type: 'output', agentRole: 'reporter' },
+   325→   354→   383→   383→   383→    ],
+   326→   355→   384→   384→   384→    edges: [
+   327→   356→   385→   385→   385→      { from: 'query', to: 'search' },
+   328→   357→   386→   386→   386→      { from: 'search', to: 'extract' },
+   329→   358→   387→   387→   387→      { from: 'extract', to: 'synthesize' },
+   330→   359→   388→   388→   388→      { from: 'synthesize', to: 'report' },
+   331→   360→   389→   389→   389→    ],
+   332→   361→   390→   390→   390→  },
+   333→   362→   391→   391→   391→  rateLimit: { windowMs: 60000, maxRequests: 5, tier: 'pro' },
+   334→   363→   392→   392→   392→  moaConfig: {
+   335→   364→   393→   393→   393→    voting: {
+   336→   365→   394→   394→   394→      criteriaWeights: { quality: 0.45, costEfficiency: 0.25, speed: 0.3 },
+   337→   366→   395→   395→   395→      minConsensus: 0.65,
+   338→   367→   396→   396→   396→      deduplicationThreshold: 0.7,
+   339→   368→   397→   397→   397→    },
+   340→   369→   398→   398→   398→    rounds: [
+   341→   370→   399→   399→   399→      { round: 'propose', providerCount: 4, temperature: 0.3, strategy: 'all' },
+   342→   371→   400→   400→   400→      { round: 'critique', providerCount: 2, temperature: 0.2, strategy: 'top_n' },
+   343→   372→   401→   401→   401→      { round: 'refine', providerCount: 2, temperature: 0.3, strategy: 'top_n' },
+   344→   373→   402→   402→   402→    ],
+   345→   374→   403→   403→   403→    feedbackInjection: true,
+   346→   375→   404→   404→   404→  },
+   347→   376→   405→   405→   405→};
+   348→   377→   406→   406→   406→
+   349→   378→   407→   407→   407→// EMAIL Agent Configuration
+   350→   379→   408→   408→   408→export const EMAIL_AGENT_CONFIG: AgentConfig = {
+   351→   380→   409→   409→   409→  id: 'EMAIL',
+   352→   381→   410→   410→   410→  name: 'Communicant',
+   353→   382→   411→   411→   411→  description: 'Professional email composition and campaign management',
+   354→   383→   412→   412→   412→  icon: 'Mail',
+   355→   384→   413→   413→   413→  color: '#EC4899',
+   356→   385→   414→   414→   414→  systemPrompt: `You are AgentForge EMAIL, an elite email composition agent. You craft professional emails and manage campaigns.
+   357→   386→   415→   415→   415→
+   358→   387→   416→   416→   416→RULES:
+   359→   388→   417→   417→   417→1. Match tone to audience and purpose
+   360→   389→   418→   418→   418→2. Subject lines must be compelling and clear
+   361→   390→   419→   419→   419→3. Keep emails concise and actionable
+   362→   391→   420→   420→   420→4. Include clear CTAs
+   363→   392→   421→   421→   421→5. Support A/B testing variants
+   364→   393→   422→   422→   422→6. Ensure CAN-SPAM compliance
+   365→   394→   423→   423→   423→7. Personalize with merge fields
+   366→   395→   424→   424→   424→8. Include plain text alternative`,
+   367→   396→   425→   425→   425→  llmPool: {
+   368→   397→   426→   426→   426→    primary: [
+   369→   398→   427→   427→   427→      { id: 'claude-3.7-sonnet', name: 'Claude 3.7 Sonnet', model: 'claude-3-7-sonnet-20250219', maxTokens: 4096, temperature: 0.5, costPer1kTokens: 0.003, latencyMs: 1200, strengths: ['writing', 'persuasion', 'tone'] },
+   370→   399→   428→   428→   428→      { id: 'gpt-4o', name: 'GPT-4o', model: 'gpt-4o-2024-11-20', maxTokens: 4096, temperature: 0.5, costPer1kTokens: 0.005, latencyMs: 1000, strengths: ['writing', 'personalization'] },
+   371→   400→   429→   429→   429→    ],
+   372→   401→   430→   430→   430→    secondary: [
+   373→   402→   431→   431→   431→      { id: 'mistral-large', name: 'Mistral Large', model: 'mistral-large-2411', maxTokens: 4096, temperature: 0.5, costPer1kTokens: 0.002, latencyMs: 900, strengths: ['multilingual', 'formal'] },
+   374→   403→   432→   432→   432→    ],
+   375→   404→   433→   433→   433→    fallback: [
+   376→   405→   434→   434→   434→      { id: 'gemini-2.0-flash', name: 'Gemini 2.0 Flash', model: 'gemini-2.0-flash-001', maxTokens: 4096, temperature: 0.5, costPer1kTokens: 0.0001, latencyMs: 400, strengths: ['speed', 'drafts'] },
+   377→   406→   435→   435→   435→    ],
+   378→   407→   436→   436→   436→  },
+   379→   408→   437→   437→   437→  reflectionCriteria: [
+   380→   409→   438→   438→   438→    { name: 'Clarity', weight: 0.30, description: 'Clear and easy to understand', scoringGuide: '0-2: Confusing, 3-5: Understandable, 6-8: Crystal clear, 9-10: Perfect' },
+   381→   410→   439→   439→   439→    { name: 'Persuasion', weight: 0.25, description: 'Effectiveness at achieving goal', scoringGuide: '0-2: Weak, 3-5: Decent, 6-8: Convincing, 9-10: Irresistible' },
+   382→   411→   440→   440→   440→    { name: 'Tone Match', weight: 0.20, description: 'Appropriate tone for audience', scoringGuide: '0-2: Wrong tone, 3-5: Acceptable, 6-8: Well-matched, 9-10: Perfect' },
+   383→   412→   441→   441→   441→    { name: 'Actionability', weight: 0.15, description: 'Clear next steps for recipient', scoringGuide: '0-2: Vague, 3-5: Some direction, 6-8: Clear CTA, 9-10: Impossible to ignore' },
+   384→   413→   442→   442→   442→    { name: 'Conciseness', weight: 0.10, description: 'Says more with less', scoringGuide: '0-2: Verbose, 3-5: Adequate, 6-8: Tight, 9-10: Every word counts' },
+   385→   414→   443→   443→   443→  ],
+   386→   415→   444→   444→   444→  maxIterations: 2,
+   387→   416→   445→   445→   445→  confidenceThreshold: 0.88,
+   388→   417→   446→   446→   446→  sandboxEnabled: false,
+   389→   418→   447→   447→   447→  deploymentTarget: 'none',
+   390→   419→   448→   448→   448→  outputFormat: { type: 'email', extensions: ['.html', '.txt', '.json'], mimeType: 'text/html' },
+   391→   420→   449→   449→   449→  dagTemplate: {
+   392→   421→   450→   450→   450→    nodes: [
+   393→   422→   451→   451→   451→      { id: 'context', label: 'Context Analysis', level: 0, type: 'input', agentRole: 'analyzer' },
+   394→   423→   452→   452→   452→      { id: 'draft', label: 'Email Draft', level: 1, type: 'process', agentRole: 'writer' },
+   395→   424→   453→   453→   453→      { id: 'variants', label: 'A/B Variants', level: 2, type: 'process', agentRole: 'variant-generator' },
+   396→   425→   454→   454→   454→      { id: 'refine', label: 'Refinement', level: 3, type: 'output', agentRole: 'editor' },
+   397→   426→   455→   455→   455→    ],
+   398→   427→   456→   456→   456→    edges: [
+   399→   428→   457→   457→   457→      { from: 'context', to: 'draft' },
+   400→   429→   458→   458→   458→      { from: 'draft', to: 'variants' },
+   401→
+   402→[showing lines 30-429 of 502; use offset=430 with limit to continue reading]
