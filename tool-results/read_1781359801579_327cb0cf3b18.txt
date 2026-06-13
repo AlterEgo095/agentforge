@@ -1,0 +1,786 @@
+     1→// ============================================================
+     2→// AgentForge - Reflection Agent
+     3→// 3-Level Auto-Fix: Pattern (200+) → AST (ts-morph) → LLM (multi-pass)
+     4→// Real LLM-based evaluation with weighted criteria
+     5→// Root cause analysis before LLM fix
+     6→// ============================================================
+     7→
+     8→import type { ReflectionCriteria, ReflectionScore, LLMId } from '@agentforge/shared';
+     9→import { LLMRouter } from '../../services/LLMRouter';
+    10→import { PatternLibrary, type AppliedFix, type DetectedIssue } from '../../services/PatternLibrary';
+    11→import { tracingService } from '../../services/telemetry/TracingService';
+    12→
+    13→interface ReflectionResult {
+    14→  passed: boolean;
+    15→  scores: ReflectionScore[];
+    16→  feedback: string;
+    17→  overallScore: number;
+    18→  confidence: number;
+    19→}
+    20→
+    21→interface RootCauseAnalysis {
+    22→  summary: string;
+    23→  categories: Record<string, number>;
+    24→  criticalIssues: DetectedIssue[];
+    25→  suggestedFixStrategy: 'pattern' | 'ast' | 'llm';
+    26→  confidence: number;
+    27→}
+    28→
+    29→interface MultiPassLLMResult {
+    30→  output: string;
+    31→  passes: LLMPassResult[];
+    32→  totalTokensUsed: number;
+    33→  converged: boolean;
+    34→}
+    35→
+    36→interface LLMPassResult {
+    37→  passNumber: number;
+    38→  input: string;
+    39→  output: string;
+    40→  tokensUsed: number;
+    41→  improvementScore: number;
+    42→  applied: boolean;
+    43→}
+    44→
+    45→export class ReflectionAgent {
+    46→  private llmRouter: LLMRouter;
+    47→  private patternLibrary: PatternLibrary;
+    48→
+    49→  constructor(llmRouter?: LLMRouter) {
+    50→    this.llmRouter = llmRouter || new LLMRouter();
+    51→    this.patternLibrary = new PatternLibrary();
+    52→  }
+    53→
+    54→  /**
+    55→   * Evaluate output against weighted criteria using an LLM evaluator.
+    56→   * Uses Gemini 2.0 Flash for speed/cost efficiency in evaluation.
+    57→   */
+    58→  async evaluate(
+    59→    output: string,
+    60→    criteria: ReflectionCriteria[],
+    61→    threshold: number
+    62→  ): Promise<ReflectionResult> {
+    63→    const doEvaluate = async () => {
+    64→      // Build the evaluation prompt with specific criteria
+    65→      const criteriaList = criteria.map(c =>
+    66→        `- ${c.name} (weight: ${(c.weight * 100).toFixed(0)}%): ${c.description}\n  Scoring: ${c.scoringGuide}`
+    67→      ).join('\n');
+    68→
+    69→      const totalWeight = criteria.reduce((sum, c) => sum + c.weight, 0);
+    70→
+    71→      const evalPrompt = `You are a strict, objective quality evaluator. Evaluate the following output against these criteria.
+    72→
+    73→For each criterion, provide:
+    74→1. A score from 0 to 10 (be harsh — only give 9-10 for truly exceptional work)
+    75→2. Brief, specific feedback (what's good, what needs improvement)
+    76→
+    77→CRITERIA:
+    78→${criteriaList}
+    79→
+    80→OUTPUT TO EVALUATE:
+    81→${output.substring(0, 6000)}
+    82→
+    83→Respond in this EXACT JSON format only (no markdown, no extra text):
+    84→{
+    85→  "scores": [
+    86→    {"criteria": "Criterion Name", "score": 7, "feedback": "Specific feedback here"},
+    87→    ...
+    88→  ],
+    89→  "overall_feedback": "Summary of key strengths and critical weaknesses that must be addressed"
+    90→}`;
+    91→
+    92→      try {
+    93→        const response = await this.llmRouter.call('gemini-2.0-flash' as LLMId, [
+    94→          { role: 'system', content: 'You are a strict code and content quality evaluator. Be objective, thorough, and specific. Never give default scores — always evaluate based on the actual content.' },
+    95→          { role: 'user', content: evalPrompt },
+    96→        ], { temperature: 0.1, maxTokens: 2048 });
+    97→
+    98→        // Parse the LLM response
+    99→        const scores = this.parseReflectionResponse(response.content || '', criteria);
+   100→        const overallScore = scores.reduce((sum, s) => sum + s.weightedScore, 0) / totalWeight;
+   101→        const confidence = overallScore / 10;
+   102→
+   103→        return {
+   104→          passed: confidence >= threshold,
+   105→          scores,
+   106→          feedback: this.extractFeedback(response.content || ''),
+   107→          overallScore,
+   108→          confidence,
+   109→        };
+   110→      } catch (error) {
+   111→        console.error('[ReflectionAgent] Evaluation failed:', error);
+   112→        // Return default scores if LLM evaluation fails
+   113→        return {
+   114→          passed: false,
+   115→          scores: this.defaultScores(criteria),
+   116→          feedback: 'Evaluation failed — defaulting to low scores. Manual review recommended.',
+   117→          overallScore: 3,
+   118→          confidence: 0.3,
+   119→        };
+   120→      }
+   121→    };
+   122→
+   123→    if (tracingService.isEnabled()) {
+   124→      return tracingService.withSpan(
+   125→        { name: 'agent.reflection', attributes: { 'reflection.type': 'evaluate', 'reflection.criteria_count': criteria.length, 'reflection.threshold': threshold } },
+   126→        async (span) => {
+   127→          const result = await doEvaluate();
+   128→          span.setAttribute('reflection.passed', result.passed);
+   129→          span.setAttribute('reflection.confidence', result.confidence);
+   130→          span.setAttribute('reflection.overall_score', result.overallScore);
+   131→          return result;
+   132→        },
+   133→      );
+   134→    }
+   135→    return doEvaluate();
+   136→  }
+   137→
+   138→  // ═══════════════════════════════════════════════════════
+   139→  // Level 1: Pattern-Based Fixes (Fastest, Cheapest)
+   140→  // 200+ categorized patterns from PatternLibrary
+   141→  // ═══════════════════════════════════════════════════════
+   142→
+   143→  /**
+   144→   * Apply all pattern fixes using the comprehensive PatternLibrary.
+   145→   * Returns the fixed output and a list of all applied fixes, or null if nothing changed.
+   146→   */
+   147→  patternFix(output: string, feedback: string): string | null {
+   148→    const { output: fixed, fixes } = this.patternLibrary.applyAll(output);
+   149→
+   150→    if (fixes.length === 0) return null;
+   151→
+   152→    // Log the pattern fixes for debugging
+   153→    const criticalFixes = fixes.filter(f => f.severity === 'critical');
+   154→    if (criticalFixes.length > 0) {
+   155→      console.warn(`[ReflectionAgent] Applied ${criticalFixes.length} critical pattern fixes:`,
+   156→        criticalFixes.map(f => `${f.name} at line ${f.line}`).join(', '));
+   157→    }
+   158→
+   159→    console.log(`[ReflectionAgent] Pattern fix applied ${fixes.length} fixes across ${new Set(fixes.map(f => f.category)).size} categories`);
+   160→    return fixed;
+   161→  }
+   162→
+   163→  /**
+   164→   * Apply pattern fixes limited to a specific category.
+   165→   */
+   166→  patternFixByCategory(output: string, category: string): string | null {
+   167→    const { output: fixed, fixes } = this.patternLibrary.applyByCategory(output, category);
+   168→    return fixes.length > 0 ? fixed : null;
+   169→  }
+   170→
+   171→  /**
+   172→   * Apply only critical-severity pattern fixes.
+   173→   */
+   174→  patternFixCritical(output: string): string | null {
+   175→    const { output: fixed, fixes } = this.patternLibrary.applyCritical(output);
+   176→    return fixes.length > 0 ? fixed : null;
+   177→  }
+   178→
+   179→  /**
+   180→   * Detect all issues in the output without applying fixes.
+   181→   */
+   182→  detectIssues(output: string): DetectedIssue[] {
+   183→    return this.patternLibrary.detectIssues(output);
+   184→  }
+   185→
+   186→  /**
+   187→   * Get pattern library statistics.
+   188→   */
+   189→  getPatternStats(): { total: number; byCategory: Record<string, number> } {
+   190→    return {
+   191→      total: this.patternLibrary.getPatternCount(),
+   192→      byCategory: this.patternLibrary.getPatternsByCategory(),
+   193→    };
+   194→  }
+   195→
+   196→  // ═══════════════════════════════════════════════════════
+   197→  // Level 2: AST-Based Structural Fixes (ts-morph inspired)
+   198→  // Structural code transformations without full parser
+   199→  // ═══════════════════════════════════════════════════════
+   200→
+   201→  async astFix(output: string, feedback: string): Promise<string | null> {
+   202→    try {
+   203→      let fixed = output;
+   204→      let changed = false;
+   205→
+   206→      // Fix 1: Add missing return types to functions
+   207→      fixed = fixed.replace(
+   208→        /(?:export\s+)?(?:async\s+)?function\s+(\w+)\s*\(([^)]*)\)\s*\{/g,
+   209→        (match, name, params) => {
+   210→          if (!match.includes('): ') && !match.includes('):')) {
+   211→            changed = true;
+   212→            // Infer return type from async keyword
+   213→            const isAsync = match.includes('async');
+   214→            const returnType = isAsync ? 'Promise<unknown>' : 'unknown';
+   215→            return match.replace(/\{$/, `: ${returnType} {`);
+   216→          }
+   217→          return match;
+   218→        }
+   219→      );
+   220→
+   221→      // Fix 2: Add missing return types to arrow functions
+   222→      fixed = fixed.replace(
+   223→        /(?:export\s+)?const\s+(\w+)\s*=\s*(?:async\s+)?\(([^)]*)\)\s*=>\s*\{/g,
+   224→        (match, name, params) => {
+   225→          if (!match.includes('): ') && !match.includes('):')) {
+   226→            changed = true;
+   227→            const isAsync = match.includes('async');
+   228→            const returnType = isAsync ? 'Promise<unknown>' : 'unknown';
+   229→            return match.replace(/=>\s*\{$/, `): ${returnType} => {`);
+   230→          }
+   231→          return match;
+   232→        }
+   233→      );
+   234→
+   235→      // Fix 3: Replace `require()` with `import`
+   236→      fixed = fixed.replace(
+   237→        /const\s+(\w+)\s*=\s*require\(['"]([^'"]+)['"]\);?/g,
+   238→        (_, name, module) => {
+   239→          changed = true;
+   240→          return `import ${name} from '${module}';`;
+   241→        }
+   242→      );
+   243→
+   244→      // Fix 4: Add try-catch around async function bodies
+   245→      if (feedback.toLowerCase().includes('error handling') || feedback.toLowerCase().includes('try')) {
+   246→        fixed = fixed.replace(
+   247→          /(async\s+function\s+\w+\s*\([^)]*\)\s*:\s*\w+\s*\{)\s*\n([\s\S]*?)(\n\})/g,
+   248→          (match, header, body, closing) => {
+   249→            if (!body.includes('try {') && body.includes('await ')) {
+   250→              changed = true;
+   251→              return `${header}\n  try {\n${body.split('\n').map((l: string) => '    ' + l).join('\n')}\n  } catch (error) {\n    throw error;\n  }${closing}`;
+   252→            }
+   253→            return match;
+   254→          }
+   255→        );
+   256→      }
+   257→
+   258→      // Fix 5: Add proper TypeScript interface exports
+   259→      fixed = fixed.replace(
+   260→        /(^|\n)(interface\s+(\w+))/gm,
+   261→        (match, prefix, iface, name) => {
+   262→          if (!prefix.includes('export')) {
+   263→            changed = true;
+   264→            return `${prefix}export ${iface}`;
+   265→          }
+   266→          return match;
+   267→        }
+   268→      );
+   269→
+   270→      // Fix 6: Add missing semicolons after statements
+   271→      fixed = fixed.replace(
+   272→        /(\w|\)|\]|\})(\n\s*(?:export|const|let|var|function|class|interface|type|import|return|if|for|while))/g,
+   273→        '$1;$2'
+   274→      );
+   275→
+   276→      // Fix 7: Wrap catch blocks with proper error typing
+   277→      fixed = fixed.replace(
+   278→        /catch\s*\(\s*(\w+)\s*\)\s*\{/g,
+   279→        (match, errorVar) => {
+   280→          if (!match.includes(': unknown') && !match.includes(': Error')) {
+   281→            changed = true;
+   282→            return `catch (${errorVar}: unknown) {`;
+   283→          }
+   284→          return match;
+   285→        }
+   286→      );
+   287→
+   288→      // Fix 8: Add explicit return types to async arrow function exports
+   289→      fixed = fixed.replace(
+   290→        /export\s+const\s+(\w+)\s*=\s*async\s*\(([^)]*)\)\s*=>\s*\{/g,
+   291→        (match, name, params) => {
+   292→          if (!match.includes('): Promise')) {
+   293→            changed = true;
+   294→            return match.replace(/=>\s*\{$/, '): Promise<unknown> => {');
+   295→          }
+   296→          return match;
+   297→        }
+   298→      );
+   299→
+   300→      // Fix 9: Add type annotation to function parameters that are 'any'
+   301→      fixed = fixed.replace(
+   302→        /(\()\s*([a-zA-Z_$][\w$]*)\s*:\s*any\s*([,)])/g,
+   303→        (match, open, name, close) => {
+   304→          changed = true;
+   305→          return `${open}${name}: unknown${close}`;
+   306→        }
+   307→      );
+   308→
+   309→      // Fix 10: Replace `new Buffer()` with `Buffer.from()`
+   310→      fixed = fixed.replace(
+   311→        /new\s+Buffer\(/g,
+   312→        () => {
+   313→          changed = true;
+   314→          return 'Buffer.from(';
+   315→        }
+   316→      );
+   317→
+   318→      return changed ? fixed : null;
+   319→    } catch (error) {
+   320→      console.error('[ReflectionAgent] AST fix failed:', error);
+   321→      return null;
+   322→    }
+   323→  }
+   324→
+   325→  // ═══════════════════════════════════════════════════════
+   326→  // Root Cause Analysis
+   327→  // Analyzes issues before LLM fix to provide better context
+   328→  // ═══════════════════════════════════════════════════════
+   329→
+   330→  /**
+   331→   * Perform root cause analysis on the output using the PatternLibrary.
+   332→   * This identifies the most critical issues and suggests a fix strategy.
+   333→   */
+   334→  analyzeRootCause(output: string, feedback: string): RootCauseAnalysis {
+   335→    const issues = this.patternLibrary.detectIssues(output);
+   336→
+   337→    // Count issues by category
+   338→    const categories: Record<string, number> = {};
+   339→    for (const issue of issues) {
+   340→      categories[issue.category] = (categories[issue.category] ?? 0) + 1;
+   341→    }
+   342→
+   343→    // Identify critical issues
+   344→    const criticalIssues = issues.filter(i => i.severity === 'critical');
+   345→
+   346→    // Determine suggested fix strategy based on analysis
+   347→    let suggestedFixStrategy: 'pattern' | 'ast' | 'llm';
+   348→
+   349→    if (criticalIssues.length === 0 && issues.length <= 5) {
+   350→      // Minor issues — pattern fix is sufficient
+   351→      suggestedFixStrategy = 'pattern';
+   352→    } else if (criticalIssues.length <= 3 && !categories['security']) {
+   353→      // Some critical issues but no security — AST + pattern fix
+   354→      suggestedFixStrategy = 'ast';
+   355→    } else {
+   356→      // Complex or security issues — need LLM reasoning
+   357→      suggestedFixStrategy = 'llm';
+   358→    }
+   359→
+   360→    // Calculate confidence based on pattern coverage
+   361→    const totalIssues = issues.length;
+   362→    const patternFixable = issues.filter(i =>
+   363→      i.severity === 'low' || i.severity === 'medium'
+   364→    ).length;
+   365→    const confidence = totalIssues > 0 ? patternFixable / totalIssues : 1;
+   366→
+   367→    // Build summary
+   368→    const topCategories = Object.entries(categories)
+   369→      .sort(([, a], [, b]) => b - a)
+   370→      .slice(0, 3)
+   371→      .map(([cat, count]) => `${cat}: ${count}`)
+   372→      .join(', ');
+   373→
+   374→    const summary = criticalIssues.length > 0
+   375→      ? `Found ${totalIssues} issues (${criticalIssues.length} critical). Top categories: ${topCategories}. Security issues detected — LLM fix recommended.`
+   376→      : `Found ${totalIssues} issues. Top categories: ${topCategories}. ${suggestedFixStrategy === 'pattern' ? 'Pattern fixes should suffice.' : 'Higher-level fix needed.'}`;
+   377→
+   378→    return {
+   379→      summary,
+   380→      categories,
+   381→      criticalIssues,
+   382→      suggestedFixStrategy,
+   383→      confidence,
+   384→    };
+   385→  }
+   386→
+   387→  // ═══════════════════════════════════════════════════════
+   388→  // Level 3: LLM-Based Fixes (Most Expensive, Most Capable)
+   389→  // Multi-pass LLM repair with increasing context
+   390→  // ═══════════════════════════════════════════════════════
+   391→
+   392→  /**
+   393→   * Perform multi-pass LLM repair (up to 3 passes with increasing context).
+   394→   * Each pass adds more diagnostic information from the PatternLibrary analysis.
+   395→   */
+   396→  async llmFix(output: string, feedback: string, providers: LLMId[]): Promise<string | null> {
+   397→    const MAX_PASSES = 3;
+   398→    const result = await this.multiPassLLMRepair(output, feedback, providers, MAX_PASSES);
+   399→
+   400→    if (!result.converged && result.passes.length === 0) {
+   401→      return null;
+   402→    }
+   403→
+   404→    // Return the best output from the last successful pass
+   405→    const lastPass = result.passes[result.passes.length - 1];
+   406→    return lastPass?.output ?? null;
+   407→  }
+   408→
+   409→  /**
+   410→   * Full multi-pass LLM repair with root cause analysis.
+   411→   * Returns detailed results from each pass.
+   412→   */
+   413→  async multiPassLLMRepair(
+   414→    output: string,
+   415→    feedback: string,
+   416→    providers: LLMId[],
+   417→    maxPasses: number = 3
+   418→  ): Promise<MultiPassLLMResult> {
+   419→    const passes: LLMPassResult[] = [];
+   420→    let currentOutput = output;
+   421→    let totalTokensUsed = 0;
+   422→    let converged = false;
+   423→
+   424→    // Perform root cause analysis before starting
+   425→    const rootCause = this.analyzeRootCause(output, feedback);
+   426→    console.log(`[ReflectionAgent] Root cause analysis: ${rootCause.summary}`);
+   427→
+   428→    for (let passNum = 1; passNum <= maxPasses; passNum++) {
+   429→      // Build increasingly detailed context for each pass
+   430→      const contextPrompt = this.buildPassPrompt(currentOutput, feedback, rootCause, passNum, maxPasses);
+   431→
+   432→      const fixProvider = this.selectFixProvider(providers);
+   433→
+   434→      try {
+   435→        const response = await this.llmRouter.call(fixProvider, [
+   436→          {
+   437→            role: 'system',
+   438→            content: this.buildSystemPrompt(passNum, rootCause),
+   439→          },
+   440→          { role: 'user', content: contextPrompt },
+   441→        ], { temperature: Math.max(0.1, 0.3 - passNum * 0.1), maxTokens: 8192 });
+   442→
+   443→        const fixed = response.content;
+   444→        totalTokensUsed += response.tokensUsed;
+   445→
+   446→        if (!fixed) {
+   447→          passes.push({
+   448→            passNumber: passNum,
+   449→            input: currentOutput,
+   450→            output: currentOutput,
+   451→            tokensUsed: response.tokensUsed,
+   452→            improvementScore: 0,
+   453→            applied: false,
+   454→          });
+   455→          continue;
+   456→        }
+   457→
+   458→        // Strip markdown code fences if present
+   459→        const cleaned = fixed
+   460→          .replace(/^```[\w]*\n?/gm, '')
+   461→          .replace(/\n?```$/gm, '')
+   462→          .trim();
+   463→
+   464→        // Quick improvement check: did the output actually change?
+   465→        const improvementScore = this.calculateImprovementScore(currentOutput, cleaned, feedback);
+   466→
+   467→        passes.push({
+   468→          passNumber: passNum,
+   469→          input: currentOutput,
+   470→          output: cleaned,
+   471→          tokensUsed: response.tokensUsed,
+   472→          improvementScore,
+   473→          applied: true,
+   474→        });
+   475→
+   476→        // Update current output for next pass
+   477→        currentOutput = cleaned;
+   478→
+   479→        // Check convergence — if improvement is negligible, stop early
+   480→        if (improvementScore > 0.8) {
+   481→          console.log(`[ReflectionAgent] LLM fix converged at pass ${passNum} (score: ${improvementScore.toFixed(2)})`);
+   482→          converged = true;
+   483→          break;
+   484→        }
+   485→
+   486→        // Re-analyze root cause with updated output for next pass
+   487→        if (passNum < maxPasses) {
+   488→          const remainingIssues = this.patternLibrary.detectIssues(currentOutput);
+   489→          const criticalRemaining = remainingIssues.filter(i => i.severity === 'critical');
+   490→          if (criticalRemaining.length === 0) {
+   491→            console.log(`[ReflectionAgent] No critical issues remaining after pass ${passNum}`);
+   492→            converged = true;
+   493→            break;
+   494→          }
+   495→        }
+   496→
+   497→      } catch (error) {
+   498→        console.error(`[ReflectionAgent] LLM fix pass ${passNum} failed:`, error);
+   499→        passes.push({
+   500→          passNumber: passNum,
+   501→          input: currentOutput,
+   502→          output: currentOutput,
+   503→          tokensUsed: 0,
+   504→          improvementScore: 0,
+   505→          applied: false,
+   506→        });
+   507→        // Continue to next pass with the same output
+   508→      }
+   509→    }
+   510→
+   511→    return {
+   512→      output: currentOutput,
+   513→      passes,
+   514→      totalTokensUsed,
+   515→      converged,
+   516→    };
+   517→  }
+   518→
+   519→  // ═══════════════════════════════════════════════════════
+   520→  // Full 3-Level Auto-Fix Pipeline
+   521→  // Pattern → AST → LLM with escalation
+   522→  // ═══════════════════════════════════════════════════════
+   523→
+   524→  /**
+   525→   * Run the full auto-fix pipeline: Pattern → AST → LLM (multi-pass).
+   526→   * Each level is attempted only if the previous level didn't fully resolve issues.
+   527→   */
+   528→  async autoFixPipeline(
+   529→    output: string,
+   530→    feedback: string,
+   531→    providers: LLMId[]
+   532→  ): Promise<{
+   533→    finalOutput: string;
+   534→    level1Fixes: AppliedFix[];
+   535→    level2Applied: boolean;
+   536→    level3Result: MultiPassLLMResult | null;
+   537→  }> {
+   538→    const doAutoFix = async () => {
+   539→      // Root cause analysis first
+   540→      const rootCause = this.analyzeRootCause(output, feedback);
+   541→      console.log(`[ReflectionAgent] Auto-fix pipeline starting. Root cause: ${rootCause.summary}`);
+   542→
+   543→      // Level 1: Pattern fixes
+   544→      const { output: afterPattern, fixes: level1Fixes } = this.patternLibrary.applyAll(output);
+   545→      console.log(`[ReflectionAgent] Level 1 (Pattern): ${level1Fixes.length} fixes applied`);
+   546→
+   547→      // Re-analyze after pattern fixes
+   548→      const postPatternIssues = this.patternLibrary.detectIssues(afterPattern);
+   549→      const postPatternCritical = postPatternIssues.filter(i => i.severity === 'critical');
+   550→
+   551→      // Level 2: AST fixes (if issues remain)
+   552→      let afterAst = afterPattern;
+   553→      let level2Applied = false;
+   554→
+   555→      if (postPatternCritical.length > 0 || postPatternIssues.length > 3) {
+   556→        const astResult = await this.astFix(afterPattern, feedback);
+   557→        if (astResult) {
+   558→          afterAst = astResult;
+   559→          level2Applied = true;
+   560→          console.log(`[ReflectionAgent] Level 2 (AST): Applied structural fixes`);
+   561→        }
+   562→      }
+   563→
+   564→      // Re-analyze after AST fixes
+   565→      const postAstIssues = this.patternLibrary.detectIssues(afterAst);
+   566→      const postAstCritical = postAstIssues.filter(i => i.severity === 'critical');
+   567→
+   568→      // Level 3: Multi-pass LLM fixes (only if critical issues remain)
+   569→      let level3Result: MultiPassLLMResult | null = null;
+   570→
+   571→      if (postAstCritical.length > 0 || (postAstIssues.length > 5 && feedback.length > 50)) {
+   572→        level3Result = await this.multiPassLLMRepair(afterAst, feedback, providers, 3);
+   573→        console.log(`[ReflectionAgent] Level 3 (LLM): ${level3Result.passes.length} passes, converged=${level3Result.converged}`);
+   574→      }
+   575→
+   576→      const finalOutput = level3Result?.output ?? afterAst;
+   577→
+   578→      return {
+   579→        finalOutput,
+   580→        level1Fixes,
+   581→        level2Applied,
+   582→        level3Result,
+   583→      };
+   584→    };
+   585→
+   586→    if (tracingService.isEnabled()) {
+   587→      return tracingService.withSpan(
+   588→        { name: 'agent.autofix', attributes: { 'autofix.type': 'pipeline' } },
+   589→        async (span) => {
+   590→          const result = await doAutoFix();
+   591→          span.setAttribute('autofix.level1_fixes', result.level1Fixes.length);
+   592→          span.setAttribute('autofix.level2_applied', result.level2Applied);
+   593→          span.setAttribute('autofix.level3_converged', result.level3Result?.converged ?? false);
+   594→          return result;
+   595→        },
+   596→      );
+   597→    }
+   598→    return doAutoFix();
+   599→  }
+   600→
+   601→  // ═══════════════════════════════════════════════════════
+   602→  // Private Helpers
+   603→  // ═══════════════════════════════════════════════════════
+   604→
+   605→  /**
+   606→   * Build the system prompt for LLM fix, incorporating root cause analysis.
+   607→   */
+   608→  private buildSystemPrompt(passNum: number, rootCause: RootCauseAnalysis): string {
+   609→    const basePrompt = 'You are a meticulous code fixer. You apply feedback precisely and return complete, production-ready output. No explanations, no markdown fences.';
+   610→
+   611→    if (passNum === 1) {
+   612→      // First pass: standard fix with basic root cause context
+   613→      if (rootCause.criticalIssues.length > 0) {
+   614→        const criticalNames = rootCause.criticalIssues
+   615→          .slice(0, 5)
+   616→          .map(i => `${i.name} (${i.category})`)
+   617→          .join(', ');
+   618→        return `${basePrompt} CRITICAL ISSUES DETECTED: ${criticalNames}. Fix these first, then address all other feedback.`;
+   619→      }
+   620→      return basePrompt;
+   621→    }
+   622→
+   623→    if (passNum === 2) {
+   624→      // Second pass: more aggressive, with detailed root cause context
+   625→      return `${basePrompt} This is a second pass. Previous fixes were insufficient. Focus on ROOT CAUSES not symptoms. Category breakdown: ${JSON.stringify(rootCause.categories)}. Be more aggressive with changes — do not preserve code that has issues.`;
+   626→    }
+   627→
+   628→    // Third pass: maximum context, surgical precision
+   629→    return `${basePrompt} FINAL PASS. Previous attempts did not fully resolve issues. Be SURGICAL: identify the exact lines causing problems and rewrite them. Do not rewrite entire sections — only fix what's broken. Root cause summary: ${rootCause.summary}`;
+   630→  }
+   631→
+   632→  /**
+   633→   * Build the user prompt for each LLM pass with increasing context.
+   634→   */
+   635→  private buildPassPrompt(
+   636→    output: string,
+   637→    feedback: string,
+   638→    rootCause: RootCauseAnalysis,
+   639→    passNum: number,
+   640→    maxPasses: number
+   641→  ): string {
+   642→    let prompt = `You are a code fixer. The following output has quality issues identified by an evaluator. Apply ALL the feedback and return the COMPLETE fixed output.
+   643→
+   644→IMPORTANT RULES:
+   645→1. Return ONLY the fixed output — no explanations, no markdown, no comments about what you changed
+   646→2. Do not truncate or abbreviate — return the COMPLETE output
+   647→3. Apply ALL feedback points, not just some
+   648→4. Maintain the original structure and approach
+   649→5. Do not add new features beyond what the feedback requests`;
+   650→
+   651→    if (passNum >= 2) {
+   652→      // Add root cause context on subsequent passes
+   653→      const topIssues = rootCause.criticalIssues
+   654→        .slice(0, 10)
+   655→        .map(i => `  - [${i.severity.toUpperCase()}] ${i.name}: ${i.description} (line ${i.line})`)
+   656→        .join('\n');
+   657→
+   658→      prompt += `\n\nROOT CAUSE ANALYSIS:\n${rootCause.summary}\n\nDETECTED ISSUES:\n${topIssues || 'No critical issues detected by pattern analysis.'}`;
+   659→    }
+   660→
+   661→    if (passNum === maxPasses) {
+   662→      // Final pass — add all detected issues
+   663→      const allIssues = this.patternLibrary.detectIssues(output);
+   664→      const issueList = allIssues
+   665→        .slice(0, 20)
+   666→        .map(i => `  - [${i.severity.toUpperCase()}] ${i.name} (line ${i.line}): ${i.match.substring(0, 80)}`)
+   667→        .join('\n');
+   668→
+   669→      prompt += `\n\nCOMPLETE ISSUE LIST:\n${issueList || 'No issues detected by pattern analysis.'}`;
+   670→    }
+   671→
+   672→    prompt += `
+   673→
+   674→EVALUATOR FEEDBACK:
+   675→${feedback}
+   676→
+   677→CURRENT OUTPUT WITH ISSUES:
+   678→${output.substring(0, 8000)}
+   679→
+   680→Return the COMPLETE fixed output now:`;
+   681→
+   682→    return prompt;
+   683→  }
+   684→
+   685→  /**
+   686→   * Calculate a rough improvement score between two versions of output.
+   687→   * Compares issue counts and feedback alignment.
+   688→   */
+   689→  private calculateImprovementScore(original: string, fixed: string, feedback: string): number {
+   690→    if (original === fixed) return 0;
+   691→
+   692→    const originalIssues = this.patternLibrary.detectIssues(original);
+   693→    const fixedIssues = this.patternLibrary.detectIssues(fixed);
+   694→
+   695→    const originalCritical = originalIssues.filter(i => i.severity === 'critical' || i.severity === 'high').length;
+   696→    const fixedCritical = fixedIssues.filter(i => i.severity === 'critical' || i.severity === 'high').length;
+   697→
+   698→    // If no high/critical issues in original, just check if anything improved
+   699→    if (originalCritical === 0) {
+   700→      return originalIssues.length > fixedIssues.length ? 0.8 : 0.3;
+   701→    }
+   702→
+   703→    // Score based on reduction in high/critical issues
+   704→    const criticalReduction = (originalCritical - fixedCritical) / originalCritical;
+   705→
+   706→    // Also consider total issue reduction
+   707→    const totalReduction = originalIssues.length > 0
+   708→      ? (originalIssues.length - fixedIssues.length) / originalIssues.length
+   709→      : 0;
+   710→
+   711→    // Weighted combination
+   712→    return Math.min(1, criticalReduction * 0.7 + totalReduction * 0.3);
+   713→  }
+   714→
+   715→  private parseReflectionResponse(response: string, criteria: ReflectionCriteria[]): ReflectionScore[] {
+   716→    try {
+   717→      // Try to extract JSON from the response
+   718→      const jsonMatch = response.match(/\{[\s\S]*\}/);
+   719→      if (!jsonMatch) return this.defaultScores(criteria);
+   720→
+   721→      const parsed = JSON.parse(jsonMatch[0]);
+   722→
+   723→      // Build a map of parsed scores
+   724→      const scoresMap = new Map<string, { score: number; feedback: string }>();
+   725→      for (const s of (parsed.scores || [])) {
+   726→        scoresMap.set(s.criteria, { score: s.score, feedback: s.feedback });
+   727→      }
+   728→
+   729→      // Map to ReflectionScore with proper weighting
+   730→      return criteria.map(criterion => {
+   731→        const entry = scoresMap.get(criterion.name);
+   732→        const score = entry?.score ?? 5;
+   733→        return {
+   734→          iteration: 1,
+   735→          criteria: criterion.name,
+   736→          score,
+   737→          confidence: score / 10,
+   738→          feedback: entry?.feedback || 'No feedback provided',
+   739→          weightedScore: score * criterion.weight,
+   740→        };
+   741→      });
+   742→    } catch {
+   743→      return this.defaultScores(criteria);
+   744→    }
+   745→  }
+   746→
+   747→  private defaultScores(criteria: ReflectionCriteria[]): ReflectionScore[] {
+   748→    return criteria.map(criterion => ({
+   749→      iteration: 1,
+   750→      criteria: criterion.name,
+   751→      score: 4,
+   752→      confidence: 0.4,
+   753→      feedback: 'Evaluation failed — default low score assigned',
+   754→      weightedScore: 4 * criterion.weight,
+   755→    }));
+   756→  }
+   757→
+   758→  private extractFeedback(response: string): string {
+   759→    try {
+   760→      const jsonMatch = response.match(/\{[\s\S]*\}/);
+   761→      if (!jsonMatch) return 'No feedback available';
+   762→      const parsed = JSON.parse(jsonMatch[0]);
+   763→      return parsed.overall_feedback || 'No feedback available';
+   764→    } catch {
+   765→      return 'No feedback available';
+   766→    }
+   767→  }
+   768→
+   769→  /**
+   770→   * Select the best provider for fixing code.
+   771→   * Prefer Claude (best at code refinement) then GPT-4o.
+   772→   */
+   773→  private selectFixProvider(providers: LLMId[]): LLMId {
+   774→    const preference: LLMId[] = [
+   775→      'claude-3.7-sonnet', 'gpt-4o', 'deepseek-r1',
+   776→      'gemini-2.5-pro', 'mistral-large', 'gemini-2.0-flash',
+   777→    ];
+   778→
+   779→    for (const preferred of preference) {
+   780→      if (providers.includes(preferred)) return preferred;
+   781→    }
+   782→
+   783→    return providers[0] || 'gemini-2.0-flash' as LLMId;
+   784→  }
+   785→}
+   786→
