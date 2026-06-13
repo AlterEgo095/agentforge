@@ -1,0 +1,1099 @@
+     1→// ============================================================
+     2→// @alterego/browser-capability — Browser Actions
+     3→// Headless browser automation via Playwright
+     4→// ============================================================
+     5→
+     6→import { chromium, type Browser, type BrowserContext, type Page } from 'playwright';
+     7→import { BrowserMemory } from '../memory/browser-memory';
+     8→import type {
+     9→  IBrowserCapability,
+    10→  IBrowserMemory,
+    11→  BrowserCapabilityConfig,
+    12→  ActionResult,
+    13→  ActionStatus,
+    14→  NavigateResult,
+    15→  ClickResult,
+    16→  TypeResult,
+    17→  ExtractResult,
+    18→  PageContentResult,
+    19→  SearchResult,
+    20→  SearchItem,
+    21→  SearchEngine,
+    22→  DownloadResult,
+    23→  ScreenshotResult,
+    24→  ScrollResult,
+    25→  WaitResult,
+    26→  TabInfo,
+    27→  CookieInfo,
+    28→  StorageInfo,
+    29→  TypeOptions,
+    30→  PdfOptions,
+    31→  FormField,
+    32→} from '../types';
+    33→
+    34→// -----------------------------------------------------------
+    35→// Anti-fingerprinting user agent pool
+    36→// -----------------------------------------------------------
+    37→
+    38→const USER_AGENTS = [
+    39→  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    40→  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    41→  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    42→  'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0',
+    43→  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:123.0) Gecko/20100101 Firefox/123.0',
+    44→  'Mozilla/5.0 (X11; Linux x86_64; rv:123.0) Gecko/20100101 Firefox/123.0',
+    45→  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15',
+    46→];
+    47→
+    48→function randomUserAgent(): string {
+    49→  return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+    50→}
+    51→
+    52→function randomDelay(min = 50, max = 200): number {
+    53→  return Math.floor(Math.random() * (max - min) + min);
+    54→}
+    55→
+    56→// -----------------------------------------------------------
+    57→// Search engine URL builders
+    58→// -----------------------------------------------------------
+    59→
+    60→const SEARCH_URL_BUILDERS: Record<SearchEngine, (query: string) => string> = {
+    61→  google: (q) => `https://www.google.com/search?q=${encodeURIComponent(q)}`,
+    62→  bing: (q) => `https://www.bing.com/search?q=${encodeURIComponent(q)}`,
+    63→  duckduckgo: (q) => `https://duckduckgo.com/?q=${encodeURIComponent(q)}`,
+    64→  github: (q) => `https://github.com/search?q=${encodeURIComponent(q)}`,
+    65→  arxiv: (q) => `https://arxiv.org/search/?query=${encodeURIComponent(q)}&searchtype=all`,
+    66→  scholar: (q) => `https://scholar.google.com/scholar?q=${encodeURIComponent(q)}`,
+    67→};
+    68→
+    69→// -----------------------------------------------------------
+    70→// Helper: build ActionResult
+    71→// -----------------------------------------------------------
+    72→
+    73→function result<T>(
+    74→  status: ActionStatus,
+    75→  data: T,
+    76→  durationMs: number,
+    77→  url?: string,
+    78→): ActionResult<T> {
+    79→  return { status, data, durationMs, url, timestamp: Date.now() };
+    80→}
+    81→
+    82→function errorResult(
+    83→  error: string,
+    84→  durationMs: number,
+    85→  url?: string,
+    86→): ActionResult<never> {
+    87→  return { status: 'error', error, durationMs, url, timestamp: Date.now() };
+    88→}
+    89→
+    90→function timeoutResult(
+    91→  error: string,
+    92→  durationMs: number,
+    93→  url?: string,
+    94→): ActionResult<never> {
+    95→  return { status: 'timeout', error, durationMs, url, timestamp: Date.now() };
+    96→}
+    97→
+    98→// -----------------------------------------------------------
+    99→// BrowserCapability
+   100→// -----------------------------------------------------------
+   101→
+   102→const DEFAULT_CONFIG: BrowserCapabilityConfig = {
+   103→  browserType: 'chromium',
+   104→  headless: true,
+   105→  defaultTimeout: 30_000,
+   106→  navigationTimeout: 60_000,
+   107→  viewport: { width: 1920, height: 1080 },
+   108→  stealth: true,
+   109→  maxTabs: 5,
+   110→};
+   111→
+   112→export class BrowserCapability implements IBrowserCapability {
+   113→  private config: BrowserCapabilityConfig;
+   114→  private browser: Browser | null = null;
+   115→  private context: BrowserContext | null = null;
+   116→  private pages: Page[] = [];
+   117→  private activePageIndex = 0;
+   118→  private memory: BrowserMemory;
+   119→
+   120→  constructor(config: Partial<BrowserCapabilityConfig> = {}) {
+   121→    this.config = { ...DEFAULT_CONFIG, ...config };
+   122→    this.memory = new BrowserMemory();
+   123→  }
+   124→
+   125→  // -----------------------------------------------------------
+   126→  // Lifecycle
+   127→  // -----------------------------------------------------------
+   128→
+   129→  async launch(): Promise<ActionResult<boolean>> {
+   130→    const start = Date.now();
+   131→    try {
+   132→      const launchOptions: Record<string, unknown> = {
+   133→        headless: this.config.headless,
+   134→      };
+   135→      if (this.config.proxy) {
+   136→        launchOptions.proxy = this.config.proxy;
+   137→      }
+   138→
+   139→      this.browser = await chromium.launch(launchOptions);
+   140→
+   141→      const contextOptions: Record<string, unknown> = {
+   142→        viewport: this.config.viewport,
+   143→        userAgent: this.config.userAgent ?? (this.config.stealth ? randomUserAgent() : undefined),
+   144→      };
+   145→
+   146→      this.context = await this.browser.newContext(contextOptions);
+   147→
+   148→      if (this.config.stealth) {
+   149→        await this.applyStealthScripts();
+   150→      }
+   151→
+   152→      const page = await this.context.newPage();
+   153→      page.setDefaultTimeout(this.config.defaultTimeout);
+   154→      page.setDefaultNavigationTimeout(this.config.navigationTimeout);
+   155→      this.pages = [page];
+   156→      this.activePageIndex = 0;
+   157→
+   158→      return result('success', true, Date.now() - start);
+   159→    } catch (err) {
+   160→      return errorResult(`Failed to launch browser: ${(err as Error).message}`, Date.now() - start);
+   161→    }
+   162→  }
+   163→
+   164→  async close(): Promise<ActionResult<boolean>> {
+   165→    const start = Date.now();
+   166→    try {
+   167→      if (this.context) {
+   168→        await this.context.close();
+   169→      }
+   170→      if (this.browser) {
+   171→        await this.browser.close();
+   172→      }
+   173→      this.browser = null;
+   174→      this.context = null;
+   175→      this.pages = [];
+   176→      this.activePageIndex = 0;
+   177→      return result('success', true, Date.now() - start);
+   178→    } catch (err) {
+   179→      return errorResult(`Failed to close browser: ${(err as Error).message}`, Date.now() - start);
+   180→    }
+   181→  }
+   182→
+   183→  isRunning(): boolean {
+   184→    return this.browser !== null && this.browser.isConnected();
+   185→  }
+   186→
+   187→  // -----------------------------------------------------------
+   188→  // Navigation
+   189→  // -----------------------------------------------------------
+   190→
+   191→  async open(url: string): Promise<ActionResult<NavigateResult>> {
+   192→    const start = Date.now();
+   193→    try {
+   194→      const page = this.getActivePage();
+   195→      const response = await page.goto(url, { waitUntil: 'domcontentloaded' });
+   196→
+   197→      const finalUrl = page.url();
+   198→      const title = await page.title();
+   199→      const redirected = finalUrl !== url;
+   200→
+   201→      const redirectChain: string[] = [url];
+   202→      if (redirected) {
+   203→        redirectChain.push(finalUrl);
+   204→      }
+   205→
+   206→      const navResult: NavigateResult = {
+   207→        url: finalUrl,
+   208→        title,
+   209→        redirected,
+   210→        redirectChain,
+   211→      };
+   212→
+   213→      // Save to history
+   214→      this.memory.addToHistory(finalUrl, title);
+   215→
+   216→      return result('success', navResult, Date.now() - start, finalUrl);
+   217→    } catch (err) {
+   218→      const msg = (err as Error).message;
+   219→      if (msg.includes('Timeout') || msg.includes('timeout')) {
+   220→        return timeoutResult(msg, Date.now() - start, url);
+   221→      }
+   222→      return errorResult(msg, Date.now() - start, url);
+   223→    }
+   224→  }
+   225→
+   226→  async goBack(): Promise<ActionResult<NavigateResult>> {
+   227→    const start = Date.now();
+   228→    try {
+   229→      const page = this.getActivePage();
+   230→      await page.goBack({ waitUntil: 'domcontentloaded' });
+   231→      const url = page.url();
+   232→      const title = await page.title();
+   233→      const navResult: NavigateResult = { url, title, redirected: false };
+   234→      return result('success', navResult, Date.now() - start, url);
+   235→    } catch (err) {
+   236→      return errorResult((err as Error).message, Date.now() - start);
+   237→    }
+   238→  }
+   239→
+   240→  async goForward(): Promise<ActionResult<NavigateResult>> {
+   241→    const start = Date.now();
+   242→    try {
+   243→      const page = this.getActivePage();
+   244→      await page.goForward({ waitUntil: 'domcontentloaded' });
+   245→      const url = page.url();
+   246→      const title = await page.title();
+   247→      const navResult: NavigateResult = { url, title, redirected: false };
+   248→      return result('success', navResult, Date.now() - start, url);
+   249→    } catch (err) {
+   250→      return errorResult((err as Error).message, Date.now() - start);
+   251→    }
+   252→  }
+   253→
+   254→  async reload(): Promise<ActionResult<NavigateResult>> {
+   255→    const start = Date.now();
+   256→    try {
+   257→      const page = this.getActivePage();
+   258→      await page.reload({ waitUntil: 'domcontentloaded' });
+   259→      const url = page.url();
+   260→      const title = await page.title();
+   261→      const navResult: NavigateResult = { url, title, redirected: false };
+   262→      return result('success', navResult, Date.now() - start, url);
+   263→    } catch (err) {
+   264→      return errorResult((err as Error).message, Date.now() - start);
+   265→    }
+   266→  }
+   267→
+   268→  async getCurrentUrl(): Promise<ActionResult<string>> {
+   269→    const start = Date.now();
+   270→    try {
+   271→      const url = this.getActivePage().url();
+   272→      return result('success', url, Date.now() - start, url);
+   273→    } catch (err) {
+   274→      return errorResult((err as Error).message, Date.now() - start);
+   275→    }
+   276→  }
+   277→
+   278→  async getTitle(): Promise<ActionResult<string>> {
+   279→    const start = Date.now();
+   280→    try {
+   281→      const title = await this.getActivePage().title();
+   282→      return result('success', title, Date.now() - start);
+   283→    } catch (err) {
+   284→      return errorResult((err as Error).message, Date.now() - start);
+   285→    }
+   286→  }
+   287→
+   288→  // -----------------------------------------------------------
+   289→  // Interaction
+   290→  // -----------------------------------------------------------
+   291→
+   292→  async click(selector: string): Promise<ActionResult<ClickResult>> {
+   293→    const start = Date.now();
+   294→    try {
+   295→      const page = this.getActivePage();
+   296→      if (this.config.stealth) await this.stealthDelay();
+   297→      await page.click(selector);
+   298→      const clickResult: ClickResult = { selector, clicked: true };
+   299→      return result('success', clickResult, Date.now() - start, page.url());
+   300→    } catch (err) {
+   301→      const msg = (err as Error).message;
+   302→      if (msg.includes('Timeout') || msg.includes('timeout')) {
+   303→        return timeoutResult(msg, Date.now() - start);
+   304→      }
+   305→      return errorResult(msg, Date.now() - start);
+   306→    }
+   307→  }
+   308→
+   309→  async type(
+   310→    selector: string,
+   311→    text: string,
+   312→    options?: TypeOptions,
+   313→  ): Promise<ActionResult<TypeResult>> {
+   314→    const start = Date.now();
+   315→    try {
+   316→      const page = this.getActivePage();
+   317→      if (this.config.stealth) await this.stealthDelay();
+   318→
+   319→      if (options?.clear !== false) {
+   320→        await page.fill(selector, '');
+   321→      }
+   322→
+   323→      await page.type(selector, text, { delay: options?.delay ?? (this.config.stealth ? randomDelay(30, 80) : 0) });
+   324→
+   325→      if (options?.pressEnter) {
+   326→        await page.press(selector, 'Enter');
+   327→      }
+   328→
+   329→      const typeResult: TypeResult = {
+   330→        selector,
+   331→        text,
+   332→        cleared: options?.clear !== false,
+   333→      };
+   334→      return result('success', typeResult, Date.now() - start, page.url());
+   335→    } catch (err) {
+   336→      return errorResult((err as Error).message, Date.now() - start);
+   337→    }
+   338→  }
+   339→
+   340→  async press(key: string): Promise<ActionResult<boolean>> {
+   341→    const start = Date.now();
+   342→    try {
+   343→      const page = this.getActivePage();
+   344→      await page.keyboard.press(key);
+   345→      return result('success', true, Date.now() - start, page.url());
+   346→    } catch (err) {
+   347→      return errorResult((err as Error).message, Date.now() - start);
+   348→    }
+   349→  }
+   350→
+   351→  async select(selector: string, values: string[]): Promise<ActionResult<string[]>> {
+   352→    const start = Date.now();
+   353→    try {
+   354→      const page = this.getActivePage();
+   355→      if (this.config.stealth) await this.stealthDelay();
+   356→      const selected = await page.selectOption(selector, values);
+   357→      return result('success', selected, Date.now() - start, page.url());
+   358→    } catch (err) {
+   359→      return errorResult((err as Error).message, Date.now() - start);
+   360→    }
+   361→  }
+   362→
+   363→  async hover(selector: string): Promise<ActionResult<boolean>> {
+   364→    const start = Date.now();
+   365→    try {
+   366→      const page = this.getActivePage();
+   367→      if (this.config.stealth) await this.stealthDelay();
+   368→      await page.hover(selector);
+   369→      return result('success', true, Date.now() - start, page.url());
+   370→    } catch (err) {
+   371→      return errorResult((err as Error).message, Date.now() - start);
+   372→    }
+   373→  }
+   374→
+   375→  // -----------------------------------------------------------
+   376→  // Waiting
+   377→  // -----------------------------------------------------------
+   378→
+   379→  async waitFor(selector: string, timeout?: number): Promise<ActionResult<WaitResult>> {
+   380→    const start = Date.now();
+   381→    try {
+   382→      const page = this.getActivePage();
+   383→      await page.waitForSelector(selector, { timeout: timeout ?? this.config.defaultTimeout });
+   384→      const waitResult: WaitResult = { waited: true, condition: `selector: ${selector}`, durationMs: Date.now() - start };
+   385→      return result('success', waitResult, Date.now() - start, page.url());
+   386→    } catch (err) {
+   387→      const msg = (err as Error).message;
+   388→      if (msg.includes('Timeout') || msg.includes('timeout')) {
+   389→        return timeoutResult(msg, Date.now() - start);
+   390→      }
+   391→      return errorResult(msg, Date.now() - start);
+   392→    }
+   393→  }
+   394→
+   395→  async waitForNavigation(timeout?: number): Promise<ActionResult<NavigateResult>> {
+   396→    const start = Date.now();
+   397→    try {
+   398→      const page = this.getActivePage();
+   399→      await page.waitForURL('**/*', { timeout: timeout ?? this.config.navigationTimeout, waitUntil: 'domcontentloaded' });
+   400→      const url = page.url();
+   401→      const title = await page.title();
+   402→      const navResult: NavigateResult = { url, title, redirected: false };
+   403→      return result('success', navResult, Date.now() - start, url);
+   404→    } catch (err) {
+   405→      const msg = (err as Error).message;
+   406→      if (msg.includes('Timeout') || msg.includes('timeout')) {
+   407→        return timeoutResult(msg, Date.now() - start);
+   408→      }
+   409→      return errorResult(msg, Date.now() - start);
+   410→    }
+   411→  }
+   412→
+   413→  async waitForNetworkIdle(timeout?: number): Promise<ActionResult<WaitResult>> {
+   414→    const start = Date.now();
+   415→    try {
+   416→      const page = this.getActivePage();
+   417→      await page.waitForLoadState('networkidle', { timeout: timeout ?? this.config.defaultTimeout });
+   418→      const waitResult: WaitResult = { waited: true, condition: 'networkidle', durationMs: Date.now() - start };
+   419→      return result('success', waitResult, Date.now() - start, page.url());
+   420→    } catch (err) {
+   421→      const msg = (err as Error).message;
+   422→      if (msg.includes('Timeout') || msg.includes('timeout')) {
+   423→        return timeoutResult(msg, Date.now() - start);
+   424→      }
+   425→      return errorResult(msg, Date.now() - start);
+   426→    }
+   427→  }
+   428→
+   429→  async wait(ms: number): Promise<ActionResult<WaitResult>> {
+   430→    const start = Date.now();
+   431→    await new Promise((resolve) => setTimeout(resolve, ms));
+   432→    const waitResult: WaitResult = { waited: true, condition: `fixed:${ms}ms`, durationMs: Date.now() - start };
+   433→    return result('success', waitResult, Date.now() - start);
+   434→  }
+   435→
+   436→  // -----------------------------------------------------------
+   437→  // Extraction
+   438→  // -----------------------------------------------------------
+   439→
+   440→  async extract(selector: string, attribute?: string): Promise<ActionResult<ExtractResult>> {
+   441→    const start = Date.now();
+   442→    try {
+   443→      const page = this.getActivePage();
+   444→      const values = await page.evaluate(
+   445→        ([sel, attr]) => {
+   446→          const elements = Array.from(document.querySelectorAll(sel as string));
+   447→          return elements.map((el) => {
+   448→            if (attr) return (el as HTMLElement).getAttribute(attr) ?? '';
+   449→            return el.textContent?.trim() ?? '';
+   450→          });
+   451→        },
+   452→        [selector, attribute ?? null] as [string, string | null],
+   453→      );
+   454→      const extractResult: ExtractResult = { selector, values, count: values.length };
+   455→      return result('success', extractResult, Date.now() - start, page.url());
+   456→    } catch (err) {
+   457→      return errorResult((err as Error).message, Date.now() - start);
+   458→    }
+   459→  }
+   460→
+   461→  async extractPageContent(): Promise<ActionResult<PageContentResult>> {
+   462→    const start = Date.now();
+   463→    try {
+   464→      const page = this.getActivePage();
+   465→      const content = await page.evaluate(() => {
+   466→        return {
+   467→          url: window.location.href,
+   468→          title: document.title,
+   469→          text: document.body?.innerText ?? '',
+   470→          html: document.body?.innerHTML ?? '',
+   471→        };
+   472→      });
+   473→      const pageResult: PageContentResult = {
+   474→        url: content.url,
+   475→        title: content.title,
+   476→        text: content.text,
+   477→        html: content.html,
+   478→        length: content.text.length,
+   479→      };
+   480→      return result('success', pageResult, Date.now() - start, content.url);
+   481→    } catch (err) {
+   482→      return errorResult((err as Error).message, Date.now() - start);
+   483→    }
+   484→  }
+   485→
+   486→  async extractLinks(): Promise<ActionResult<Array<{ href: string; text: string }>>> {
+   487→    const start = Date.now();
+   488→    try {
+   489→      const page = this.getActivePage();
+   490→      const links = await page.evaluate(() => {
+   491→        return Array.from(document.querySelectorAll('a')).map((a) => ({
+   492→          href: a.href,
+   493→          text: a.textContent?.trim() ?? '',
+   494→        }));
+   495→      });
+   496→      return result('success', links, Date.now() - start, page.url());
+   497→    } catch (err) {
+   498→      return errorResult((err as Error).message, Date.now() - start);
+   499→    }
+   500→  }
+   501→
+   502→  async extractImages(): Promise<ActionResult<Array<{ src: string; alt: string; width: number; height: number }>>> {
+   503→    const start = Date.now();
+   504→    try {
+   505→      const page = this.getActivePage();
+   506→      const images = await page.evaluate(() => {
+   507→        return Array.from(document.querySelectorAll('img')).map((img) => ({
+   508→          src: img.src,
+   509→          alt: img.alt ?? '',
+   510→          width: img.naturalWidth ?? img.width,
+   511→          height: img.naturalHeight ?? img.height,
+   512→        }));
+   513→      });
+   514→      return result('success', images, Date.now() - start, page.url());
+   515→    } catch (err) {
+   516→      return errorResult((err as Error).message, Date.now() - start);
+   517→    }
+   518→  }
+   519→
+   520→  async extractMeta(): Promise<ActionResult<Record<string, string>>> {
+   521→    const start = Date.now();
+   522→    try {
+   523→      const page = this.getActivePage();
+   524→      const meta = await page.evaluate(() => {
+   525→        const result: Record<string, string> = {};
+   526→        const metas = document.querySelectorAll('meta');
+   527→        metas.forEach((m) => {
+   528→          const name = m.getAttribute('name') ?? m.getAttribute('property') ?? m.getAttribute('http-equiv') ?? '';
+   529→          const content = m.getAttribute('content') ?? '';
+   530→          if (name && content) {
+   531→            result[name] = content;
+   532→          }
+   533→        });
+   534→        return result;
+   535→      });
+   536→      return result('success', meta, Date.now() - start, page.url());
+   537→    } catch (err) {
+   538→      return errorResult((err as Error).message, Date.now() - start);
+   539→    }
+   540→  }
+   541→
+   542→  // -----------------------------------------------------------
+   543→  // Search
+   544→  // -----------------------------------------------------------
+   545→
+   546→  async search(query: string, engine: SearchEngine = 'duckduckgo'): Promise<ActionResult<SearchResult>> {
+   547→    const start = Date.now();
+   548→    try {
+   549→      if (!SEARCH_URL_BUILDERS[engine]) {
+   550→        return errorResult(`Unknown search engine: ${engine}`, Date.now() - start);
+   551→      }
+   552→
+   553→      const searchUrl = SEARCH_URL_BUILDERS[engine](query);
+   554→      const page = this.getActivePage();
+   555→      await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: this.config.navigationTimeout });
+   556→
+   557→      let items: SearchItem[] = [];
+   558→
+   559→      switch (engine) {
+   560→        case 'google':
+   561→          items = await this.extractGoogleResults();
+   562→          break;
+   563→        case 'github':
+   564→          items = await this.extractGithubResults();
+   565→          break;
+   566→        case 'arxiv':
+   567→          items = await this.extractArxivResults();
+   568→          break;
+   569→        default:
+   570→          items = await this.extractGenericResults();
+   571→          break;
+   572→      }
+   573→
+   574→      const searchResult: SearchResult = { engine, query, items };
+   575→      return result('success', searchResult, Date.now() - start, page.url());
+   576→    } catch (err) {
+   577→      return errorResult(`Search failed: ${(err as Error).message}`, Date.now() - start);
+   578→    }
+   579→  }
+   580→
+   581→  private async extractGoogleResults(): Promise<SearchItem[]> {
+   582→    const page = this.getActivePage();
+   583→    return page.evaluate(() => {
+   584→      const results: SearchItem[] = [];
+   585→      const elements = document.querySelectorAll('div.g');
+   586→      elements.forEach((el) => {
+   587→        const titleEl = el.querySelector('h3');
+   588→        const linkEl = el.querySelector('a');
+   589→        const snippetEl = el.querySelector('[data-sncf]');
+   590→        if (titleEl && linkEl) {
+   591→          results.push({
+   592→            title: titleEl.textContent?.trim() ?? '',
+   593→            url: linkEl.href ?? '',
+   594→            snippet: snippetEl?.textContent?.trim() ?? '',
+   595→          });
+   596→        }
+   597→      });
+   598→      return results;
+   599→    });
+   600→  }
+   601→
+   602→  private async extractGithubResults(): Promise<SearchItem[]> {
+   603→    const page = this.getActivePage();
+   604→    return page.evaluate(() => {
+   605→      const results: SearchItem[] = [];
+   606→      const elements = document.querySelectorAll('[data-testid="results-list"] > div');
+   607→      elements.forEach((el) => {
+   608→        const titleEl = el.querySelector('a');
+   609→        const snippetEl = el.querySelector('p');
+   610→        if (titleEl) {
+   611→          results.push({
+   612→            title: titleEl.textContent?.trim() ?? '',
+   613→            url: titleEl.href ?? '',
+   614→            snippet: snippetEl?.textContent?.trim() ?? '',
+   615→          });
+   616→        }
+   617→      });
+   618→      return results;
+   619→    });
+   620→  }
+   621→
+   622→  private async extractArxivResults(): Promise<SearchItem[]> {
+   623→    const page = this.getActivePage();
+   624→    return page.evaluate(() => {
+   625→      const results: SearchItem[] = [];
+   626→      const elements = document.querySelectorAll('.arxiv-result');
+   627→      elements.forEach((el) => {
+   628→        const titleEl = el.querySelector('.title');
+   629→        const linkEl = el.querySelector('a');
+   630→        const snippetEl = el.querySelector('.abstract-short');
+   631→        if (titleEl) {
+   632→          results.push({
+   633→            title: titleEl.textContent?.trim() ?? '',
+   634→            url: linkEl?.href ?? '',
+   635→            snippet: snippetEl?.textContent?.trim() ?? '',
+   636→          });
+   637→        }
+   638→      });
+   639→      return results;
+   640→    });
+   641→  }
+   642→
+   643→  private async extractGenericResults(): Promise<SearchItem[]> {
+   644→    const page = this.getActivePage();
+   645→    return page.evaluate(() => {
+   646→      const results: SearchItem[] = [];
+   647→      // Try common search result patterns
+   648→      const selectors = [
+   649→        '.result',
+   650→        '.results .result',
+   651→        '[data-result]',
+   652→        'article',
+   653→        '.web-result',
+   654→        '.search-result',
+   655→        'li.result',
+   656→      ];
+   657→      for (const sel of selectors) {
+   658→        const elements = document.querySelectorAll(sel);
+   659→        if (elements.length > 0) {
+   660→          elements.forEach((el) => {
+   661→            const titleEl = el.querySelector('a');
+   662→            const snippetEl = el.querySelector('p, .snippet, .abstract');
+   663→            if (titleEl) {
+   664→              results.push({
+   665→                title: titleEl.textContent?.trim() ?? '',
+   666→                url: titleEl.href ?? '',
+   667→                snippet: snippetEl?.textContent?.trim() ?? '',
+   668→              });
+   669→            }
+   670→          });
+   671→          break;
+   672→        }
+   673→      }
+   674→      return results;
+   675→    });
+   676→  }
+   677→
+   678→  // -----------------------------------------------------------
+   679→  // File operations
+   680→  // -----------------------------------------------------------
+   681→
+   682→  async download(url: string, path?: string): Promise<ActionResult<DownloadResult>> {
+   683→    const start = Date.now();
+   684→    try {
+   685→      const page = this.getActivePage();
+   686→      const downloadPromise = page.waitForEvent('download', { timeout: this.config.defaultTimeout });
+   687→      await page.goto(url, { waitUntil: 'domcontentloaded' });
+   688→      // If we get here, the page loaded instead of triggering a download
+   689→      // Try clicking any download link
+   690→      const download = await downloadPromise.catch(() => null);
+   691→      if (download) {
+   692→        const dest = path ?? (this.config.downloadDir ? `${this.config.downloadDir}/${download.suggestedFilename()}` : `/tmp/${download.suggestedFilename()}`);
+   693→        await download.saveAs(dest);
+   694→        const downloadResult: DownloadResult = { url, path: dest, size: 0 };
+   695→        return result('success', downloadResult, Date.now() - start, url);
+   696→      }
+   697→      return errorResult('No download triggered', Date.now() - start, url);
+   698→    } catch (err) {
+   699→      return errorResult((err as Error).message, Date.now() - start, url);
+   700→    }
+   701→  }
+   702→
+   703→  async screenshot(
+   704→    options?: { path?: string; fullPage?: boolean; selector?: string },
+   705→  ): Promise<ActionResult<ScreenshotResult>> {
+   706→    const start = Date.now();
+   707→    try {
+   708→      const page = this.getActivePage();
+   709→      let buffer: Buffer;
+   710→
+   711→      if (options?.selector) {
+   712→        const element = await page.waitForSelector(options.selector);
+   713→        buffer = await element!.screenshot({ type: 'png' });
+   714→      } else {
+   715→        buffer = await page.screenshot({ fullPage: options?.fullPage ?? false, type: 'png' });
+   716→      }
+   717→
+   718→      const dest = options?.path ?? (this.config.screenshotDir ? `${this.config.screenshotDir}/screenshot_${Date.now()}.png` : `/tmp/screenshot_${Date.now()}.png`);
+   719→
+   720→      const fs = await import('fs');
+   721→      await fs.promises.writeFile(dest, buffer);
+   722→
+   723→      const screenshotResult: ScreenshotResult = {
+   724→        path: dest,
+   725→        size: buffer.length,
+   726→        width: this.config.viewport.width,
+   727→        height: this.config.viewport.height,
+   728→      };
+   729→      return result('success', screenshotResult, Date.now() - start, page.url());
+   730→    } catch (err) {
+   731→      return errorResult((err as Error).message, Date.now() - start);
+   732→    }
+   733→  }
+   734→
+   735→  async pdf(options?: PdfOptions): Promise<ActionResult<{ path: string; size: number }>> {
+   736→    const start = Date.now();
+   737→    try {
+   738→      const page = this.getActivePage();
+   739→      const buffer = await page.pdf({
+   740→        format: (options?.format as 'A4' | 'Letter' | undefined) ?? 'A4',
+   741→        printBackground: options?.printBackground ?? true,
+   742→        margin: options?.margin,
+   743→      });
+   744→
+   745→      const dest = options?.path ?? `/tmp/page_${Date.now()}.pdf`;
+   746→      const fs = await import('fs');
+   747→      await fs.promises.writeFile(dest, buffer);
+   748→
+   749→      return result('success', { path: dest, size: buffer.length }, Date.now() - start, page.url());
+   750→    } catch (err) {
+   751→      return errorResult((err as Error).message, Date.now() - start);
+   752→    }
+   753→  }
+   754→
+   755→  // -----------------------------------------------------------
+   756→  // Scrolling
+   757→  // -----------------------------------------------------------
+   758→
+   759→  async scroll(direction: 'up' | 'down' | 'left' | 'right', amount = 500): Promise<ActionResult<ScrollResult>> {
+   760→    const start = Date.now();
+   761→    try {
+   762→      const page = this.getActivePage();
+   763→      const delta = direction === 'up' || direction === 'left' ? -amount : amount;
+   764→      await page.evaluate(
+   765→        ([dir, d]) => {
+   766→          if (dir === 'up' || dir === 'down') {
+   767→            window.scrollBy(0, d as number);
+   768→          } else {
+   769→            window.scrollBy(d as number, 0);
+   770→          }
+   771→        },
+   772→        [direction, delta] as [string, number],
+   773→      );
+   774→      if (this.config.stealth) await this.stealthDelay();
+   775→      const scrollResult: ScrollResult = { direction, amount, scrolled: true };
+   776→      return result('success', scrollResult, Date.now() - start, page.url());
+   777→    } catch (err) {
+   778→      return errorResult((err as Error).message, Date.now() - start);
+   779→    }
+   780→  }
+   781→
+   782→  async scrollTo(selector: string): Promise<ActionResult<boolean>> {
+   783→    const start = Date.now();
+   784→    try {
+   785→      const page = this.getActivePage();
+   786→      const element = await page.waitForSelector(selector);
+   787→      await element!.scrollIntoViewIfNeeded();
+   788→      return result('success', true, Date.now() - start, page.url());
+   789→    } catch (err) {
+   790→      return errorResult((err as Error).message, Date.now() - start);
+   791→    }
+   792→  }
+   793→
+   794→  // -----------------------------------------------------------
+   795→  // Tabs
+   796→  // -----------------------------------------------------------
+   797→
+   798→  async openTab(url?: string): Promise<ActionResult<TabInfo>> {
+   799→    const start = Date.now();
+   800→    try {
+   801→      if (this.pages.length >= this.config.maxTabs) {
+   802→        return errorResult(`Maximum tabs (${this.config.maxTabs}) reached`, Date.now() - start);
+   803→      }
+   804→      const ctx = this.getContext();
+   805→      const page = await ctx.newPage();
+   806→      page.setDefaultTimeout(this.config.defaultTimeout);
+   807→      page.setDefaultNavigationTimeout(this.config.navigationTimeout);
+   808→      this.pages.push(page);
+   809→
+   810→      if (url) {
+   811→        await page.goto(url, { waitUntil: 'domcontentloaded' });
+   812→      }
+   813→
+   814→      const newIndex = this.pages.length - 1;
+   815→      this.activePageIndex = newIndex;
+   816→
+   817→      const tabInfo: TabInfo = {
+   818→        index: newIndex,
+   819→        url: page.url(),
+   820→        title: await page.title(),
+   821→        active: true,
+   822→      };
+   823→      return result('success', tabInfo, Date.now() - start, page.url());
+   824→    } catch (err) {
+   825→      return errorResult((err as Error).message, Date.now() - start);
+   826→    }
+   827→  }
+   828→
+   829→  async switchTab(index: number): Promise<ActionResult<TabInfo>> {
+   830→    const start = Date.now();
+   831→    try {
+   832→      if (index < 0 || index >= this.pages.length) {
+   833→        return errorResult(`Tab index ${index} out of range (0-${this.pages.length - 1})`, Date.now() - start);
+   834→      }
+   835→      this.activePageIndex = index;
+   836→      const page = this.pages[index];
+   837→      await page.bringToFront();
+   838→      const tabInfo: TabInfo = {
+   839→        index,
+   840→        url: page.url(),
+   841→        title: await page.title(),
+   842→        active: true,
+   843→      };
+   844→      return result('success', tabInfo, Date.now() - start, page.url());
+   845→    } catch (err) {
+   846→      return errorResult((err as Error).message, Date.now() - start);
+   847→    }
+   848→  }
+   849→
+   850→  async closeTab(index?: number): Promise<ActionResult<boolean>> {
+   851→    const start = Date.now();
+   852→    try {
+   853→      const closeIndex = index ?? this.activePageIndex;
+   854→      if (closeIndex < 0 || closeIndex >= this.pages.length) {
+   855→        return errorResult(`Tab index ${closeIndex} out of range`, Date.now() - start);
+   856→      }
+   857→      if (this.pages.length <= 1) {
+   858→        return errorResult('Cannot close the last tab', Date.now() - start);
+   859→      }
+   860→      const page = this.pages[closeIndex];
+   861→      await page.close();
+   862→      this.pages.splice(closeIndex, 1);
+   863→
+   864→      if (this.activePageIndex >= this.pages.length) {
+   865→        this.activePageIndex = this.pages.length - 1;
+   866→      }
+   867→
+   868→      return result('success', true, Date.now() - start);
+   869→    } catch (err) {
+   870→      return errorResult((err as Error).message, Date.now() - start);
+   871→    }
+   872→  }
+   873→
+   874→  async getTabs(): Promise<ActionResult<TabInfo[]>> {
+   875→    const start = Date.now();
+   876→    try {
+   877→      const tabs: TabInfo[] = await Promise.all(
+   878→        this.pages.map(async (page, index) => ({
+   879→          index,
+   880→          url: page.url(),
+   881→          title: await page.title(),
+   882→          active: index === this.activePageIndex,
+   883→        })),
+   884→      );
+   885→      return result('success', tabs, Date.now() - start);
+   886→    } catch (err) {
+   887→      return errorResult((err as Error).message, Date.now() - start);
+   888→    }
+   889→  }
+   890→
+   891→  // -----------------------------------------------------------
+   892→  // Cookies & Storage
+   893→  // -----------------------------------------------------------
+   894→
+   895→  async getCookies(): Promise<ActionResult<CookieInfo[]>> {
+   896→    const start = Date.now();
+   897→    try {
+   898→      const ctx = this.getContext();
+   899→      const cookies = await ctx.cookies();
+   900→      const cookieInfos: CookieInfo[] = cookies.map((c) => ({
+   901→        name: c.name,
+   902→        value: c.value,
+   903→        domain: c.domain,
+   904→        path: c.path,
+   905→        expires: c.expires,
+   906→        httpOnly: c.httpOnly,
+   907→        secure: c.secure,
+   908→        sameSite: c.sameSite as 'Strict' | 'Lax' | 'None' | undefined,
+   909→      }));
+   910→      return result('success', cookieInfos, Date.now() - start);
+   911→    } catch (err) {
+   912→      return errorResult((err as Error).message, Date.now() - start);
+   913→    }
+   914→  }
+   915→
+   916→  async setCookie(
+   917→    cookie: Omit<CookieInfo, 'expires'> & { expires?: number },
+   918→  ): Promise<ActionResult<boolean>> {
+   919→    const start = Date.now();
+   920→    try {
+   921→      const ctx = this.getContext();
+   922→      await ctx.addCookies([
+   923→        {
+   924→          name: cookie.name,
+   925→          value: cookie.value,
+   926→          domain: cookie.domain,
+   927→          path: cookie.path,
+   928→          expires: cookie.expires ?? -1,
+   929→          httpOnly: cookie.httpOnly,
+   930→          secure: cookie.secure,
+   931→          sameSite: cookie.sameSite as 'Strict' | 'Lax' | 'None' | undefined,
+   932→        },
+   933→      ]);
+   934→      return result('success', true, Date.now() - start);
+   935→    } catch (err) {
+   936→      return errorResult((err as Error).message, Date.now() - start);
+   937→    }
+   938→  }
+   939→
+   940→  async clearCookies(): Promise<ActionResult<boolean>> {
+   941→    const start = Date.now();
+   942→    try {
+   943→      const ctx = this.getContext();
+   944→      await ctx.clearCookies();
+   945→      return result('success', true, Date.now() - start);
+   946→    } catch (err) {
+   947→      return errorResult((err as Error).message, Date.now() - start);
+   948→    }
+   949→  }
+   950→
+   951→  async getStorage(): Promise<ActionResult<StorageInfo>> {
+   952→    const start = Date.now();
+   953→    try {
+   954→      const page = this.getActivePage();
+   955→      const storage = await page.evaluate(() => {
+   956→        const ls: Record<string, string> = {};
+   957→        const ss: Record<string, string> = {};
+   958→        for (let i = 0; i < localStorage.length; i++) {
+   959→          const key = localStorage.key(i);
+   960→          if (key) ls[key] = localStorage.getItem(key) ?? '';
+   961→        }
+   962→        for (let i = 0; i < sessionStorage.length; i++) {
+   963→          const key = sessionStorage.key(i);
+   964→          if (key) ss[key] = sessionStorage.getItem(key) ?? '';
+   965→        }
+   966→        return { localStorage: ls, sessionStorage: ss };
+   967→      });
+   968→      return result('success', storage, Date.now() - start, page.url());
+   969→    } catch (err) {
+   970→      return errorResult((err as Error).message, Date.now() - start);
+   971→    }
+   972→  }
+   973→
+   974→  // -----------------------------------------------------------
+   975→  // Form handling
+   976→  // -----------------------------------------------------------
+   977→
+   978→  async fillForm(fields: FormField[]): Promise<ActionResult<boolean>> {
+   979→    const start = Date.now();
+   980→    try {
+   981→      const page = this.getActivePage();
+   982→      for (const field of fields) {
+   983→        if (this.config.stealth) await this.stealthDelay();
+   984→        switch (field.type ?? 'text') {
+   985→          case 'text':
+   986→            await page.fill(field.selector, field.value);
+   987→            break;
+   988→          case 'select':
+   989→            await page.selectOption(field.selector, field.value);
+   990→            break;
+   991→          case 'checkbox':
+   992→            if (field.value === 'true' || field.value === 'checked') {
+   993→              await page.check(field.selector);
+   994→            } else {
+   995→              await page.uncheck(field.selector);
+   996→            }
+   997→            break;
+   998→          case 'radio':
+   999→            await page.click(field.selector);
+  1000→            break;
+  1001→          case 'file':
+  1002→            await page.setInputFiles(field.selector, field.value);
+  1003→            break;
+  1004→        }
+  1005→      }
+  1006→      return result('success', true, Date.now() - start, page.url());
+  1007→    } catch (err) {
+  1008→      return errorResult((err as Error).message, Date.now() - start);
+  1009→    }
+  1010→  }
+  1011→
+  1012→  async submitForm(selector: string): Promise<ActionResult<NavigateResult>> {
+  1013→    const start = Date.now();
+  1014→    try {
+  1015→      const page = this.getActivePage();
+  1016→      await page.click(selector);
+  1017→      await page.waitForLoadState('domcontentloaded');
+  1018→      const url = page.url();
+  1019→      const title = await page.title();
+  1020→      const navResult: NavigateResult = { url, title, redirected: false };
+  1021→      return result('success', navResult, Date.now() - start, url);
+  1022→    } catch (err) {
+  1023→      return errorResult((err as Error).message, Date.now() - start);
+  1024→    }
+  1025→  }
+  1026→
+  1027→  // -----------------------------------------------------------
+  1028→  // Upload
+  1029→  // -----------------------------------------------------------
+  1030→
+  1031→  async upload(selector: string, filePaths: string[]): Promise<ActionResult<boolean>> {
+  1032→    const start = Date.now();
+  1033→    try {
+  1034→      const page = this.getActivePage();
+  1035→      await page.setInputFiles(selector, filePaths);
+  1036→      return result('success', true, Date.now() - start, page.url());
+  1037→    } catch (err) {
+  1038→      return errorResult((err as Error).message, Date.now() - start);
+  1039→    }
+  1040→  }
+  1041→
+  1042→  // -----------------------------------------------------------
+  1043→  // Memory
+  1044→  // -----------------------------------------------------------
+  1045→
+  1046→  getMemory(): IBrowserMemory {
+  1047→    return this.memory;
+  1048→  }
+  1049→
+  1050→  // -----------------------------------------------------------
+  1051→  // Internal helpers
+  1052→  // -----------------------------------------------------------
+  1053→
+  1054→  private getActivePage(): Page {
+  1055→    if (!this.pages.length) {
+  1056→      throw new Error('No active page. Call launch() first.');
+  1057→    }
+  1058→    return this.pages[this.activePageIndex];
+  1059→  }
+  1060→
+  1061→  private getContext(): BrowserContext {
+  1062→    if (!this.context) {
+  1063→      throw new Error('No browser context. Call launch() first.');
+  1064→    }
+  1065→    return this.context;
+  1066→  }
+  1067→
+  1068→  private async stealthDelay(): Promise<void> {
+  1069→    const delay = randomDelay(50, 200);
+  1070→    await new Promise((resolve) => setTimeout(resolve, delay));
+  1071→  }
+  1072→
+  1073→  private async applyStealthScripts(): Promise<void> {
+  1074→    if (!this.context) return;
+  1075→
+  1076→    // Override navigator.webdriver
+  1077→    await this.context.addInitScript(() => {
+  1078→      Object.defineProperty(navigator, 'webdriver', {
+  1079→        get: () => false,
+  1080→      });
+  1081→
+  1082→      // Override plugins length
+  1083→      Object.defineProperty(navigator, 'plugins', {
+  1084→        get: () => [1, 2, 3, 4, 5],
+  1085→      });
+  1086→
+  1087→      // Override languages
+  1088→      Object.defineProperty(navigator, 'languages', {
+  1089→        get: () => ['en-US', 'en'],
+  1090→      });
+  1091→
+  1092→      // Override Chrome runtime
+  1093→      if (!(window as Record<string, unknown>).chrome) {
+  1094→        (window as Record<string, unknown>).chrome = { runtime: {} };
+  1095→      }
+  1096→    });
+  1097→  }
+  1098→}
+  1099→
