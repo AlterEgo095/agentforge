@@ -63,3 +63,33 @@ Stage Summary:
 - Writer Worker upgraded from v1.0 (template-only) to v2.0 (LLM-enhanced + quality + refinement)
 - Full Research→Writer pipeline now possible via bridge
 - REST API: /api/writer with write, sessions, quality scoring, health endpoints
+
+---
+Task ID: Sprint-5-Plugin-Loader-Research-API
+Agent: Main Agent (Super Z)
+Task: Sprint 5 — Plugin Loader & Research API: canonical plugin types, research REST API, end-to-end pipeline
+
+Work Log:
+- S5-1: Created @alterego/plugin-loader package with types.ts, plugin-loader.ts, index.ts
+- S5-1: Canonical types: PluginManifest, PluginContext, PluginInitializer, PluginEventBus, PluginKnowledgeStore, PluginLogger, PluginRegistration, PluginInstance, LoaderEventType
+- S5-1: PluginLoader class: registration, topological sort dependency resolution, lifecycle (register→init→start→stop→dispose), capability injection (getCapability<T>), health checks, timeout support, auto-start
+- S5-1: 37 tests covering: registration, dependency resolution, circular detection, lifecycle, capability injection, health checks, config, context, full pipeline integration
+- S5-2: Migrated research-worker types.ts — replaced divergent PluginManifest/PluginContext/PluginInitializer with re-exports from @alterego/plugin-loader
+- S5-2: Added @alterego/plugin-loader dependency to both research-worker and writer-worker package.json
+- S5-3: Created research.ts API route with 5 endpoints: POST /search, POST /research, GET /sessions, GET /sessions/:id, GET /health
+- S5-3: Added Zod validation schemas for search and research request bodies
+- S5-3: Registered research route in API index (/api/research)
+- S5-4: Created POST /api/writer/research-write endpoint — end-to-end pipeline: Research → Bridge → Writer
+- S5-4: Accepts query + research config + writer config, runs full pipeline, returns combined result
+- S5-5: ADR-001 CacheManager migration: confirmed all production code already migrated, only 2 chaos test files remain
+- S5-5: Updated CacheManager @deprecated notice with Sprint 6 removal schedule
+- S5-7: All test suites passing: Plugin Loader (37), Writer Worker (56), Research Worker (120), Event Bus (18) = 231 total
+
+Stage Summary:
+- @alterego/plugin-loader package created and tested (37/37 tests)
+- Research Worker now has REST API: 5 endpoints under /api/research
+- End-to-end pipeline: POST /api/writer/research-write (Research → Bridge → Writer in one call)
+- Canonical plugin types — no more divergent definitions between workers
+- CacheManager confirmed deprecated, removal scheduled Sprint 6
+- 231 tests passing across 4 packages
+- API now exposes 8 route groups: auth, agents, projects, tenants, deployments, admin, writer, research
