@@ -1,0 +1,602 @@
+     1→// ============================================================
+     2→// AgentForge - Analytics & RL Page
+     3→// Wires all 8 analytics/RL endpoints to a comprehensive UI:
+     4→//   - Routing Metrics (model/strategy distribution)
+     5→//   - Feedback Stats (by agent ratings)
+     6→//   - Learning Status (RL model training state)
+     7→//   - Predictions (cost + quality forecasts)
+     8→//   - Cost Forecast (per agent, daily breakdown)
+     9→//   - Cost Anomalies (detected spikes)
+    10→//   - Trigger Retrain (manual RL retrain)
+    11→//   - Submit Feedback (already in Execute page)
+    12→// ============================================================
+    13→
+    14→import React, { useState, useEffect, useCallback } from 'react';
+    15→import {
+    16→  BarChart3, TrendingUp, Star, Brain, Zap, AlertTriangle,
+    17→  RefreshCw, Loader2, DollarSign, Activity, Cpu, Target,
+    18→  ArrowUpRight, ArrowDownRight, Minus, RotateCcw, CheckCircle,
+    19→  XCircle,
+    20→} from 'lucide-react';
+    21→import {
+    22→  api,
+    23→  type RoutingMetrics,
+    24→  type FeedbackStats,
+    25→  type LearningStatus,
+    26→  type Predictions,
+    27→  type CostForecast,
+    28→  type CostAnomaly,
+    29→} from '../lib/api';
+    30→import { AGENT_REGISTRY } from '@agentforge/shared';
+    31→import type { AgentId } from '@agentforge/shared';
+    32→import { cn } from '../lib/cn';
+    33→import { useToast } from '../components/common/Toast';
+    34→
+    35→// ── Stat Pill ──────────────────────────────────────────────
+    36→function StatPill({
+    37→  label, value, icon: Icon, color, trend,
+    38→}: {
+    39→  label: string; value: string | number; icon: React.ElementType; color: string;
+    40→  trend?: 'up' | 'down' | 'stable';
+    41→}) {
+    42→  return (
+    43→    <div className="p-4 rounded-xl bg-gray-800/30 border border-gray-700/50">
+    44→      <div className="flex items-center gap-2 mb-2">
+    45→        <div className="w-7 h-7 rounded-lg flex items-center justify-center" style={{ backgroundColor: `${color}20` }}>
+    46→          <Icon className="w-3.5 h-3.5" style={{ color }} />
+    47→        </div>
+    48→        <span className="text-xs text-gray-500">{label}</span>
+    49→        {trend && (
+    50→          <span className={cn(
+    51→            'ml-auto flex items-center text-xs',
+    52→            trend === 'up' ? 'text-green-400' : trend === 'down' ? 'text-red-400' : 'text-gray-500'
+    53→          )}>
+    54→            {trend === 'up' ? <ArrowUpRight className="w-3 h-3" /> :
+    55→             trend === 'down' ? <ArrowDownRight className="w-3 h-3" /> :
+    56→             <Minus className="w-3 h-3" />}
+    57→          </span>
+    58→        )}
+    59→      </div>
+    60→      <p className="text-xl font-bold text-white">{value}</p>
+    61→    </div>
+    62→  );
+    63→}
+    64→
+    65→// ── Progress Bar ───────────────────────────────────────────
+    66→function ProgressBar({ value, max, color = '#3B82F6', label }: { value: number; max: number; color?: string; label?: string }) {
+    67→  const pct = max > 0 ? Math.min((value / max) * 100, 100) : 0;
+    68→  return (
+    69→    <div>
+    70→      {label && (
+    71→        <div className="flex items-center justify-between mb-1">
+    72→          <span className="text-xs text-gray-500">{label}</span>
+    73→          <span className="text-xs text-gray-400 font-mono">{value.toFixed(1)}%</span>
+    74→        </div>
+    75→      )}
+    76→      <div className="h-2 rounded-full bg-gray-800 overflow-hidden">
+    77→        <div
+    78→          className="h-full rounded-full transition-all duration-500"
+    79→          style={{ width: `${pct}%`, backgroundColor: color }}
+    80→        />
+    81→      </div>
+    82→    </div>
+    83→  );
+    84→}
+    85→
+    86→// ── Main Component ─────────────────────────────────────────
+    87→export function Analytics() {
+    88→  const { addToast } = useToast();
+    89→
+    90→  // Data states
+    91→  const [routingMetrics, setRoutingMetrics] = useState<RoutingMetrics | null>(null);
+    92→  const [feedbackStats, setFeedbackStats] = useState<FeedbackStats | null>(null);
+    93→  const [learningStatus, setLearningStatus] = useState<LearningStatus | null>(null);
+    94→  const [predictions, setPredictions] = useState<Predictions | null>(null);
+    95→  const [costAnomalies, setCostAnomalies] = useState<CostAnomaly[]>([]);
+    96→  const [agentForecast, setAgentForecast] = useState<CostForecast | null>(null);
+    97→  const [selectedAgent, setSelectedAgent] = useState<AgentId>('DEV');
+    98→
+    99→  // UI states
+   100→  const [loading, setLoading] = useState(true);
+   101→  const [retraining, setRetraining] = useState(false);
+   102→  const [error, setError] = useState<string | null>(null);
+   103→
+   104→  // Fetch all analytics data
+   105→  const fetchAll = useCallback(async () => {
+   106→    try {
+   107→      setLoading(true);
+   108→      setError(null);
+   109→
+   110→      const [metricsRes, feedbackRes, learningRes, predictionsRes, anomalyRes, forecastRes] =
+   111→        await Promise.allSettled([
+   112→          api.getRoutingMetrics(),
+   113→          api.getFeedbackStats(),
+   114→          api.getLearningStatus(),
+   115→          api.getPredictions(),
+   116→          api.getCostAnomaly(),
+   117→          api.getCostForecast(selectedAgent, 7),
+   118→        ]);
+   119→
+   120→      if (metricsRes.status === 'fulfilled') setRoutingMetrics(metricsRes.value.data);
+   121→      if (feedbackRes.status === 'fulfilled') setFeedbackStats(feedbackRes.value.data);
+   122→      if (learningRes.status === 'fulfilled') setLearningStatus(learningRes.value.data);
+   123→      if (predictionsRes.status === 'fulfilled') setPredictions(predictionsRes.value.data);
+   124→      if (anomalyRes.status === 'fulfilled') setCostAnomalies(anomalyRes.value.data || []);
+   125→      if (forecastRes.status === 'fulfilled') setAgentForecast(forecastRes.value.data);
+   126→    } catch (err: any) {
+   127→      setError(err.message || 'Failed to load analytics');
+   128→    } finally {
+   129→      setLoading(false);
+   130→    }
+   131→  }, [selectedAgent]);
+   132→
+   133→  useEffect(() => {
+   134→    fetchAll();
+   135→  }, [fetchAll]);
+   136→
+   137→  // Retrain RL model
+   138→  const handleRetrain = async () => {
+   139→    try {
+   140→      setRetraining(true);
+   141→      await api.triggerRetrain();
+   142→      addToast('success', 'RL retraining started successfully');
+   143→      // Refresh learning status after a short delay
+   144→      setTimeout(async () => {
+   145→        try {
+   146→          const res = await api.getLearningStatus();
+   147→          setLearningStatus(res.data);
+   148→        } catch { /* ignore */ }
+   149→      }, 2000);
+   150→    } catch (err: any) {
+   151→      addToast('error', err.message || 'Failed to trigger retraining');
+   152→    } finally {
+   153→      setRetraining(false);
+   154→    }
+   155→  };
+   156→
+   157→  if (loading) {
+   158→    return (
+   159→      <div className="p-6 max-w-7xl mx-auto flex items-center justify-center min-h-[60vh]">
+   160→        <div className="text-center">
+   161→          <Loader2 className="w-8 h-8 text-blue-400 animate-spin mx-auto mb-4" />
+   162→          <p className="text-gray-500">Loading analytics...</p>
+   163→        </div>
+   164→      </div>
+   165→    );
+   166→  }
+   167→
+   168→  return (
+   169→    <div className="p-6 lg:p-8 max-w-7xl mx-auto animate-fade-in">
+   170→      {/* Header */}
+   171→      <div className="flex items-center justify-between mb-8">
+   172→        <div>
+   173→          <div className="flex items-center gap-3 mb-1">
+   174→            <BarChart3 className="w-7 h-7 text-purple-400" />
+   175→            <h1 className="text-3xl font-bold gradient-text">Analytics & RL</h1>
+   176→          </div>
+   177→          <p className="text-gray-500 text-sm">Routing metrics, feedback analysis, cost forecasting, and RL model status</p>
+   178→        </div>
+   179→        <div className="flex items-center gap-3">
+   180→          <button
+   181→            onClick={fetchAll}
+   182→            className="p-2.5 rounded-lg bg-gray-800 hover:bg-gray-700 text-gray-400 hover:text-white transition-colors"
+   183→          >
+   184→            <RefreshCw className="w-4 h-4" />
+   185→          </button>
+   186→        </div>
+   187→      </div>
+   188→
+   189→      {/* Error */}
+   190→      {error && (
+   191→        <div className="mb-6 px-4 py-3 rounded-lg bg-red-500/10 border border-red-500/20 text-red-400 text-sm">
+   192→          {error}
+   193→        </div>
+   194→      )}
+   195→
+   196→      {/* ── Section 1: Routing Metrics ──────────────────── */}
+   197→      <section className="glass-card rounded-2xl p-6 mb-6">
+   198→        <h2 className="text-lg font-semibold text-white mb-5 flex items-center gap-2">
+   199→          <Activity className="w-5 h-5 text-blue-400" />
+   200→          Routing Metrics
+   201→        </h2>
+   202→
+   203→        {routingMetrics ? (
+   204→          <div>
+   205→            <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+   206→              <StatPill label="Total Decisions" value={routingMetrics.totalDecisions.toLocaleString()} icon={Zap} color="#3B82F6" />
+   207→              <StatPill label="Avg Quality" value={`${(routingMetrics.avgQuality * 100).toFixed(1)}%`} icon={Target} color="#10B981" />
+   208→              <StatPill label="Avg Latency" value={`${routingMetrics.avgLatency.toFixed(0)}ms`} icon={Cpu} color="#F59E0B" />
+   209→              <StatPill label="Models Used" value={Object.keys(routingMetrics.byModel).length} icon={BarChart3} color="#8B5CF6" />
+   210→            </div>
+   211→
+   212→            {/* Model Distribution */}
+   213→            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+   214→              <div>
+   215→                <h3 className="text-sm font-medium text-white mb-3">Model Distribution</h3>
+   216→                <div className="space-y-3">
+   217→                  {Object.entries(routingMetrics.byModel).map(([model, count]) => {
+   218→                    const maxCount = Math.max(...Object.values(routingMetrics.byModel));
+   219→                    return (
+   220→                      <div key={model}>
+   221→                        <ProgressBar
+   222→                          label={model}
+   223→                          value={maxCount > 0 ? (count / maxCount) * 100 : 0}
+   224→                          max={100}
+   225→                          color="#3B82F6"
+   226→                        />
+   227→                        <span className="text-xs text-gray-600">{count.toLocaleString()} decisions</span>
+   228→                      </div>
+   229→                    );
+   230→                  })}
+   231→                </div>
+   232→              </div>
+   233→
+   234→              <div>
+   235→                <h3 className="text-sm font-medium text-white mb-3">Strategy Distribution</h3>
+   236→                <div className="space-y-3">
+   237→                  {Object.entries(routingMetrics.byStrategy).map(([strategy, count]) => {
+   238→                    const maxCount = Math.max(...Object.values(routingMetrics.byStrategy));
+   239→                    const strategyColors: Record<string, string> = {
+   240→                      'cost-optimal': '#10B981',
+   241→                      'quality-optimal': '#8B5CF6',
+   242→                      'balanced': '#3B82F6',
+   243→                      'fast': '#F59E0B',
+   244→                      'fallback': '#6B7280',
+   245→                    };
+   246→                    return (
+   247→                      <div key={strategy}>
+   248→                        <ProgressBar
+   249→                          label={strategy}
+   250→                          value={maxCount > 0 ? (count / maxCount) * 100 : 0}
+   251→                          max={100}
+   252→                          color={strategyColors[strategy] || '#6B7280'}
+   253→                        />
+   254→                        <span className="text-xs text-gray-600">{count.toLocaleString()} decisions</span>
+   255→                      </div>
+   256→                    );
+   257→                  })}
+   258→                </div>
+   259→              </div>
+   260→            </div>
+   261→          </div>
+   262→        ) : (
+   263→          <p className="text-sm text-gray-600">No routing metrics available yet. Execute agents to generate data.</p>
+   264→        )}
+   265→      </section>
+   266→
+   267→      {/* ── Section 2: Feedback Stats ───────────────────── */}
+   268→      <section className="glass-card rounded-2xl p-6 mb-6">
+   269→        <h2 className="text-lg font-semibold text-white mb-5 flex items-center gap-2">
+   270→          <Star className="w-5 h-5 text-yellow-400" />
+   271→          Feedback Analysis
+   272→        </h2>
+   273→
+   274→        {feedbackStats ? (
+   275→          <div>
+   276→            <div className="grid grid-cols-2 md:grid-cols-3 gap-4 mb-6">
+   277→              <StatPill label="Total Feedback" value={feedbackStats.totalFeedback.toLocaleString()} icon={Star} color="#F59E0B" />
+   278→              <StatPill label="Avg Rating" value={`${feedbackStats.avgRating.toFixed(1)} / 5`} icon={TrendingUp} color="#10B981" />
+   279→              <StatPill label="Agents Rated" value={Object.keys(feedbackStats.byAgent).length} icon={BarChart3} color="#8B5CF6" />
+   280→            </div>
+   281→
+   282→            {/* Per-Agent Ratings */}
+   283→            {Object.keys(feedbackStats.byAgent).length > 0 && (
+   284→              <div>
+   285→                <h3 className="text-sm font-medium text-white mb-3">Ratings by Agent</h3>
+   286→                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+   287→                  {Object.entries(feedbackStats.byAgent).map(([agentId, data]) => {
+   288→                    const agentColor = AGENT_REGISTRY[agentId as AgentId]?.color || '#6B7280';
+   289→                    return (
+   290→                      <div key={agentId} className="p-3 rounded-xl bg-gray-800/30 border border-gray-700/50">
+   291→                        <div className="flex items-center gap-2 mb-2">
+   292→                          <span
+   293→                            className="w-2 h-2 rounded-full"
+   294→                            style={{ backgroundColor: agentColor }}
+   295→                          />
+   296→                          <span className="text-sm font-medium text-white">{agentId}</span>
+   297→                        </div>
+   298→                        <div className="flex items-center justify-between">
+   299→                          <span className="text-xs text-gray-500">{data.count} ratings</span>
+   300→                          <div className="flex items-center gap-1">
+   301→                            <Star className="w-3 h-3 text-yellow-400 fill-yellow-400" />
+   302→                            <span className="text-sm font-mono text-gray-300">{data.avgRating.toFixed(1)}</span>
+   303→                          </div>
+   304→                        </div>
+   305→                        <div className="mt-2">
+   306→                          <ProgressBar value={data.avgRating * 20} max={100} color={agentColor} />
+   307→                        </div>
+   308→                      </div>
+   309→                    );
+   310→                  })}
+   311→                </div>
+   312→              </div>
+   313→            )}
+   314→          </div>
+   315→        ) : (
+   316→          <p className="text-sm text-gray-600">No feedback data yet. Rate agent results to see analytics here.</p>
+   317→        )}
+   318→      </section>
+   319→
+   320→      {/* ── Section 3: RL Learning Status ───────────────── */}
+   321→      <section className="glass-card rounded-2xl p-6 mb-6">
+   322→        <div className="flex items-center justify-between mb-5">
+   323→          <h2 className="text-lg font-semibold text-white flex items-center gap-2">
+   324→            <Brain className="w-5 h-5 text-green-400" />
+   325→            RL Learning Status
+   326→          </h2>
+   327→          <button
+   328→            onClick={handleRetrain}
+   329→            disabled={retraining || (learningStatus?.isTraining ?? false)}
+   330→            className={cn(
+   331→              'inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed',
+   332→              learningStatus?.isTraining
+   333→                ? 'bg-yellow-500/10 text-yellow-400 border border-yellow-500/20'
+   334→                : 'bg-green-600 hover:bg-green-700 text-white'
+   335→            )}
+   336→          >
+   337→            {retraining || learningStatus?.isTraining ? (
+   338→              <>
+   339→                <Loader2 className="w-4 h-4 animate-spin" />
+   340→                {learningStatus?.isTraining ? 'Training...' : 'Starting...'}
+   341→              </>
+   342→            ) : (
+   343→              <>
+   344→                <RotateCcw className="w-4 h-4" />
+   345→                Trigger Retrain
+   346→              </>
+   347→            )}
+   348→          </button>
+   349→        </div>
+   350→
+   351→        {learningStatus ? (
+   352→          <div>
+   353→            <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+   354→              <StatPill
+   355→                label="Status"
+   356→                value={learningStatus.isTraining ? 'Training' : 'Idle'}
+   357→                icon={learningStatus.isTraining ? Loader2 : CheckCircle}
+   358→                color={learningStatus.isTraining ? '#F59E0B' : '#10B981'}
+   359→              />
+   360→              <StatPill label="Data Points" value={learningStatus.dataPoints.toLocaleString()} icon={BarChart3} color="#3B82F6" />
+   361→              <StatPill label="Model Version" value={`v${learningStatus.modelVersion}`} icon={Cpu} color="#8B5CF6" />
+   362→              <StatPill label="Accuracy" value={`${(learningStatus.accuracy * 100).toFixed(1)}%`} icon={Target} color="#10B981" />
+   363→            </div>
+   364→
+   365→            {learningStatus.lastTrainedAt && (
+   366→              <p className="text-xs text-gray-600">
+   367→                Last trained: {new Date(learningStatus.lastTrainedAt).toLocaleString()}
+   368→              </p>
+   369→            )}
+   370→
+   371→            <div className="mt-4">
+   372→              <ProgressBar
+   373→                label="Model Accuracy"
+   374→                value={learningStatus.accuracy * 100}
+   375→                max={100}
+   376→                color="#10B981"
+   377→              />
+   378→            </div>
+   379→          </div>
+   380→        ) : (
+   381→          <p className="text-sm text-gray-600">No learning status available yet.</p>
+   382→        )}
+   383→      </section>
+   384→
+   385→      {/* ── Section 4: Predictions ──────────────────────── */}
+   386→      <section className="glass-card rounded-2xl p-6 mb-6">
+   387→        <h2 className="text-lg font-semibold text-white mb-5 flex items-center gap-2">
+   388→          <TrendingUp className="w-5 h-5 text-blue-400" />
+   389→          Predictions
+   390→        </h2>
+   391→
+   392→        {predictions ? (
+   393→          <div>
+   394→            <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+   395→              <StatPill
+   396→                label="7-Day Cost"
+   397→                value={`$${predictions.costPrediction.next7Days.toFixed(2)}`}
+   398→                icon={DollarSign}
+   399→                color="#F59E0B"
+   400→              />
+   401→              <StatPill
+   402→                label="30-Day Cost"
+   403→                value={`$${predictions.costPrediction.next30Days.toFixed(2)}`}
+   404→                icon={DollarSign}
+   405→                color="#EF4444"
+   406→              />
+   407→              <StatPill
+   408→                label="Expected Quality"
+   409→                value={`${(predictions.qualityPrediction.expectedQuality * 100).toFixed(1)}%`}
+   410→                icon={Target}
+   411→                color="#10B981"
+   412→              />
+   413→              <StatPill
+   414→                label="Confidence"
+   415→                value={`${(predictions.qualityPrediction.confidence * 100).toFixed(1)}%`}
+   416→                icon={Zap}
+   417→                color="#8B5CF6"
+   418→              />
+   419→            </div>
+   420→
+   421→            {/* Per-Agent Predictions */}
+   422→            {Object.keys(predictions.byAgent).length > 0 && (
+   423→              <div>
+   424→                <h3 className="text-sm font-medium text-white mb-3">By Agent</h3>
+   425→                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+   426→                  {Object.entries(predictions.byAgent).map(([agentId, data]) => {
+   427→                    const agentColor = AGENT_REGISTRY[agentId as AgentId]?.color || '#6B7280';
+   428→                    return (
+   429→                      <div key={agentId} className="p-3 rounded-xl bg-gray-800/30 border border-gray-700/50">
+   430→                        <div className="flex items-center gap-2 mb-2">
+   431→                          <span className="w-2 h-2 rounded-full" style={{ backgroundColor: agentColor }} />
+   432→                          <span className="text-sm font-medium text-white">{agentId}</span>
+   433→                        </div>
+   434→                        <div className="grid grid-cols-2 gap-3">
+   435→                          <div>
+   436→                            <p className="text-xs text-gray-500">Cost</p>
+   437→                            <p className="text-sm font-mono text-gray-300">${data.cost.toFixed(2)}</p>
+   438→                          </div>
+   439→                          <div>
+   440→                            <p className="text-xs text-gray-500">Quality</p>
+   441→                            <p className="text-sm font-mono text-gray-300">{(data.quality * 100).toFixed(1)}%</p>
+   442→                          </div>
+   443→                        </div>
+   444→                      </div>
+   445→                    );
+   446→                  })}
+   447→                </div>
+   448→              </div>
+   449→            )}
+   450→          </div>
+   451→        ) : (
+   452→          <p className="text-sm text-gray-600">No predictions available. More execution data is needed.</p>
+   453→        )}
+   454→      </section>
+   455→
+   456→      {/* ── Section 5: Cost Forecast by Agent ───────────── */}
+   457→      <section className="glass-card rounded-2xl p-6 mb-6">
+   458→        <div className="flex items-center justify-between mb-5">
+   459→          <h2 className="text-lg font-semibold text-white flex items-center gap-2">
+   460→            <DollarSign className="w-5 h-5 text-green-400" />
+   461→            Cost Forecast
+   462→          </h2>
+   463→          <div className="flex items-center gap-2">
+   464→            <select
+   465→              value={selectedAgent}
+   466→              onChange={(e) => setSelectedAgent(e.target.value as AgentId)}
+   467→              className="px-3 py-1.5 rounded-lg bg-gray-800 border border-gray-700 text-white text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+   468→            >
+   469→              {(Object.keys(AGENT_REGISTRY) as AgentId[]).map(id => (
+   470→                <option key={id} value={id}>{id}</option>
+   471→              ))}
+   472→            </select>
+   473→          </div>
+   474→        </div>
+   475→
+   476→        {agentForecast ? (
+   477→          <div>
+   478→            <div className="grid grid-cols-2 md:grid-cols-3 gap-4 mb-6">
+   479→              <StatPill label="Current Cost" value={`$${agentForecast.currentCost.toFixed(2)}`} icon={DollarSign} color="#3B82F6" />
+   480→              <StatPill
+   481→                label="Projected Cost"
+   482→                value={`$${agentForecast.projectedCost.toFixed(2)}`}
+   483→                icon={TrendingUp}
+   484→                color={agentForecast.trend === 'increasing' ? '#EF4444' : agentForecast.trend === 'decreasing' ? '#10B981' : '#F59E0B'}
+   485→                trend={agentForecast.trend === 'increasing' ? 'up' : agentForecast.trend === 'decreasing' ? 'down' : 'stable'}
+   486→              />
+   487→              <StatPill
+   488→                label="Trend"
+   489→                value={agentForecast.trend.charAt(0).toUpperCase() + agentForecast.trend.slice(1)}
+   490→                icon={agentForecast.trend === 'increasing' ? ArrowUpRight : agentForecast.trend === 'decreasing' ? ArrowDownRight : Minus}
+   491→                color={agentForecast.trend === 'increasing' ? '#EF4444' : agentForecast.trend === 'decreasing' ? '#10B981' : '#F59E0B'}
+   492→              />
+   493→            </div>
+   494→
+   495→            {/* Daily Breakdown Chart (CSS-based) */}
+   496→            {agentForecast.dailyBreakdown && agentForecast.dailyBreakdown.length > 0 && (
+   497→              <div>
+   498→                <h3 className="text-sm font-medium text-white mb-3">Daily Breakdown</h3>
+   499→                <div className="flex items-end gap-1 h-48">
+   500→                  {agentForecast.dailyBreakdown.map((day, i) => {
+   501→                    const maxCost = Math.max(...agentForecast.dailyBreakdown.map(d => Math.max(d.cost, d.predicted || 0)));
+   502→                    const heightPct = maxCost > 0 ? (Math.max(day.cost, day.predicted || 0) / maxCost) * 100 : 0;
+   503→                    return (
+   504→                      <div key={i} className="flex-1 flex flex-col items-center gap-1 min-w-0">
+   505→                        <div className="w-full relative" style={{ height: `${Math.max(heightPct, 2)}%` }}>
+   506→                          {day.predicted ? (
+   507→                            <div className="absolute inset-0 rounded-t bg-purple-500/30 border border-dashed border-purple-500/50" />
+   508→                          ) : (
+   509→                            <div className="absolute inset-0 rounded-t bg-blue-500/50" />
+   510→                          )}
+   511→                        </div>
+   512→                        <span className="text-[9px] text-gray-600 truncate w-full text-center">
+   513→                          {new Date(day.date).toLocaleDateString(undefined, { weekday: 'short' })}
+   514→                        </span>
+   515→                      </div>
+   516→                    );
+   517→                  })}
+   518→                </div>
+   519→                <div className="flex items-center gap-4 mt-2">
+   520→                  <div className="flex items-center gap-1.5">
+   521→                    <div className="w-3 h-3 rounded bg-blue-500/50" />
+   522→                    <span className="text-xs text-gray-500">Actual</span>
+   523→                  </div>
+   524→                  <div className="flex items-center gap-1.5">
+   525→                    <div className="w-3 h-3 rounded bg-purple-500/30 border border-dashed border-purple-500/50" />
+   526→                    <span className="text-xs text-gray-500">Predicted</span>
+   527→                  </div>
+   528→                </div>
+   529→              </div>
+   530→            )}
+   531→          </div>
+   532→        ) : (
+   533→          <p className="text-sm text-gray-600">No cost forecast data available for this agent.</p>
+   534→        )}
+   535→      </section>
+   536→
+   537→      {/* ── Section 6: Cost Anomalies ───────────────────── */}
+   538→      <section className="glass-card rounded-2xl p-6">
+   539→        <h2 className="text-lg font-semibold text-white mb-5 flex items-center gap-2">
+   540→          <AlertTriangle className="w-5 h-5 text-red-400" />
+   541→          Cost Anomalies
+   542→        </h2>
+   543→
+   544→        {costAnomalies.length > 0 ? (
+   545→          <div className="space-y-3">
+   546→            {costAnomalies.map((anomaly) => {
+   547→              const severityColors: Record<string, { bg: string; text: string }> = {
+   548→                low: { bg: 'bg-blue-500/10', text: 'text-blue-400' },
+   549→                medium: { bg: 'bg-yellow-500/10', text: 'text-yellow-400' },
+   550→                high: { bg: 'bg-red-500/10', text: 'text-red-400' },
+   551→              };
+   552→              const severity = severityColors[anomaly.severity] || severityColors.medium;
+   553→              const deviationPct = anomaly.expectedCost > 0
+   554→                ? ((anomaly.actualCost - anomaly.expectedCost) / anomaly.expectedCost * 100).toFixed(0)
+   555→                : '—';
+   556→
+   557→              return (
+   558→                <div key={anomaly.id} className="p-4 rounded-xl bg-gray-800/30 border border-gray-700/50">
+   559→                  <div className="flex items-center justify-between mb-2">
+   560→                    <div className="flex items-center gap-2">
+   561→                      <span className={cn('px-2 py-0.5 rounded-full text-xs font-medium', severity.bg, severity.text)}>
+   562→                        {anomaly.severity}
+   563→                      </span>
+   564→                      <span className="text-sm font-medium text-white">{anomaly.agentId}</span>
+   565→                      <span className="text-xs text-gray-600">{anomaly.type}</span>
+   566→                    </div>
+   567→                    <span className="text-xs text-gray-600">
+   568→                      {new Date(anomaly.detectedAt).toLocaleString()}
+   569→                    </span>
+   570→                  </div>
+   571→                  <div className="grid grid-cols-3 gap-4 text-sm">
+   572→                    <div>
+   573→                      <p className="text-xs text-gray-500">Expected</p>
+   574→                      <p className="font-mono text-gray-300">${anomaly.expectedCost.toFixed(2)}</p>
+   575→                    </div>
+   576→                    <div>
+   577→                      <p className="text-xs text-gray-500">Actual</p>
+   578→                      <p className="font-mono text-red-400">${anomaly.actualCost.toFixed(2)}</p>
+   579→                    </div>
+   580→                    <div>
+   581→                      <p className="text-xs text-gray-500">Deviation</p>
+   582→                      <p className="font-mono text-red-400">+{deviationPct}%</p>
+   583→                    </div>
+   584→                  </div>
+   585→                </div>
+   586→              );
+   587→            })}
+   588→          </div>
+   589→        ) : (
+   590→          <div className="flex items-center justify-center py-8 text-gray-600">
+   591→            <div className="text-center">
+   592→              <CheckCircle className="w-10 h-10 mx-auto mb-3 opacity-30" />
+   593→              <p>No cost anomalies detected</p>
+   594→              <p className="text-sm mt-1">All agent costs are within expected ranges</p>
+   595→            </div>
+   596→          </div>
+   597→        )}
+   598→      </section>
+   599→    </div>
+   600→  );
+   601→}
+   602→

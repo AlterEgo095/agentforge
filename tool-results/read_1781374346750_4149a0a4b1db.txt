@@ -1,0 +1,1333 @@
+     1→// ============================================================
+     2→// AgentForge - Recherche Agent Worker
+     3→// Deep research agent with web search, synthesis, and reporting.
+     4→// Extends BaseAgentWorker to implement a full research pipeline:
+     5→//   Query Classification → Search Strategy → Source Discovery →
+     6→//   Finding Extraction → Cross-Reference → Synthesis → Report
+     7→// ============================================================
+     8→
+     9→import { BaseAgentWorker } from './BaseAgentWorker';
+    10→import type { QualityReport } from './BaseAgentWorker';
+    11→import { v4 as uuidv4 } from 'uuid';
+    12→
+    13→// ─── Output & Supporting Types ─────────────────────────────
+    14→
+    15→export interface RechercheSection {
+    16→  id: string;
+    17→  heading: string;
+    18→  content: string; // 150+ words per section
+    19→  sourceIds: string[];
+    20→  confidence: number; // 0-1
+    21→  type: 'overview' | 'methodology' | 'findings' | 'analysis' | 'conclusion' | 'gaps' | 'recommendations';
+    22→}
+    23→
+    24→export type RechercheSourceType = 'academic' | 'news' | 'blog' | 'documentation' | 'social' | 'government' | 'other';
+    25→export type RechercheSourceCredibility = 'high' | 'medium' | 'low';
+    26→
+    27→export interface RechercheSource {
+    28→  id: string;
+    29→  title: string;
+    30→  url: string;
+    31→  type: RechercheSourceType;
+    32→  credibility: RechercheSourceCredibility;
+    33→  relevance: number; // 0-1
+    34→  snippet: string;
+    35→  publishedDate?: string;
+    36→  keyClaims: string[];
+    37→}
+    38→
+    39→export type RechercheFindingConsensus = 'strong' | 'moderate' | 'weak' | 'disputed';
+    40→export type RechercheFindingType = 'fact' | 'opinion' | 'trend' | 'statistic' | 'claim';
+    41→
+    42→export interface RechercheFinding {
+    43→  id: string;
+    44→  statement: string;
+    45→  evidence: string[];
+    46→  confidence: number; // 0-1
+    47→  sourceIds: string[];
+    48→  consensus: RechercheFindingConsensus;
+    49→  type: RechercheFindingType;
+    50→}
+    51→
+    52→export interface SourceComparison {
+    53→  sources: string[]; // source IDs
+    54→  agreements: string[];
+    55→  disagreements: string[];
+    56→  similarity: number; // 0-1
+    57→}
+    58→
+    59→export type RechercheReferenceFormat = 'apa' | 'mla' | 'chicago' | 'bibtex';
+    60→
+    61→export interface RechercheReference {
+    62→  id: string;
+    63→  sourceId: string;
+    64→  format: RechercheReferenceFormat;
+    65→  citation: string;
+    66→}
+    67→
+    68→export type RechercheTemporalFocus = 'historical' | 'recent' | 'current' | 'future';
+    69→export type RechercheSentiment = 'positive' | 'neutral' | 'negative' | 'mixed';
+    70→
+    71→export interface RechercheClassification {
+    72→  primaryTopic: string;
+    73→  domain: string;
+    74→  subTopics: string[];
+    75→  entities: { name: string; type: string }[];
+    76→  temporalFocus: RechercheTemporalFocus;
+    77→  sentiment: RechercheSentiment;
+    78→}
+    79→
+    80→export interface RechercheOutput {
+    81→  title: string;
+    82→  query: string;
+    83→  executiveSummary: string;
+    84→  sections: RechercheSection[];
+    85→  sources: RechercheSource[];
+    86→  findings: RechercheFinding[];
+    87→  comparisons: SourceComparison[];
+    88→  references: RechercheReference[];
+    89→  classification: RechercheClassification;
+    90→  gaps: string[];
+    91→  metadata: {
+    92→    sourceCount: number;
+    93→    findingCount: number;
+    94→    confidenceLevel: number;
+    95→    depthLevel: number;
+    96→    searchEnginesUsed: string[];
+    97→  };
+    98→}
+    99→
+   100→// ─── Internal Pipeline Types ───────────────────────────────
+   101→
+   102→interface SearchStrategy {
+   103→  keywords: string[];
+   104→  engines: string[];
+   105→  depth: number; // 1-5
+   106→  maxSources: number;
+   107→  minRelevance: number;
+   108→  language: string;
+   109→  dateRange?: { from: string; to: string };
+   110→}
+   111→
+   112→// ─── Recherche Agent Worker ────────────────────────────────
+   113→
+   114→export class RechercheAgentWorker extends BaseAgentWorker<RechercheOutput> {
+   115→
+   116→  constructor() {
+   117→    super('RECHERCHE');
+   118→  }
+   119→
+   120→  // ─── Core Pipeline: generate() ─────────────────────────
+   121→
+   122→  protected async generate(
+   123→    prompt: string,
+   124→    context: Record<string, unknown>,
+   125→    sessionId: string,
+   126→  ): Promise<RechercheOutput> {
+   127→    // ── Step 1: Parse & Classify the Query ──
+   128→    this.emitEvent('research_query', sessionId, { query: prompt });
+   129→    const classification = this.classifyQuery(prompt);
+   130→
+   131→    // ── Step 2: Plan Search Strategy ──
+   132→    const depth = typeof context.depth === 'number' ? context.depth : 3;
+   133→    const strategy = this.planSearchStrategy(classification, depth);
+   134→
+   135→    // ── Step 3: Simulate Web Search (generate structured search results) ──
+   136→    this.emitEvent('research_search', sessionId, {
+   137→      engines: strategy.engines,
+   138→      keywords: strategy.keywords,
+   139→      depth: strategy.depth,
+   140→    });
+   141→    const sources = this.generateSources(prompt, strategy);
+   142→
+   143→    // ── Step 4: Extract Findings from Sources ──
+   144→    this.emitEvent('research_extract', sessionId, {
+   145→      sourceCount: sources.length,
+   146→    });
+   147→    const findings = this.extractFindings(sources);
+   148→
+   149→    // ── Step 5: Cross-Reference & Compare Sources ──
+   150→    const comparisons = this.compareSources(sources);
+   151→
+   152→    // ── Step 6: Synthesize — Executive Summary & Sections ──
+   153→    this.emitEvent('research_synthesize', sessionId, {
+   154→      findingCount: findings.length,
+   155→      comparisonCount: comparisons.length,
+   156→    });
+   157→    const executiveSummary = this.synthesizeSummary(prompt, classification, findings, comparisons);
+   158→    const sections = this.synthesizeSections(prompt, classification, sources, findings, comparisons);
+   159→
+   160→    // ── Step 7: Identify Knowledge Gaps ──
+   161→    const gaps = this.identifyGaps(findings, sources);
+   162→
+   163→    // ── Step 8: Format References in Multiple Citation Styles ──
+   164→    const references = this.generateCitations(sources, 'all');
+   165→
+   166→    // ── Step 9: Assemble Output & Emit Report ──
+   167→    const confidenceLevel = this.computeConfidenceLevel(findings, sources);
+   168→
+   169→    const output: RechercheOutput = {
+   170→      title: this.generateTitle(prompt, classification),
+   171→      query: prompt,
+   172→      executiveSummary,
+   173→      sections,
+   174→      sources,
+   175→      findings,
+   176→      comparisons,
+   177→      references,
+   178→      classification,
+   179→      gaps,
+   180→      metadata: {
+   181→        sourceCount: sources.length,
+   182→        findingCount: findings.length,
+   183→        confidenceLevel,
+   184→        depthLevel: strategy.depth,
+   185→        searchEnginesUsed: strategy.engines,
+   186→      },
+   187→    };
+   188→
+   189→    this.emitEvent('research_report', sessionId, {
+   190→      title: output.title,
+   191→      sectionCount: sections.length,
+   192→      sourceCount: sources.length,
+   193→      findingCount: findings.length,
+   194→      confidenceLevel,
+   195→    });
+   196→
+   197→    return output;
+   198→  }
+   199→
+   200→  // ─── Quality Validation: validateOutput() ──────────────
+   201→
+   202→  protected async validateOutput(output: RechercheOutput, prompt: string): Promise<QualityReport> {
+   203→    const suggestions: string[] = [];
+   204→
+   205→    // 1. Source Quality (0-1): Checks credibility distribution
+   206→    const sourceQuality = this.scoreSourceQuality(output, suggestions);
+   207→
+   208→    // 2. Comprehensiveness (0-1): Checks section coverage
+   209→    const comprehensiveness = this.scoreComprehensiveness(output, suggestions);
+   210→
+   211→    // 3. Accuracy (0-1): Checks confidence levels and evidence
+   212→    const accuracy = this.scoreAccuracy(output, suggestions);
+   213→
+   214→    // 4. Synthesis (0-1): Validates cross-references between sources
+   215→    const synthesis = this.scoreSynthesis(output, suggestions);
+   216→
+   217→    // 5. Presentation (0-1): Validates structure and formatting
+   218→    const presentation = this.scorePresentation(output, prompt, suggestions);
+   219→
+   220→    const dimensions: Record<string, number> = {
+   221→      'Source Quality': sourceQuality,
+   222→      'Comprehensiveness': comprehensiveness,
+   223→      'Accuracy': accuracy,
+   224→      'Synthesis': synthesis,
+   225→      'Presentation': presentation,
+   226→    };
+   227→
+   228→    const overall = this.computeWeightedScore(dimensions);
+   229→    const passed = this.isQualityPassing(overall);
+   230→
+   231→    return { overall, dimensions, passed, suggestions };
+   232→  }
+   233→
+   234→  // ─── Render: renderOutput() ────────────────────────────
+   235→
+   236→  protected async renderOutput(output: RechercheOutput, format?: string): Promise<unknown> {
+   237→    switch (format) {
+   238→      case 'summary':
+   239→        return {
+   240→          title: output.title,
+   241→          query: output.query,
+   242→          executiveSummary: output.executiveSummary,
+   243→          confidenceLevel: output.metadata.confidenceLevel,
+   244→          sourceCount: output.metadata.sourceCount,
+   245→          findingCount: output.metadata.findingCount,
+   246→          gaps: output.gaps,
+   247→        };
+   248→
+   249→      case 'markdown':
+   250→        return this.renderMarkdown(output);
+   251→
+   252→      case 'academic':
+   253→        return this.renderAcademic(output);
+   254→
+   255→      default:
+   256→        // JSON with full research report
+   257→        return output;
+   258→    }
+   259→  }
+   260→
+   261→  // ─── Helper: classifyQuery() ───────────────────────────
+   262→
+   263→  private classifyQuery(query: string): RechercheClassification {
+   264→    const queryLower = query.toLowerCase();
+   265→
+   266→    // Domain detection
+   267→    const domainMap: Record<string, string> = {
+   268→      'ai|machine learning|neural|model|gpt|llm': 'artificial-intelligence',
+   269→      'climate|carbon|emission|environment|sustainability': 'environment',
+   270→      'health|medical|disease|treatment|clinical': 'healthcare',
+   271→      'finance|stock|market|investment|crypto|bitcoin': 'finance',
+   272→      'education|learning|school|university|curriculum': 'education',
+   273→      'law|legal|regulation|compliance|policy': 'legal',
+   274→      'tech|software|hardware|startup|silicon': 'technology',
+   275→      'science|research|study|experiment|peer-review': 'science',
+   276→      'politics|government|election|democracy|policy': 'politics',
+   277→      'business|company|corporate|strategy|management': 'business',
+   278→    };
+   279→
+   280→    let domain = 'general';
+   281→    for (const [pattern, d] of Object.entries(domainMap)) {
+   282→      if (new RegExp(pattern, 'i').test(queryLower)) {
+   283→        domain = d;
+   284→        break;
+   285→      }
+   286→    }
+   287→
+   288→    // Primary topic: use the first meaningful noun phrase from the query
+   289→    const primaryTopic = query.replace(/[?!.]/g, '').trim();
+   290→
+   291→    // Sub-topics: extract potential sub-areas from the query
+   292→    const subTopics = this.extractSubTopics(query);
+   293→
+   294→    // Entity extraction (basic pattern matching)
+   295→    const entities = this.extractEntities(query);
+   296→
+   297→    // Temporal focus detection
+   298→    let temporalFocus: RechercheTemporalFocus = 'current';
+   299→    if (/\b(history|historical|origin|past|evolution of)\b/i.test(queryLower)) {
+   300→      temporalFocus = 'historical';
+   301→    } else if (/\b(recent|latest|new|2024|2025|this year)\b/i.test(queryLower)) {
+   302→      temporalFocus = 'recent';
+   303→    } else if (/\b(future|predict|forecast|outlook|trend|2030|2040)\b/i.test(queryLower)) {
+   304→      temporalFocus = 'future';
+   305→    }
+   306→
+   307→    // Sentiment detection
+   308→    let sentiment: RechercheSentiment = 'neutral';
+   309→    if (/\b(benefit|improve|advance|progress|opportunity|positive|growth)\b/i.test(queryLower)) {
+   310→      sentiment = 'positive';
+   311→    } else if (/\b(risk|danger|threat|crisis|negative|decline|problem)\b/i.test(queryLower)) {
+   312→      sentiment = 'negative';
+   313→    } else if (/\b(vs|versus|debate|controversy|compare|pros.*cons)\b/i.test(queryLower)) {
+   314→      sentiment = 'mixed';
+   315→    }
+   316→
+   317→    return {
+   318→      primaryTopic,
+   319→      domain,
+   320→      subTopics,
+   321→      entities,
+   322→      temporalFocus,
+   323→      sentiment,
+   324→    };
+   325→  }
+   326→
+   327→  // ─── Helper: planSearchStrategy() ──────────────────────
+   328→
+   329→  private planSearchStrategy(classification: RechercheClassification, depth: number): SearchStrategy {
+   330→    const engines = ['duckduckgo', 'google'];
+   331→    if (classification.domain === 'academic' || classification.domain === 'science') {
+   332→      engines.push('scholar', 'semantic-scholar');
+   333→    }
+   334→    if (classification.domain === 'news' || classification.temporalFocus === 'recent' || classification.temporalFocus === 'current') {
+   335→      engines.push('news');
+   336→    }
+   337→
+   338→    const maxSources = 5 + depth * 5; // depth 1=10, 3=20, 5=30
+   339→    const minRelevance = Math.max(0.3, 0.7 - depth * 0.08); // deeper research accepts lower relevance
+   340→
+   341→    // Generate keyword variations
+   342→    const keywords = [
+   343→      classification.primaryTopic,
+   344→      ...classification.subTopics.slice(0, depth),
+   345→      ...classification.entities.slice(0, 2).map(e => e.name),
+   346→    ];
+   347→
+   348→    return {
+   349→      keywords,
+   350→      engines: Array.from(new Set(engines)),
+   351→      depth,
+   352→      maxSources,
+   353→      minRelevance,
+   354→      language: 'en',
+   355→    };
+   356→  }
+   357→
+   358→  // ─── Helper: generateSources() ─────────────────────────
+   359→  // Simulates source discovery. In production, this would integrate
+   360→  // with the ResearchWorker plugin's browser-based search.
+   361→
+   362→  private generateSources(query: string, strategy: SearchStrategy): RechercheSource[] {
+   363→    const sources: RechercheSource[] = [];
+   364→    const sourceCount = Math.min(strategy.maxSources, 8 + strategy.depth * 3);
+   365→
+   366→    const typeDistribution: RechercheSourceType[] = ['academic', 'news', 'blog', 'documentation', 'government', 'social', 'other'];
+   367→    const credibilityOptions: RechercheSourceCredibility[] = ['high', 'medium', 'low'];
+   368→
+   369→    for (let i = 0; i < sourceCount; i++) {
+   370→      const id = `src_${uuidv4().slice(0, 8)}`;
+   371→      const type = typeDistribution[i % typeDistribution.length];
+   372→      const credibility = credibilityOptions[i < sourceCount * 0.4 ? 0 : i < sourceCount * 0.8 ? 1 : 2];
+   373→      const relevance = Math.max(strategy.minRelevance, 0.5 + Math.random() * 0.5);
+   374→
+   375→      sources.push({
+   376→        id,
+   377→        title: this.simulateSourceTitle(query, type, i),
+   378→        url: this.simulateSourceUrl(query, type, i),
+   379→        type,
+   380→        credibility,
+   381→        relevance: Math.round(relevance * 100) / 100,
+   382→        snippet: this.simulateSnippet(query, type, i),
+   383→        publishedDate: this.simulateDate(strategy.depth),
+   384→        keyClaims: this.simulateKeyClaims(query, type, i),
+   385→      });
+   386→    }
+   387→
+   388→    // Sort by relevance descending
+   389→    return sources.sort((a, b) => b.relevance - a.relevance);
+   390→  }
+   391→
+   392→  // ─── Helper: extractFindings() ─────────────────────────
+   393→
+   394→  private extractFindings(sources: RechercheSource[]): RechercheFinding[] {
+   395→    const findings: RechercheFinding[] = [];
+   396→
+   397→    for (const source of sources) {
+   398→      for (let c = 0; c < source.keyClaims.length; c++) {
+   399→        const claim = source.keyClaims[c];
+   400→        const id = `find_${uuidv4().slice(0, 8)}`;
+   401→
+   402→        // Determine finding type from claim content
+   403→        const type = this.inferFindingType(claim);
+   404→
+   405→        // Determine consensus based on source credibility and claim nature
+   406→        const consensus = this.inferConsensus(source.credibility, claim);
+   407→
+   408→        // Confidence influenced by source credibility and relevance
+   409→        const credibilityMultiplier = source.credibility === 'high' ? 0.85 : source.credibility === 'medium' ? 0.65 : 0.45;
+   410→        const confidence = Math.min(1, Math.round((credibilityMultiplier * source.relevance + Math.random() * 0.15) * 100) / 100);
+   411→
+   412→        findings.push({
+   413→          id,
+   414→          statement: claim,
+   415→          evidence: [`Supported by ${source.title}`, `Source relevance: ${(source.relevance * 100).toFixed(0)}%`],
+   416→          confidence,
+   417→          sourceIds: [source.id],
+   418→          consensus,
+   419→          type,
+   420→        });
+   421→      }
+   422→    }
+   423→
+   424→    // Deduplicate similar findings (merge sourceIds for matching statements)
+   425→    return this.deduplicateFindings(findings);
+   426→  }
+   427→
+   428→  // ─── Helper: compareSources() ──────────────────────────
+   429→
+   430→  private compareSources(sources: RechercheSource[]): SourceComparison[] {
+   431→    const comparisons: SourceComparison[] = [];
+   432→
+   433→    // Compare pairs of sources (limit to avoid combinatorial explosion)
+   434→    const limit = Math.min(sources.length, 8);
+   435→    for (let i = 0; i < limit; i++) {
+   436→      for (let j = i + 1; j < limit; j++) {
+   437→        const srcA = sources[i];
+   438→        const srcB = sources[j];
+   439→
+   440→        const agreements = this.findAgreements(srcA, srcB);
+   441→        const disagreements = this.findDisagreements(srcA, srcB);
+   442→
+   443→        // Similarity based on shared claims and overlapping topics
+   444→        const totalClaims = srcA.keyClaims.length + srcB.keyClaims.length;
+   445→        const sharedClaims = agreements.length;
+   446→        const similarity = totalClaims > 0
+   447→          ? Math.round((2 * sharedClaims / totalClaims) * 100) / 100
+   448→          : 0;
+   449→
+   450→        if (agreements.length > 0 || disagreements.length > 0) {
+   451→          comparisons.push({
+   452→            sources: [srcA.id, srcB.id],
+   453→            agreements,
+   454→            disagreements,
+   455→            similarity,
+   456→          });
+   457→        }
+   458→      }
+   459→    }
+   460→
+   461→    return comparisons;
+   462→  }
+   463→
+   464→  // ─── Helper: generateCitations() ───────────────────────
+   465→
+   466→  private generateCitations(sources: RechercheSource[], format: string): RechercheReference[] {
+   467→    const references: RechercheReference[] = [];
+   468→    const formats: RechercheReferenceFormat[] = format === 'all'
+   469→      ? ['apa', 'mla', 'chicago', 'bibtex']
+   470→      : [format as RechercheReferenceFormat];
+   471→
+   472→    for (const source of sources) {
+   473→      for (const fmt of formats) {
+   474→        const id = `ref_${uuidv4().slice(0, 8)}`;
+   475→        const citation = this.formatCitation(source, fmt);
+   476→        references.push({
+   477→          id,
+   478→          sourceId: source.id,
+   479→          format: fmt,
+   480→          citation,
+   481→        });
+   482→      }
+   483→    }
+   484→
+   485→    return references;
+   486→  }
+   487→
+   488→  // ─── Helper: identifyGaps() ────────────────────────────
+   489→
+   490→  private identifyGaps(findings: RechercheFinding[], sources: RechercheSource[]): string[] {
+   491→    const gaps: string[] = [];
+   492→
+   493→    // Gap: insufficient source diversity
+   494→    const types = new Set(sources.map(s => s.type));
+   495→    if (types.size < 3) {
+   496→      gaps.push('Limited source type diversity — research would benefit from broader source categories (academic, government, news)');
+   497→    }
+   498→
+   499→    // Gap: low-confidence findings
+   500→    const lowConfidence = findings.filter(f => f.confidence < 0.5);
+   501→    if (lowConfidence.length > findings.length * 0.3) {
+   502→      gaps.push('Many findings have low confidence — additional verification from authoritative sources is needed');
+   503→    }
+   504→
+   505→    // Gap: disputed findings
+   506→    const disputed = findings.filter(f => f.consensus === 'disputed');
+   507→    if (disputed.length > 0) {
+   508→      gaps.push(`${disputed.length} finding(s) are disputed across sources — further investigation required to resolve contradictions`);
+   509→    }
+   510→
+   511→    // Gap: temporal coverage
+   512→    const hasRecent = sources.some(s => {
+   513→      if (!s.publishedDate) return false;
+   514→      const year = new Date(s.publishedDate).getFullYear();
+   515→      return year >= 2024;
+   516→    });
+   517→    if (!hasRecent) {
+   518→      gaps.push('No recent sources (2024+) found — current data may be outdated for the topic');
+   519→    }
+   520→
+   521→    // Gap: missing academic/peer-reviewed sources
+   522→    const hasAcademic = sources.some(s => s.type === 'academic');
+   523→    if (!hasAcademic) {
+   524→      gaps.push('No peer-reviewed academic sources — adding scholarly research would strengthen evidence');
+   525→    }
+   526→
+   527→    // Gap: insufficient cross-referencing
+   528→    const multiSource = findings.filter(f => f.sourceIds.length > 1);
+   529→    if (multiSource.length < findings.length * 0.3) {
+   530→      gaps.push('Most findings are supported by only a single source — cross-validation from additional sources is recommended');
+   531→    }
+   532→
+   533→    // Gap: opinion-heavy research
+   534→    const opinions = findings.filter(f => f.type === 'opinion');
+   535→    if (opinions.length > findings.length * 0.5) {
+   536→      gaps.push('Research is opinion-dominant — more factual and statistical evidence is needed for a balanced report');
+   537→    }
+   538→
+   539→    // Always include a forward-looking gap
+   540→    gaps.push('Further research is recommended to track evolving developments on this topic');
+   541→
+   542→    return gaps;
+   543→  }
+   544→
+   545→  // ─── Helper: renderMarkdown() ──────────────────────────
+   546→
+   547→  private renderMarkdown(output: RechercheOutput): string {
+   548→    const lines: string[] = [];
+   549→
+   550→    // Title
+   551→    lines.push(`# ${output.title}`);
+   552→    lines.push('');
+   553→
+   554→    // Metadata
+   555→    lines.push(`> **Query**: ${output.query}`);
+   556→    lines.push(`> **Domain**: ${output.classification.domain}`);
+   557→    lines.push(`> **Confidence**: ${(output.metadata.confidenceLevel * 100).toFixed(0)}%`);
+   558→    lines.push(`> **Sources**: ${output.metadata.sourceCount} | **Findings**: ${output.metadata.findingCount}`);
+   559→    lines.push('');
+   560→
+   561→    // Executive Summary
+   562→    lines.push('## Executive Summary');
+   563→    lines.push('');
+   564→    lines.push(output.executiveSummary);
+   565→    lines.push('');
+   566→
+   567→    // Sections
+   568→    for (const section of output.sections) {
+   569→      lines.push(`## ${section.heading}`);
+   570→      lines.push('');
+   571→      lines.push(section.content);
+   572→      lines.push('');
+   573→
+   574→      if (section.sourceIds.length > 0) {
+   575→        const sourceRefs = section.sourceIds
+   576→          .map(sid => {
+   577→            const src = output.sources.find(s => s.id === sid);
+   578→            return src ? `[${src.title}](${src.url})` : sid;
+   579→          })
+   580→          .join(', ');
+   581→        lines.push(`*Sources: ${sourceRefs}*`);
+   582→        lines.push('');
+   583→      }
+   584→
+   585→      lines.push(`*Confidence: ${(section.confidence * 100).toFixed(0)}%*`);
+   586→      lines.push('');
+   587→    }
+   588→
+   589→    // Knowledge Gaps
+   590→    if (output.gaps.length > 0) {
+   591→      lines.push('## Knowledge Gaps');
+   592→      lines.push('');
+   593→      for (const gap of output.gaps) {
+   594→        lines.push(`- ${gap}`);
+   595→      }
+   596→      lines.push('');
+   597→    }
+   598→
+   599→    // Sources
+   600→    lines.push('## Sources');
+   601→    lines.push('');
+   602→    for (const source of output.sources) {
+   603→      const credibilityBadge = source.credibility === 'high' ? '✓' : source.credibility === 'medium' ? '~' : '!';
+   604→      lines.push(`- ${credibilityBadge} **${source.title}** — ${source.url} _(${source.type}, relevance: ${(source.relevance * 100).toFixed(0)}%)_`);
+   605→    }
+   606→    lines.push('');
+   607→
+   608→    // References
+   609→    const apaRefs = output.references.filter(r => r.format === 'apa');
+   610→    if (apaRefs.length > 0) {
+   611→      lines.push('## References (APA)');
+   612→      lines.push('');
+   613→      for (const ref of apaRefs) {
+   614→        lines.push(`1. ${ref.citation}`);
+   615→      }
+   616→      lines.push('');
+   617→    }
+   618→
+   619→    return lines.join('\n');
+   620→  }
+   621→
+   622→  // ─── Helper: renderAcademic() ──────────────────────────
+   623→
+   624→  private renderAcademic(output: RechercheOutput): unknown {
+   625→    return {
+   626→      paper: {
+   627→        title: output.title,
+   628→        abstract: output.executiveSummary,
+   629→        sections: output.sections.map(section => ({
+   630→          heading: section.heading,
+   631→          content: section.content,
+   632→          confidence: section.confidence,
+   633→        })),
+   634→        references: output.references
+   635→          .filter(r => r.format === 'apa')
+   636→          .map(r => r.citation),
+   637→        keywords: [
+   638→          output.classification.primaryTopic,
+   639→          ...output.classification.subTopics,
+   640→        ],
+   641→        classification: {
+   642→          domain: output.classification.domain,
+   643→          entities: output.classification.entities.map(e => e.name),
+   644→          temporalFocus: output.classification.temporalFocus,
+   645→        },
+   646→        methodology: output.sections.find(s => s.type === 'methodology')?.content ?? 'Research conducted via systematic source analysis and cross-referencing.',
+   647→        limitations: output.gaps,
+   648→        metadata: {
+   649→          sourceCount: output.metadata.sourceCount,
+   650→          findingCount: output.metadata.findingCount,
+   651→          confidenceLevel: output.metadata.confidenceLevel,
+   652→        },
+   653→      },
+   654→    };
+   655→  }
+   656→
+   657→  // ─── Quality Scoring Sub-methods ───────────────────────
+   658→
+   659→  private scoreSourceQuality(output: RechercheOutput, suggestions: string[]): number {
+   660→    if (output.sources.length === 0) {
+   661→      suggestions.push('No sources found — research cannot be validated');
+   662→      return 0;
+   663→    }
+   664→
+   665→    let score = 0;
+   666→
+   667→    // Credibility distribution (high credibility should dominate)
+   668→    const highCred = output.sources.filter(s => s.credibility === 'high').length;
+   669→    const medCred = output.sources.filter(s => s.credibility === 'medium').length;
+   670→    const lowCred = output.sources.filter(s => s.credibility === 'low').length;
+   671→    const total = output.sources.length;
+   672→
+   673→    const highRatio = highCred / total;
+   674→    const lowRatio = lowCred / total;
+   675→
+   676→    // Reward high-credibility sources, penalize low-credibility
+   677→    score += Math.min(0.4, highRatio * 0.5);
+   678→    score += Math.min(0.2, (medCred / total) * 0.25);
+   679→    score -= Math.min(0.2, lowRatio * 0.3);
+   680→
+   681→    // Source type diversity
+   682→const uniqueTypes = Array.from(new Set(output.sources.map(s => s.type))).length;
+   683→    score += Math.min(0.2, uniqueTypes * 0.04);
+   684→
+   685→    // Average relevance
+   686→    const avgRelevance = output.sources.reduce((sum, s) => sum + s.relevance, 0) / total;
+   687→    score += Math.min(0.2, avgRelevance * 0.2);
+   688→
+   689→    if (highRatio < 0.2) {
+   690→      suggestions.push('Increase the proportion of high-credibility sources (academic, government)');
+   691→    }
+   692→    if (uniqueTypes < 3) {
+   693→      suggestions.push('Diversify source types for more balanced research');
+   694→    }
+   695→
+   696→    return Math.max(0, Math.min(1, Math.round(score * 100) / 100));
+   697→  }
+   698→
+   699→  private scoreComprehensiveness(output: RechercheOutput, suggestions: string[]): number {
+   700→    let score = 0;
+   701→
+   702→    // Section type coverage
+   703→    const requiredTypes: RechercheSection['type'][] = ['overview', 'findings', 'analysis', 'conclusion'];
+   704→    const presentTypes = new Set(output.sections.map(s => s.type));
+   705→    const coverageRatio = requiredTypes.filter(t => presentTypes.has(t)).length / requiredTypes.length;
+   706→    score += coverageRatio * 0.4;
+   707→
+   708→    // Section depth (word count per section)
+   709→    const avgWords = output.sections.reduce((sum, s) => sum + s.content.split(/\s+/).length, 0) / Math.max(output.sections.length, 1);
+   710→    if (avgWords >= 150) {
+   711→      score += 0.2;
+   712→    } else if (avgWords >= 100) {
+   713→      score += 0.1;
+   714→      suggestions.push('Sections should contain at least 150 words for thorough coverage');
+   715→    }
+   716→
+   717→    // Source count adequacy
+   718→    if (output.metadata.sourceCount >= 8) {
+   719→      score += 0.2;
+   720→    } else if (output.metadata.sourceCount >= 4) {
+   721→      score += 0.1;
+   722→      suggestions.push('Consider adding more sources for comprehensive coverage');
+   723→    }
+   724→
+   725→    // Finding count
+   726→    if (output.metadata.findingCount >= 5) {
+   727→      score += 0.1;
+   728→    } else if (output.metadata.findingCount >= 2) {
+   729→      score += 0.05;
+   730→    }
+   731→
+   732→    // Gaps identified
+   733→    if (output.gaps.length >= 2) {
+   734→      score += 0.1;
+   735→    }
+   736→
+   737→    if (coverageRatio < 1) {
+   738→      const missing = requiredTypes.filter(t => !presentTypes.has(t));
+   739→      suggestions.push(`Add missing section types: ${missing.join(', ')}`);
+   740→    }
+   741→
+   742→    return Math.max(0, Math.min(1, Math.round(score * 100) / 100));
+   743→  }
+   744→
+   745→  private scoreAccuracy(output: RechercheOutput, suggestions: string[]): number {
+   746→    if (output.findings.length === 0) {
+   747→      suggestions.push('No findings extracted — accuracy cannot be assessed');
+   748→      return 0;
+   749→    }
+   750→
+   751→    let score = 0;
+   752→
+   753→    // Average finding confidence
+   754→    const avgConfidence = output.findings.reduce((sum, f) => sum + f.confidence, 0) / output.findings.length;
+   755→    score += avgConfidence * 0.3;
+   756→
+   757→    // Evidence backing per finding
+   758→    const avgEvidence = output.findings.reduce((sum, f) => sum + f.evidence.length, 0) / output.findings.length;
+   759→    score += Math.min(0.25, avgEvidence * 0.08);
+   760→
+   761→    // Multi-source validation
+   762→    const multiSourceFindings = output.findings.filter(f => f.sourceIds.length > 1).length;
+   763→    const multiSourceRatio = multiSourceFindings / output.findings.length;
+   764→    score += multiSourceRatio * 0.25;
+   765→
+   766→    // Disputed findings penalty
+   767→    const disputedRatio = output.findings.filter(f => f.consensus === 'disputed').length / output.findings.length;
+   768→    score -= disputedRatio * 0.15;
+   769→
+   770→    // Strong consensus bonus
+   771→    const strongConsensusRatio = output.findings.filter(f => f.consensus === 'strong').length / output.findings.length;
+   772→    score += strongConsensusRatio * 0.1;
+   773→
+   774→    if (avgConfidence < 0.5) {
+   775→      suggestions.push('Average finding confidence is below 50% — verify sources and claims');
+   776→    }
+   777→    if (disputedRatio > 0.3) {
+   778→      suggestions.push('High proportion of disputed findings — resolve contradictions or present them clearly');
+   779→    }
+   780→
+   781→    return Math.max(0, Math.min(1, Math.round(score * 100) / 100));
+   782→  }
+   783→
+   784→  private scoreSynthesis(output: RechercheOutput, suggestions: string[]): number {
+   785→    let score = 0;
+   786→
+   787→    // Cross-references: sections that reference multiple sources
+   788→    const multiRefSections = output.sections.filter(s => s.sourceIds.length > 1).length;
+   789→    const sectionRatio = output.sections.length > 0 ? multiRefSections / output.sections.length : 0;
+   790→    score += Math.min(0.3, sectionRatio * 0.4);
+   791→
+   792→    // Comparisons between sources
+   793→    if (output.comparisons.length > 0) {
+   794→      score += Math.min(0.3, output.comparisons.length * 0.1);
+   795→    } else {
+   796→      suggestions.push('No source comparisons generated — add cross-referencing between sources');
+   797→    }
+   798→
+   799→    // Executive summary references findings
+   800→    if (output.executiveSummary.length > 100) {
+   801→      score += 0.2;
+   802→    } else {
+   803→      suggestions.push('Executive summary is too brief — synthesize key findings more thoroughly');
+   804→    }
+   805→
+   806→    // Findings linked to sections
+   807→    const findingsReferenced = output.sections.some(s =>
+   808→      s.type === 'findings' || s.type === 'analysis'
+   809→    );
+   810→    if (findingsReferenced) {
+   811→      score += 0.2;
+   812→    } else {
+   813→      suggestions.push('Add a dedicated findings or analysis section to synthesize research results');
+   814→    }
+   815→
+   816→    return Math.max(0, Math.min(1, Math.round(score * 100) / 100));
+   817→  }
+   818→
+   819→  private scorePresentation(output: RechercheOutput, prompt: string, suggestions: string[]): number {
+   820→    let score = 0;
+   821→
+   822→    // Title quality
+   823→    if (output.title && output.title.length > 5) {
+   824→      score += 0.1;
+   825→    }
+   826→
+   827→    // Structured sections
+   828→    if (output.sections.length >= 3) {
+   829→      score += 0.2;
+   830→    } else {
+   831→      suggestions.push('Report needs at least 3 sections for adequate structure');
+   832→    }
+   833→
+   834→    // Section ordering (overview should come first, conclusion last)
+   835→    const sectionTypes = output.sections.map(s => s.type);
+   836→    if (sectionTypes[0] === 'overview') {
+   837→      score += 0.1;
+   838→    }
+   839→    if (sectionTypes[sectionTypes.length - 1] === 'conclusion' || sectionTypes[sectionTypes.length - 1] === 'recommendations') {
+   840→      score += 0.1;
+   841→    }
+   842→
+   843→    // References present
+   844→    if (output.references.length > 0) {
+   845→      score += 0.15;
+   846→    } else {
+   847→      suggestions.push('No references formatted — add citations in standard academic styles');
+   848→    }
+   849→
+   850→    // Gaps identified
+   851→    if (output.gaps.length > 0) {
+   852→      score += 0.1;
+   853→    }
+   854→
+   855→    // Metadata completeness
+   856→    const meta = output.metadata;
+   857→    if (meta.sourceCount > 0 && meta.findingCount > 0 && meta.confidenceLevel > 0) {
+   858→      score += 0.15;
+   859→    } else {
+   860→      suggestions.push('Complete all metadata fields (sourceCount, findingCount, confidenceLevel)');
+   861→    }
+   862→
+   863→    // Classification present
+   864→    if (output.classification.primaryTopic && output.classification.domain) {
+   865→      score += 0.1;
+   866→    }
+   867→
+   868→    return Math.max(0, Math.min(1, Math.round(score * 100) / 100));
+   869→  }
+   870→
+   871→  // ─── Synthesis Helpers ─────────────────────────────────
+   872→
+   873→  private synthesizeSummary(
+   874→    query: string,
+   875→    classification: RechercheClassification,
+   876→    findings: RechercheFinding[],
+   877→    comparisons: SourceComparison[],
+   878→  ): string {
+   879→    const strongFindings = findings.filter(f => f.consensus === 'strong' || f.confidence >= 0.7);
+   880→    const disputedFindings = findings.filter(f => f.consensus === 'disputed');
+   881→
+   882→    const parts: string[] = [];
+   883→    parts.push(`Research on "${query}" spans the domain of ${classification.domain}, with a ${classification.temporalFocus} focus.`);
+   884→    parts.push(`The investigation identified ${findings.length} findings across ${new Set(findings.map(f => f.type)).size} categories.`);
+   885→
+   886→    if (strongFindings.length > 0) {
+   887→      parts.push(`${strongFindings.length} finding(s) have strong consensus with high confidence.`);
+   888→    }
+   889→
+   890→    if (disputedFindings.length > 0) {
+   891→      parts.push(`${disputedFindings.length} finding(s) remain disputed and require further investigation.`);
+   892→    }
+   893→
+   894→    if (comparisons.length > 0) {
+   895→      const avgSimilarity = comparisons.reduce((sum, c) => sum + c.similarity, 0) / comparisons.length;
+   896→      parts.push(`Cross-source analysis of ${comparisons.length} source pair(s) reveals an average similarity of ${(avgSimilarity * 100).toFixed(0)}%.`);
+   897→    }
+   898→
+   899→    parts.push(`Key entities identified include: ${classification.entities.slice(0, 5).map(e => e.name).join(', ') || 'none specific'}.`);
+   900→    parts.push(`Overall sentiment across sources is ${classification.sentiment}.`);
+   901→
+   902→    return parts.join(' ');
+   903→  }
+   904→
+   905→  private synthesizeSections(
+   906→    query: string,
+   907→    classification: RechercheClassification,
+   908→    sources: RechercheSource[],
+   909→    findings: RechercheFinding[],
+   910→    comparisons: SourceComparison[],
+   911→  ): RechercheSection[] {
+   912→    const sections: RechercheSection[] = [];
+   913→
+   914→    // Overview section
+   915→    sections.push({
+   916→      id: `sec_${uuidv4().slice(0, 8)}`,
+   917→      heading: 'Overview',
+   918→      content: `This research report presents a comprehensive investigation into "${query}". ` +
+   919→        `The topic falls within the ${classification.domain} domain and addresses ${classification.subTopics.length} sub-topic(s): ` +
+   920→        `${classification.subTopics.join(', ') || 'the primary subject'}. ` +
+   921→        `A total of ${sources.length} sources were analyzed, ranging from ${sources[0]?.type ?? 'various'} to ${sources[sources.length - 1]?.type ?? 'diverse'} types. ` +
+   922→        `The research was conducted with a ${classification.temporalFocus} temporal focus and the overall source sentiment is ${classification.sentiment}. ` +
+   923→        `Key entities examined include ${classification.entities.slice(0, 5).map(e => `${e.name} (${e.type})`).join(', ') || 'the primary subject area'}. ` +
+   924→        `This synthesis draws from multiple source types to provide a balanced and well-referenced analysis of the topic, ` +
+   925→        `identifying areas of consensus and disagreement across the literature.`,
+   926→      sourceIds: sources.slice(0, 3).map(s => s.id),
+   927→      confidence: 0.85,
+   928→      type: 'overview',
+   929→    });
+   930→
+   931→    // Methodology section
+   932→    sections.push({
+   933→      id: `sec_${uuidv4().slice(0, 8)}`,
+   934→      heading: 'Methodology',
+   935→      content: `The research methodology employed a systematic approach to source discovery, extraction, and cross-referencing. ` +
+   936→        `Sources were identified through multiple search engines and filtered by relevance (minimum threshold applied). ` +
+   937→        `Each source was classified by type (${Array.from(new Set(sources.map(s => s.type))).join(', ')}), credibility level, and relevance score. ` +
+   938→        `Key claims were extracted from each source and categorized as facts, opinions, trends, statistics, or claims. ` +
+   939→        `Cross-referencing was performed between source pairs to identify agreements and disagreements. ` +
+   940→        `Confidence levels were assigned based on source credibility, evidence strength, and cross-source validation. ` +
+   941→        `Findings were classified by consensus level: strong (multiple high-credibility sources agree), ` +
+   942→        `moderate (some agreement), weak (limited support), or disputed (sources disagree).`,
+   943→      sourceIds: sources.slice(0, 2).map(s => s.id),
+   944→      confidence: 0.9,
+   945→      type: 'methodology',
+   946→    });
+   947→
+   948→    // Findings section
+   949→    const highConfidenceFindings = findings.filter(f => f.confidence >= 0.6);
+   950→    const findingsContent = highConfidenceFindings.length > 0
+   951→      ? `The research yielded ${findings.length} findings, of which ${highConfidenceFindings.length} have confidence levels at or above 60%. ` +
+   952→        `Key findings include: ${highConfidenceFindings.slice(0, 5).map(f =>
+   953→          `"${f.statement}" (${f.consensus} consensus, ${(f.confidence * 100).toFixed(0)}% confidence)`
+   954→        ).join('; ')}. ` +
+   955→        `The findings span categories including ${Array.from(new Set(findings.map(f => f.type))).join(', ')}. ` +
+   956→        `Evidence for each finding was drawn from ${findings.reduce((sum, f) => sum + f.sourceIds.length, 0)} source-reference(s) in total, ` +
+   957→        `with ${findings.filter(f => f.sourceIds.length > 1).length} finding(s) supported by multiple sources.`
+   958→      : `The research identified ${findings.length} finding(s), though confidence levels are generally low. Further investigation with more authoritative sources is recommended.`;
+   959→
+   960→    sections.push({
+   961→      id: `sec_${uuidv4().slice(0, 8)}`,
+   962→      heading: 'Findings',
+   963→      content: findingsContent,
+   964→      sourceIds: highConfidenceFindings.slice(0, 5).flatMap(f => f.sourceIds),
+   965→      confidence: findings.length > 0
+   966→        ? Math.round((findings.reduce((sum, f) => sum + f.confidence, 0) / findings.length) * 100) / 100
+   967→        : 0.3,
+   968→      type: 'findings',
+   969→    });
+   970→
+   971→    // Analysis section
+   972→    const analysisContent = comparisons.length > 0
+   973→      ? `Cross-source analysis reveals ${comparisons.length} source comparison(s). ` +
+   974→        `Among these, ${comparisons.filter(c => c.similarity > 0.5).length} pair(s) show significant similarity (above 50%). ` +
+   975→        `Agreements between sources focus on: ${comparisons.flatMap(c => c.agreements).slice(0, 5).join(', ') || 'common themes'}. ` +
+   976→        `Notable disagreements include: ${comparisons.flatMap(c => c.disagreements).slice(0, 3).join(', ') || 'none significant'}. ` +
+   977→        `The average cross-source similarity is ${comparisons.length > 0 ? ((comparisons.reduce((s, c) => s + c.similarity, 0) / comparisons.length) * 100).toFixed(0) : 0}%. ` +
+   978→        `This suggests ${comparisons.filter(c => c.similarity > 0.5).length > comparisons.length / 2 ? 'strong overall agreement' : 'notable divergence'} across sources. ` +
+   979→        `Sources of higher credibility tend to converge on core facts while diverging on interpretations and predictions.`
+   980→      : `Insufficient source overlap for meaningful cross-referencing. Additional sources would enable deeper comparative analysis.`;
+   981→
+   982→    sections.push({
+   983→      id: `sec_${uuidv4().slice(0, 8)}`,
+   984→      heading: 'Analysis',
+   985→      content: analysisContent,
+   986→      sourceIds: comparisons.slice(0, 3).flatMap(c => c.sources),
+   987→      confidence: comparisons.length > 0 ? 0.75 : 0.4,
+   988→      type: 'analysis',
+   989→    });
+   990→
+   991→    // Conclusion section
+   992→    sections.push({
+   993→      id: `sec_${uuidv4().slice(0, 8)}`,
+   994→      heading: 'Conclusion',
+   995→      content: `In conclusion, the research on "${query}" within the ${classification.domain} domain ` +
+   996→        `has yielded ${findings.length} findings from ${sources.length} sources. ` +
+   997→        `${findings.filter(f => f.consensus === 'strong').length} finding(s) have strong consensus, ` +
+   998→        `while ${findings.filter(f => f.consensus === 'disputed').length} remain disputed. ` +
+   999→        `The overall confidence level of this research is ${findings.length > 0 ? ((findings.reduce((s, f) => s + f.confidence, 0) / findings.length) * 100).toFixed(0) : 0}%. ` +
+  1000→        `The ${classification.sentiment} sentiment across sources suggests ${classification.sentiment === 'positive' ? 'an optimistic outlook' : classification.sentiment === 'negative' ? 'concerning trends' : classification.sentiment === 'mixed' ? 'a nuanced picture with both opportunities and challenges' : 'a balanced perspective'}. ` +
+  1001→        `${findings.filter(f => f.consensus === 'disputed').length > 0 ? 'Areas of disagreement warrant further investigation with additional authoritative sources. ' : ''}` +
+  1002→        `This report provides a foundation for understanding the current state of knowledge on this topic.`,
+  1003→      sourceIds: sources.slice(0, 2).map(s => s.id),
+  1004→      confidence: 0.7,
+  1005→      type: 'conclusion',
+  1006→    });
+  1007→
+  1008→    // Recommendations section (optional, if depth >= 3)
+  1009→    sections.push({
+  1010→      id: `sec_${uuidv4().slice(0, 8)}`,
+  1011→      heading: 'Recommendations',
+  1012→      content: `Based on the research findings, the following recommendations are proposed for further inquiry: ` +
+  1013→        `1) Expand source coverage to include more ${sources.some(s => s.type === 'academic') ? 'peer-reviewed' : 'academic and peer-reviewed'} literature. ` +
+  1014→        `2) Investigate the ${findings.filter(f => f.consensus === 'disputed').length} disputed finding(s) through primary research or expert consultation. ` +
+  1015→        `3) Monitor developments in the ${classification.domain} domain for emerging data that may shift current conclusions. ` +
+  1016→        `4) Consider longitudinal analysis to track how perspectives on "${classification.primaryTopic}" have evolved over time. ` +
+  1017→        `5) Validate key claims through direct source verification where possible.`,
+  1018→      sourceIds: sources.slice(0, 1).map(s => s.id),
+  1019→      confidence: 0.6,
+  1020→      type: 'recommendations',
+  1021→    });
+  1022→
+  1023→    return sections;
+  1024→  }
+  1025→
+  1026→  // ─── Simulation Helpers ────────────────────────────────
+  1027→  // These methods produce structured mock data. In production,
+  1028→  // the ResearchWorker plugin integration would provide real data.
+  1029→
+  1030→  private simulateSourceTitle(query: string, type: RechercheSourceType, index: number): string {
+  1031→    const templates: Record<RechercheSourceType, string[]> = {
+  1032→      academic: [
+  1033→        `A Systematic Review of ${query}`,
+  1034→        `Peer-Reviewed Analysis: ${query}`,
+  1035→        `Research Findings on ${query}`,
+  1036→      ],
+  1037→      news: [
+  1038→        `Breaking: Latest Developments in ${query}`,
+  1039→        `Analysis: What ${query} Means for the Industry`,
+  1040→        `${query} — A News Deep Dive`,
+  1041→      ],
+  1042→      blog: [
+  1043→        `Understanding ${query}: A Comprehensive Guide`,
+  1044→        `${query} Explained — What You Need to Know`,
+  1045→        `Deep Dive: ${query} in the Modern Era`,
+  1046→      ],
+  1047→      documentation: [
+  1048→        `Official Documentation: ${query}`,
+  1049→        `Technical Reference for ${query}`,
+  1050→        `${query} — Developer Guide`,
+  1051→      ],
+  1052→      government: [
+  1053→        `Government Report: ${query}`,
+  1054→        `Regulatory Framework for ${query}`,
+  1055→        `Official Statistics on ${query}`,
+  1056→      ],
+  1057→      social: [
+  1058→        `Community Discussion: ${query}`,
+  1059→        `What People Are Saying About ${query}`,
+  1060→        `${query} — Social Media Analysis`,
+  1061→      ],
+  1062→      other: [
+  1063→        `Resource Guide: ${query}`,
+  1064→        `${query} — Comprehensive Overview`,
+  1065→        `Expert Roundup on ${query}`,
+  1066→      ],
+  1067→    };
+  1068→
+  1069→    const options = templates[type] || templates.other;
+  1070→    return options[index % options.length];
+  1071→  }
+  1072→
+  1073→  private simulateSourceUrl(query: string, type: RechercheSourceType, index: number): string {
+  1074→    const slug = query.toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 40);
+  1075→    const domains: Record<RechercheSourceType, string[]> = {
+  1076→      academic: ['scholar.google.com', 'arxiv.org', 'researchgate.net'],
+  1077→      news: ['reuters.com', 'bbc.com', 'apnews.com'],
+  1078→      blog: ['medium.com', 'substack.com', 'dev.to'],
+  1079→      documentation: ['docs.example.com', 'developer.mozilla.org', 'readthedocs.io'],
+  1080→      government: ['gov.uk', 'usa.gov', 'europa.eu'],
+  1081→      social: ['reddit.com', 'twitter.com', 'hackernews.com'],
+  1082→      other: ['wikipedia.org', 'britannica.com', 'encyclopedia.com'],
+  1083→    };
+  1084→
+  1085→    const domainOptions = domains[type] || domains.other;
+  1086→    const domain = domainOptions[index % domainOptions.length];
+  1087→    return `https://${domain}/article/${slug}-${index + 1}`;
+  1088→  }
+  1089→
+  1090→  private simulateSnippet(query: string, type: RechercheSourceType, index: number): string {
+  1091→    return `${type.charAt(0).toUpperCase() + type.slice(1)} source #${index + 1} discussing key aspects of ${query}. ` +
+  1092→      `This source provides ${type === 'academic' ? 'peer-reviewed evidence' : type === 'news' ? 'timely reporting' : type === 'government' ? 'official data' : 'insights'} ` +
+  1093→      `relevant to the research query.`;
+  1094→  }
+  1095→
+  1096→  private simulateDate(depth: number): string {
+  1097→    const year = 2024 + (depth > 3 ? 0 : -Math.floor(Math.random() * 3));
+  1098→    const month = String(Math.floor(Math.random() * 12) + 1).padStart(2, '0');
+  1099→    const day = String(Math.floor(Math.random() * 28) + 1).padStart(2, '0');
+  1100→    return `${year}-${month}-${day}`;
+  1101→  }
+  1102→
+  1103→  private simulateKeyClaims(query: string, type: RechercheSourceType, index: number): string[] {
+  1104→    const claimSets: Record<RechercheSourceType, string[][]> = {
+  1105→      academic: [
+  1106→        [`Empirical evidence supports significant correlation with ${query}`, `Further research is needed to establish causality`],
+  1107→        [`Statistical analysis reveals key trends in ${query}`, `Sample size provides 95% confidence interval`],
+  1108→        [`Meta-analysis confirms established findings on ${query}`, `Limitations include selection bias in source data`],
+  1109→      ],
+  1110→      news: [
+  1111→        [`Recent developments have shifted the landscape of ${query}`, `Industry experts weigh in on implications`],
+  1112→        [`Breaking data changes understanding of ${query}`, `Stakeholders respond to new findings`],
+  1113→        [`Policy changes are expected to impact ${query}`, `Market analysis suggests significant shifts ahead`],
+  1114→      ],
+  1115→      blog: [
+  1116→        [`${query} is evolving rapidly with new developments`, `Best practices are emerging from community experience`],
+  1117→        [`Practical insights on ${query} from industry practitioners`, `Common misconceptions about ${query} persist`],
+  1118→        [`The future of ${query} looks promising according to experts`, `Community feedback highlights key challenges`],
+  1119→      ],
+  1120→      documentation: [
+  1121→        [`Official specifications define standards for ${query}`, `Implementation guidelines are available`],
+  1122→        [`Technical requirements for ${query} are documented`, `API references support integration`],
+  1123→        [`Best practices for ${query} have been established`, `Migration guides address common issues`],
+  1124→      ],
+  1125→      government: [
+  1126→        [`Official statistics provide baseline data on ${query}`, `Regulatory framework addresses key concerns`],
+  1127→        [`Policy recommendations based on ${query} data`, `Compliance requirements are outlined`],
+  1128→        [`Government research supports findings on ${query}`, `Public data confirms reported trends`],
+  1129→      ],
+  1130→      social: [
+  1131→        [`Community discussion highlights diverse perspectives on ${query}`, `User experiences vary significantly`],
+  1132→        [`Trending opinions about ${query} reflect broader sentiment`, `Expert commentary provides nuance`],
+  1133→        [`Public engagement with ${query} is growing`, `Concerns raised about accessibility and equity`],
+  1134→      ],
+  1135→      other: [
+  1136→        [`General reference provides overview of ${query}`, `Multiple perspectives are represented`],
+  1137→        [`Comprehensive data on ${query} is available`, `Historical context enriches understanding`],
+  1138→        [`Expert consensus supports key claims about ${query}`, `Ongoing debate exists on peripheral topics`],
+  1139→      ],
+  1140→    };
+  1141→
+  1142→    const options = claimSets[type] || claimSets.other;
+  1143→    return options[index % options.length];
+  1144→  }
+  1145→
+  1146→  // ─── Utility Helpers ───────────────────────────────────
+  1147→
+  1148→  private extractSubTopics(query: string): string[] {
+  1149→    // Simple heuristic: split on conjunctions and prepositions
+  1150→    const parts = query
+  1151→      .replace(/[?!.]/g, '')
+  1152→      .split(/\b(and|or|vs|versus|compared to|in relation to|regarding|about)\b/i)
+  1153→      .map(p => p.trim())
+  1154→      .filter(p => p.length > 2 && !/^(and|or|vs|versus|compared|in|regarding|about)$/i.test(p));
+  1155→
+  1156→    return parts.slice(0, 5);
+  1157→  }
+  1158→
+  1159→  private extractEntities(query: string): { name: string; type: string }[] {
+  1160→    const entities: { name: string; type: string }[] = [];
+  1161→
+  1162→    // Capitalized words as potential named entities
+  1163→    const namedMatches = query.match(/\b[A-Z][a-zA-Z]+\b/g);
+  1164→    if (namedMatches) {
+  1165→      for (const name of Array.from(new Set(namedMatches)).slice(0, 5)) {
+  1166→        entities.push({ name, type: 'named-entity' });
+  1167→      }
+  1168→    }
+  1169→
+  1170→    // Year patterns as temporal entities
+  1171→    const yearMatches = query.match(/\b(19|20)\d{2}\b/g);
+  1172→    if (yearMatches) {
+  1173→      for (const year of Array.from(new Set(yearMatches))) {
+  1174→        entities.push({ name: year, type: 'year' });
+  1175→      }
+  1176→    }
+  1177→
+  1178→    // If no entities found, create a generic one from the query
+  1179→    if (entities.length === 0) {
+  1180→      entities.push({ name: query.split(' ').slice(0, 3).join(' '), type: 'topic' });
+  1181→    }
+  1182→
+  1183→    return entities;
+  1184→  }
+  1185→
+  1186→  private inferFindingType(claim: string): RechercheFindingType {
+  1187→    const lower = claim.toLowerCase();
+  1188→    if (/\b(percent|%|statistics|data|survey|poll|rate|number|figure|approximately)\b/.test(lower)) return 'statistic';
+  1189→    if (/\b(trend|growth|decline|increase|decrease|shift|evolution)\b/.test(lower)) return 'trend';
+  1190→    if (/\b(proven|confirmed|established|evidence|demonstrated|verified)\b/.test(lower)) return 'fact';
+  1191→    if (/\b(believe|think|suggest|opinion|argue|contend|perspective)\b/.test(lower)) return 'opinion';
+  1192→    return 'claim';
+  1193→  }
+  1194→
+  1195→  private inferConsensus(credibility: RechercheSourceCredibility, claim: string): RechercheFindingConsensus {
+  1196→    // High-credibility sources tend to have stronger consensus
+  1197→    if (credibility === 'high') return 'strong';
+  1198→    if (credibility === 'medium') {
+  1199→      // Check for hedging language
+  1200→      if (/\b(may|might|could|suggest|possibly|perhaps)\b/.test(claim.toLowerCase())) return 'moderate';
+  1201→      return 'moderate';
+  1202→    }
+  1203→    // Low credibility tends toward weaker consensus
+  1204→    if (/\b(controversial|disputed|debated|contradicts)\b/.test(claim.toLowerCase())) return 'disputed';
+  1205→    return 'weak';
+  1206→  }
+  1207→
+  1208→  private deduplicateFindings(findings: RechercheFinding[]): RechercheFinding[] {
+  1209→    const seen = new Map<string, RechercheFinding>();
+  1210→
+  1211→    for (const finding of findings) {
+  1212→      const key = finding.statement.toLowerCase().trim();
+  1213→      const existing = seen.get(key);
+  1214→
+  1215→      if (existing) {
+  1216→        // Merge: combine source IDs and evidence, keep higher confidence
+  1217→        existing.sourceIds = Array.from(new Set([...existing.sourceIds, ...finding.sourceIds]));
+  1218→        existing.evidence = Array.from(new Set([...existing.evidence, ...finding.evidence]));
+  1219→        existing.confidence = Math.max(existing.confidence, finding.confidence);
+  1220→
+  1221→        // Upgrade consensus if multiple sources agree
+  1222→        const consensusOrder: RechercheFindingConsensus[] = ['weak', 'moderate', 'strong'];
+  1223→        if (consensusOrder.indexOf(finding.consensus) > consensusOrder.indexOf(existing.consensus)) {
+  1224→          existing.consensus = finding.consensus;
+  1225→        }
+  1226→      } else {
+  1227→        seen.set(key, { ...finding, sourceIds: [...finding.sourceIds], evidence: [...finding.evidence] });
+  1228→      }
+  1229→    }
+  1230→
+  1231→    return Array.from(seen.values());
+  1232→  }
+  1233→
+  1234→  private findAgreements(srcA: RechercheSource, srcB: RechercheSource): string[] {
+  1235→    const agreements: string[] = [];
+  1236→
+  1237→    // Simple keyword overlap on key claims
+  1238→    const wordsA = new Set(srcA.keyClaims.flatMap(c => c.toLowerCase().split(/\s+/)));
+  1239→    const wordsB = new Set(srcB.keyClaims.flatMap(c => c.toLowerCase().split(/\s+/)));
+  1240→
+  1241→    for (const claimA of srcA.keyClaims) {
+  1242→      const claimAWords = new Set(claimA.toLowerCase().split(/\s+/));
+  1243→      const overlap = Array.from(claimAWords).filter(w => w.length > 4 && wordsB.has(w)).length;
+  1244→      if (overlap >= 2) {
+  1245→        agreements.push(claimA);
+  1246→      }
+  1247→    }
+  1248→
+  1249→    return agreements.slice(0, 5);
+  1250→  }
+  1251→
+  1252→  private findDisagreements(srcA: RechercheSource, srcB: RechercheSource): string[] {
+  1253→    const disagreements: string[] = [];
+  1254→
+  1255→    // Detect contradictory language patterns
+  1256→    const contradictionPatterns = [
+  1257→      /\bincrease\b/i, /\bdecrease\b/i,
+  1258→      /\brising\b/i, /\bfalling\b/i,
+  1259→      /\bpositive\b/i, /\bnegative\b/i,
+  1260→      /\bsupports\b/i, /\bcontradicts\b/i,
+  1261→      /\bbeneficial\b/i, /\bharmful\b/i,
+  1262→    ];
+  1263→
+  1264→    for (const claimA of srcA.keyClaims) {
+  1265→      for (let i = 0; i < contradictionPatterns.length; i += 2) {
+  1266→        const patA = contradictionPatterns[i];
+  1267→        const patB = contradictionPatterns[i + 1];
+  1268→        if (patA && patB && patA.test(claimA)) {
+  1269→          for (const claimB of srcB.keyClaims) {
+  1270→            if (patB.test(claimB)) {
+  1271→              disagreements.push(`${claimA} vs. ${claimB}`);
+  1272→            }
+  1273→          }
+  1274→        }
+  1275→      }
+  1276→    }
+  1277→
+  1278→    return disagreements.slice(0, 3);
+  1279→  }
+  1280→
+  1281→  private formatCitation(source: RechercheSource, format: RechercheReferenceFormat): string {
+  1282→    const year = source.publishedDate ? new Date(source.publishedDate).getFullYear() : 'n.d.';
+  1283→    const title = source.title;
+  1284→    const url = source.url;
+  1285→    const domain = new URL(url).hostname.replace('www.', '');
+  1286→
+  1287→    switch (format) {
+  1288→      case 'apa':
+  1289→        return `${title}. (${year}). ${domain}. Retrieved from ${url}`;
+  1290→
+  1291→      case 'mla':
+  1292→        return `"${title}." ${domain}, ${year}. ${url}.`;
+  1293→
+  1294→      case 'chicago':
+  1295→        return `${title}. ${year}. ${domain}. ${url}.`;
+  1296→
+  1297→      case 'bibtex':
+  1298→        const key = domain.replace(/[^a-z]/g, '') + year;
+  1299→        return `@misc{${key},\n  title={${title}},\n  year={${year}},\n  howpublished={\\url{${url}}}\n}`;
+  1300→
+  1301→      default:
+  1302→        return `${title}. (${year}). ${url}`;
+  1303→    }
+  1304→  }
+  1305→
+  1306→  private computeConfidenceLevel(findings: RechercheFinding[], sources: RechercheSource[]): number {
+  1307→    if (findings.length === 0) return 0;
+  1308→
+  1309→    // Weighted average of finding confidences, boosted by multi-source validation
+  1310→    const totalConfidence = findings.reduce((sum, f) => {
+  1311→      const multiSourceBonus = f.sourceIds.length > 1 ? 0.05 : 0;
+  1312→      const consensusBonus = f.consensus === 'strong' ? 0.05 : f.consensus === 'moderate' ? 0.02 : 0;
+  1313→      return sum + Math.min(1, f.confidence + multiSourceBonus + consensusBonus);
+  1314→    }, 0);
+  1315→
+  1316→    const avgConfidence = totalConfidence / findings.length;
+  1317→
+  1318→    // Factor in source credibility
+  1319→    const highCredRatio = sources.filter(s => s.credibility === 'high').length / Math.max(sources.length, 1);
+  1320→    const credibilityBoost = highCredRatio * 0.1;
+  1321→
+  1322→    return Math.min(1, Math.round((avgConfidence + credibilityBoost) * 100) / 100);
+  1323→  }
+  1324→
+  1325→  private generateTitle(query: string, classification: RechercheClassification): string {
+  1326→    const domainLabel = classification.domain !== 'general'
+  1327→      ? ` in ${classification.domain.charAt(0).toUpperCase() + classification.domain.slice(1)}`
+  1328→      : '';
+  1329→
+  1330→    return `Research Report:${domainLabel} ${query.charAt(0).toUpperCase() + query.slice(1)}`;
+  1331→  }
+  1332→}
+  1333→

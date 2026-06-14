@@ -1,0 +1,844 @@
+     1→// ============================================================
+     2→// AgentForge - SLIDES Agent Worker
+     3→// AI-powered presentation generation with smart layouts.
+     4→// Extends BaseAgentWorker to implement a structural pipeline
+     5→// for building presentations: outline → content → design.
+     6→// LLM calls are handled externally by the MoA engine.
+     7→// ============================================================
+     8→
+     9→import { BaseAgentWorker } from './BaseAgentWorker';
+    10→import type { QualityReport } from './BaseAgentWorker';
+    11→import type { AgentId } from '@agentforge/shared';
+    12→
+    13→// ─── Slide-Specific Types ─────────────────────────────────
+    14→
+    15→export type SlideLayout = 'title' | 'content' | 'two-column' | 'image' | 'chart' | 'quote' | 'blank';
+    16→
+    17→export interface ChartConfig {
+    18→  type: 'bar' | 'line' | 'pie' | 'scatter' | 'area';
+    19→  title: string;
+    20→  data: Record<string, unknown>;
+    21→}
+    22→
+    23→export interface SlideTheme {
+    24→  primary: string;
+    25→  secondary: string;
+    26→  accent: string;
+    27→  fontHeading: string;
+    28→  fontBody: string;
+    29→  backgroundStyle: 'light' | 'dark' | 'gradient';
+    30→}
+    31→
+    32→export interface Slide {
+    33→  number: number;
+    34→  layout: SlideLayout;
+    35→  title: string;
+    36→  content: string[];
+    37→  notes: string;
+    38→  backgroundImage?: string;
+    39→  chartConfig?: ChartConfig;
+    40→}
+    41→
+    42→export interface SlidesOutput {
+    43→  title: string;
+    44→  slides: Slide[];
+    45→  totalSlides: number;
+    46→  theme: SlideTheme;
+    47→  speakerNotes: Record<number, string>;
+    48→  metadata: {
+    49→    wordCount: number;
+    50→    estimatedDuration: number;
+    51→    exportFormats: string[];
+    52→  };
+    53→}
+    54→
+    55→export interface SlidePreferences {
+    56→  topic: string;
+    57→  audience: string;
+    58→  slideCount: number;
+    59→  includeCharts: boolean;
+    60→  themeHint?: Partial<SlideTheme>;
+    61→}
+    62→
+    63→// ─── Default Theme ────────────────────────────────────────
+    64→
+    65→const DEFAULT_THEME: SlideTheme = {
+    66→  primary: '#8B5CF6',
+    67→  secondary: '#1E1B4B',
+    68→  accent: '#C4B5FD',
+    69→  fontHeading: 'Inter',
+    70→  fontBody: 'Inter',
+    71→  backgroundStyle: 'dark',
+    72→};
+    73→
+    74→// ─── Contrast Helpers ─────────────────────────────────────
+    75→
+    76→/**
+    77→ * Compute relative luminance of a hex color per WCAG 2.0.
+    78→ */
+    79→function hexLuminance(hex: string): number {
+    80→  const cleaned = hex.replace('#', '');
+    81→  if (cleaned.length < 6) return 0;
+    82→  const r = parseInt(cleaned.substring(0, 2), 16) / 255;
+    83→  const g = parseInt(cleaned.substring(2, 4), 16) / 255;
+    84→  const b = parseInt(cleaned.substring(4, 6), 16) / 255;
+    85→  const toLinear = (c: number) => (c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4));
+    86→  return 0.2126 * toLinear(r) + 0.7152 * toLinear(g) + 0.0722 * toLinear(b);
+    87→}
+    88→
+    89→/**
+    90→ * WCAG 2.0 contrast ratio between two hex colors.
+    91→ */
+    92→function contrastRatio(color1: string, color2: string): number {
+    93→  const l1 = hexLuminance(color1);
+    94→  const l2 = hexLuminance(color2);
+    95→  const lighter = Math.max(l1, l2);
+    96→  const darker = Math.min(l1, l2);
+    97→  return (lighter + 0.05) / (darker + 0.05);
+    98→}
+    99→
+   100→// ─── SLIDES Agent Worker ──────────────────────────────────
+   101→
+   102→export class SlidesAgentWorker extends BaseAgentWorker<SlidesOutput> {
+   103→  constructor() {
+   104→    super('SLIDES' as AgentId);
+   105→  }
+   106→
+   107→  // ─── Abstract Implementations ─────────────────────────
+   108→
+   109→  /**
+   110→   * Core generation pipeline:
+   111→   *  1. Parse prompt to extract topic, audience, slide count
+   112→   *  2. Generate slide outline (title → content → conclusion)
+   113→   *  3. Create content for each slide with appropriate layouts
+   114→   *  4. Add speaker notes
+   115→   *  5. Apply theme
+   116→   *  6. Emit pipeline events
+   117→   */
+   118→  protected async generate(
+   119→    prompt: string,
+   120→    context: Record<string, unknown>,
+   121→    sessionId: string,
+   122→  ): Promise<SlidesOutput> {
+   123→    // ── Step 1: Parse preferences ──
+   124→    const prefs = this.parseSlidePreferences(prompt);
+   125→
+   126→    // Merge any theme hints from context (e.g., from refinement feedback)
+   127→    if (context.themeHint) {
+   128→      Object.assign(prefs, { themeHint: context.themeHint as Partial<SlideTheme> });
+   129→    }
+   130→
+   131→    // ── Step 2: Generate outline ──
+   132→    this.emitEvent('slides_outline', sessionId, {
+   133→      topic: prefs.topic,
+   134→      slideCount: prefs.slideCount,
+   135→    });
+   136→
+   137→    const outline = this.generateOutline(prefs.topic, prefs.slideCount);
+   138→
+   139→    // If context contains previous output from refinement, merge improvements
+   140→    if (context.previousOutput && typeof context.previousOutput === 'object') {
+   141→      this.mergeRefinementContext(outline, context.previousOutput as Record<string, unknown>);
+   142→    }
+   143→
+   144→    // ── Step 3: Create content for each slide ──
+   145→    this.emitEvent('slides_content', sessionId, {
+   146→      totalSlides: outline.length,
+   147→    });
+   148→
+   149→    const slides: Slide[] = outline.map((entry, idx) => {
+   150→      const layout = this.selectLayout(idx, outline.length, entry.contentType);
+   151→      const slide: Slide = {
+   152→        number: idx + 1,
+   153→        layout,
+   154→        title: entry.title,
+   155→        content: entry.bullets,
+   156→        notes: entry.speakerNote,
+   157→      };
+   158→
+   159→      // Add chart config for data-heavy slides
+   160→      if (entry.contentType === 'data' || (prefs.includeCharts && entry.contentType === 'content' && idx % 3 === 0)) {
+   161→        slide.chartConfig = this.generateChartPlaceholder(entry.title, entry.dataHint);
+   162→      }
+   163→
+   164→      // Add background image hint for image slides
+   165→      if (layout === 'image' || layout === 'title') {
+   166→        slide.backgroundImage = `placeholder:${entry.title.toLowerCase().replace(/\s+/g, '-')}`;
+   167→      }
+   168→
+   169→      return slide;
+   170→    });
+   171→
+   172→    // ── Step 4: Build speaker notes map ──
+   173→    const speakerNotes: Record<number, string> = {};
+   174→    for (const slide of slides) {
+   175→      speakerNotes[slide.number] = slide.notes;
+   176→    }
+   177→
+   178→    // ── Step 5: Apply theme ──
+   179→    this.emitEvent('slides_design', sessionId, {
+   180→      theme: prefs.themeHint?.backgroundStyle ?? DEFAULT_THEME.backgroundStyle,
+   181→    });
+   182→
+   183→    const theme = this.applyTheme(prefs.themeHint);
+   184→
+   185→    // ── Step 6: Compute metadata ──
+   186→    const wordCount = slides.reduce(
+   187→      (sum, s) => sum + s.title.split(/\s+/).length + s.content.reduce((c, b) => c + b.split(/\s+/).length, 0),
+   188→      0,
+   189→    );
+   190→    const estimatedDuration = Math.ceil(slides.length * 1.5); // ~1.5 min per slide
+   191→
+   192→    return {
+   193→      title: outline[0]?.title ?? prefs.topic,
+   194→      slides,
+   195→      totalSlides: slides.length,
+   196→      theme,
+   197→      speakerNotes,
+   198→      metadata: {
+   199→        wordCount,
+   200→        estimatedDuration,
+   201→        exportFormats: ['pptx', 'pdf', 'html'],
+   202→      },
+   203→    };
+   204→  }
+   205→
+   206→  /**
+   207→   * Validate output quality across 5 dimensions defined in SLIDES_AGENT_CONFIG:
+   208→   *  - Content Quality (0.30)
+   209→   *  - Visual Design (0.25)
+   210→   *  - Narrative Flow (0.20)
+   211→   *  - Data Accuracy (0.15)
+   212→   *  - Accessibility (0.10)
+   213→   */
+   214→  protected async validateOutput(output: SlidesOutput, _prompt: string): Promise<QualityReport> {
+   215→    const dimensions: Record<string, number> = {};
+   216→    const suggestions: string[] = [];
+   217→
+   218→    // ── Content Quality ──
+   219→    dimensions['Content Quality'] = this.scoreContentQuality(output, suggestions);
+   220→
+   221→    // ── Visual Design ──
+   222→    dimensions['Visual Design'] = this.scoreVisualDesign(output, suggestions);
+   223→
+   224→    // ── Narrative Flow ──
+   225→    dimensions['Narrative Flow'] = this.scoreNarrativeFlow(output, suggestions);
+   226→
+   227→    // ── Data Accuracy ──
+   228→    dimensions['Data Accuracy'] = this.scoreDataAccuracy(output, suggestions);
+   229→
+   230→    // ── Accessibility ──
+   231→    dimensions['Accessibility'] = this.scoreAccessibility(output, suggestions);
+   232→
+   233→    const overall = this.computeWeightedScore(dimensions);
+   234→    const passed = this.isQualityPassing(overall);
+   235→
+   236→    return { overall, dimensions, passed, suggestions };
+   237→  }
+   238→
+   239→  /**
+   240→   * Render output into a serializable format for API responses.
+   241→   * Supports: 'outline' | 'html' | 'pptx' | default (full JSON)
+   242→   */
+   243→  protected async renderOutput(output: SlidesOutput, format?: string): Promise<unknown> {
+   244→    switch (format) {
+   245→      case 'outline':
+   246→        return {
+   247→          title: output.title,
+   248→          totalSlides: output.totalSlides,
+   249→          theme: output.theme,
+   250→          slides: output.slides.map((s) => ({
+   251→            number: s.number,
+   252→            layout: s.layout,
+   253→            title: s.title,
+   254→          })),
+   255→        };
+   256→
+   257→      case 'html':
+   258→        return this.renderAsHtml(output);
+   259→
+   260→      case 'pptx':
+   261→        // Placeholder: returns metadata needed for PPTX generation
+   262→        return {
+   263→          format: 'pptx',
+   264→          title: output.title,
+   265→          totalSlides: output.totalSlides,
+   266→          theme: output.theme,
+   267→          slides: output.slides.map((s) => ({
+   268→            number: s.number,
+   269→            layout: s.layout,
+   270→            title: s.title,
+   271→            content: s.content,
+   272→            notes: s.notes,
+   273→            chartConfig: s.chartConfig,
+   274→          })),
+   275→          _generator: 'agentforge-slides-pptx-bridge',
+   276→        };
+   277→
+   278→      default:
+   279→        return output;
+   280→    }
+   281→  }
+   282→
+   283→  // ─── Helper Methods ──────────────────────────────────────
+   284→
+   285→  /**
+   286→   * Parse the user prompt to extract topic, audience, slide count, and
+   287→   * other presentation preferences using heuristic pattern matching.
+   288→   */
+   289→  parseSlidePreferences(prompt: string): SlidePreferences {
+   290→    const lower = prompt.toLowerCase();
+   291→
+   292→    // Extract topic — the core subject of the presentation
+   293→    const topic = this.extractTopic(prompt);
+   294→
+   295→    // Extract audience
+   296→    let audience = 'general';
+   297→    const audiencePatterns: [RegExp, string][] = [
+   298→      [/\b(?:for|targeting|audience[:\s]+)(?:engineers|developers|technical)\b/i, 'technical'],
+   299→      [/\b(?:for|targeting|audience[:\s]+)(?:executives|c-suite|leadership|board)\b/i, 'executive'],
+   300→      [/\b(?:for|targeting|audience[:\s]+)(?:students|classroom|academic)\b/i, 'academic'],
+   301→      [/\b(?:for|targeting|audience[:\s]+)(?:clients|customers|sales)\b/i, 'business'],
+   302→      [/\b(?:for|targeting|audience[:\s]+)(?:beginners|introductory|new\s+hires)\b/i, 'beginner'],
+   303→    ];
+   304→    for (const [re, label] of audiencePatterns) {
+   305→      if (re.test(lower)) {
+   306→        audience = label;
+   307→        break;
+   308→      }
+   309→    }
+   310→
+   311→    // Extract slide count preference
+   312→    let slideCount = 10; // default
+   313→    const countMatch = lower.match(/(\d+)\s*slides?\b/);
+   314→    if (countMatch) {
+   315→      slideCount = Math.min(Math.max(parseInt(countMatch[1], 10), 3), 50);
+   316→    } else if (/\bshort\b|\bbrief\b|\bquick\b/.test(lower)) {
+   317→      slideCount = 6;
+   318→    } else if (/\blong\b|\bdetailed\b|\bcomprehensive\b|\bin-depth\b/.test(lower)) {
+   319→      slideCount = 20;
+   320→    }
+   321→
+   322→    // Detect chart / data visualization request
+   323→    const includeCharts =
+   324→      /\bchart\b|\bgraph\b|\bdata\s+viz\b|\bvisualization\b|\bstatistics\b|\bmetrics\b|\bkpi\b/i.test(lower);
+   325→
+   326→    return { topic, audience, slideCount, includeCharts };
+   327→  }
+   328→
+   329→  /**
+   330→   * Generate a structured outline for the presentation.
+   331→   * Produces a logical flow: title → agenda → content → conclusion.
+   332→   */
+   333→  generateOutline(
+   334→    topic: string,
+   335→    slideCount: number,
+   336→  ): Array<{
+   337→    title: string;
+   338→    contentType: string;
+   339→    bullets: string[];
+   340→    speakerNote: string;
+   341→    dataHint?: Record<string, unknown>;
+   342→  }> {
+   343→    const outline: Array<{
+   344→      title: string;
+   345→      contentType: string;
+   346→      bullets: string[];
+   347→      speakerNote: string;
+   348→      dataHint?: Record<string, unknown>;
+   349→    }> = [];
+   350→
+   351→    // ── Title Slide ──
+   352→    outline.push({
+   353→      title: topic,
+   354→      contentType: 'title',
+   355→      bullets: [`Presented with AgentForge`, `Key topic: ${topic}`],
+   356→      speakerNote: `Welcome the audience. Introduce the topic: ${topic}. Set expectations for the presentation.`,
+   357→    });
+   358→
+   359→    // ── Agenda Slide ──
+   360→    if (slideCount >= 5) {
+   361→      outline.push({
+   362→        title: 'Agenda',
+   363→        contentType: 'content',
+   364→        bullets: this.generateAgendaItems(topic, slideCount),
+   365→        speakerNote: `Walk through the agenda so the audience knows what to expect. Mention key sections.`,
+   366→      });
+   367→    }
+   368→
+   369→    // ── Content Slides ──
+   370→    const contentSlideCount = slideCount - 2 - (slideCount >= 5 ? 1 : 0) - 1; // minus title, agenda (if present), conclusion
+   371→    const sectionCount = Math.max(1, contentSlideCount);
+   372→
+   373→    for (let i = 0; i < sectionCount; i++) {
+   374→      const sectionNumber = i + 1;
+   375→      const isDataSlide = i % 3 === 2; // every 3rd content slide is data-oriented
+   376→
+   377→      outline.push({
+   378→        title: `${topic} — Section ${sectionNumber}`,
+   379→        contentType: isDataSlide ? 'data' : 'content',
+   380→        bullets: [
+   381→          `Key point ${sectionNumber}.1: Expand on this aspect of ${topic}`,
+   382→          `Key point ${sectionNumber}.2: Supporting detail for ${topic}`,
+   383→          `Key point ${sectionNumber}.3: Additional insight or evidence`,
+   384→        ],
+   385→        speakerNote: `Discuss section ${sectionNumber} in depth. Use examples and data to support the points.`,
+   386→        ...(isDataSlide
+   387→          ? {
+   388→              dataHint: {
+   389→                labels: ['Q1', 'Q2', 'Q3', 'Q4'],
+   390→                values: [30, 45, 60, 75],
+   391→              },
+   392→            }
+   393→          : {}),
+   394→      });
+   395→    }
+   396→
+   397→    // ── Conclusion Slide ──
+   398→    outline.push({
+   399→      title: 'Conclusion & Next Steps',
+   400→      contentType: 'conclusion',
+   401→      bullets: [
+   402→        `Summarize the key takeaways from ${topic}`,
+   403→        `Highlight the most impactful insights`,
+   404→        `Outline recommended next steps`,
+   405→        `Open the floor for questions`,
+   406→      ],
+   407→      speakerNote: `Recap the main points. Reiterate the importance of the topic. Invite questions from the audience.`,
+   408→    });
+   409→
+   410→    // Trim or pad to match requested count
+   411→    while (outline.length > slideCount && outline.length > 3) {
+   412→      // Remove a content slide (not title, agenda, or conclusion)
+   413→      const contentIdx = outline.findIndex(
+   414→        (o) => o.contentType === 'content' || o.contentType === 'data',
+   415→      );
+   416→      if (contentIdx >= 0) {
+   417→        outline.splice(contentIdx, 1);
+   418→      } else {
+   419→        break;
+   420→      }
+   421→    }
+   422→
+   423→    // Re-number is handled by slide.number later; titles stay as-is
+   424→
+   425→    return outline;
+   426→  }
+   427→
+   428→  /**
+   429→   * Auto-select the best layout for a slide based on its position
+   430→   * and content type.
+   431→   */
+   432→  selectLayout(slideIndex: number, totalSlides: number, contentType: string): SlideLayout {
+   433→    // First slide is always a title layout
+   434→    if (slideIndex === 0) return 'title';
+   435→
+   436→    // Last slide is a content layout (conclusion)
+   437→    if (slideIndex === totalSlides - 1) return 'content';
+   438→
+   439→    // Data-heavy slides get a chart layout
+   440→    if (contentType === 'data') return 'chart';
+   441→
+   442→    // Quote-type content
+   443→    if (contentType === 'quote') return 'quote';
+   444→
+   445→    // Evenly distribute two-column layouts for variety
+   446→    if (contentType === 'content' && slideIndex % 2 === 0 && totalSlides > 4) {
+   447→      return 'two-column';
+   448→    }
+   449→
+   450→    // Image slides for visual variety in longer presentations
+   451→    if (contentType === 'content' && slideIndex % 3 === 0 && totalSlides > 6) {
+   452→      return 'image';
+   453→    }
+   454→
+   455→    // Default content layout
+   456→    return 'content';
+   457→  }
+   458→
+   459→  /**
+   460→   * Merge user-supplied or context-supplied theme overrides with
+   461→   * the default professional dark theme.
+   462→   */
+   463→  applyTheme(overrides?: Partial<SlideTheme>): SlideTheme {
+   464→    return {
+   465→      ...DEFAULT_THEME,
+   466→      ...overrides,
+   467→    };
+   468→  }
+   469→
+   470→  // ─── Private Helpers ───────────────────────────────────
+   471→
+   472→  /**
+   473→   * Heuristic topic extraction from a prompt string.
+   474→   * Falls back to the full prompt trimmed.
+   475→   */
+   476→  private extractTopic(prompt: string): string {
+   477→    // Try to extract after common patterns like "about X", "on X", "presentation on X"
+   478→    const patterns = [
+   479→      /(?:presentation|slides|deck)\s+(?:about|on|for|covering)\s+(.+?)(?:\.|,|$)/i,
+   480→      /(?:create|make|generate|build)\s+(?:a\s+)?(?:presentation|slides|deck)\s+(?:about|on|for|covering)\s+(.+?)(?:\.|,|$)/i,
+   481→      /(?:about|on|for)\s+(.+?)(?:\.|,|$)/i,
+   482→    ];
+   483→
+   484→    for (const re of patterns) {
+   485→      const match = prompt.match(re);
+   486→      if (match && match[1]) {
+   487→        return match[1].trim();
+   488→      }
+   489→    }
+   490→
+   491→    // Fallback: use first 80 chars, stripped of common prefixes
+   492→    const cleaned = prompt
+   493→      .replace(/^(create|make|generate|build)\s+(a\s+)?(presentation|slides|deck)\s*/i, '')
+   494→      .trim();
+   495→    return cleaned.length > 80 ? cleaned.substring(0, 80) + '…' : cleaned || 'Untitled Presentation';
+   496→  }
+   497→
+   498→  /**
+   499→   * Generate agenda items based on the topic and total slide count.
+   500→   */
+   501→  private generateAgendaItems(topic: string, slideCount: number): string[] {
+   502→    const items = [`Introduction to ${topic}`];
+   503→    const sections = Math.max(2, slideCount - 3);
+   504→
+   505→    for (let i = 1; i <= Math.min(sections, 5); i++) {
+   506→      items.push(`${topic} — Section ${i}`);
+   507→    }
+   508→
+   509→    items.push('Conclusion & Next Steps');
+   510→    return items;
+   511→  }
+   512→
+   513→  /**
+   514→   * Generate a chart configuration placeholder for data-oriented slides.
+   515→   */
+   516→  private generateChartPlaceholder(title: string, dataHint?: Record<string, unknown>): ChartConfig {
+   517→    const chartTypes: ChartConfig['type'][] = ['bar', 'line', 'pie', 'scatter', 'area'];
+   518→    const typeIndex = title.length % chartTypes.length;
+   519→
+   520→    return {
+   521→      type: chartTypes[typeIndex],
+   522→      title: `Data: ${title}`,
+   523→      data: dataHint ?? {
+   524→        labels: ['Item A', 'Item B', 'Item C', 'Item D'],
+   525→        values: [25, 40, 55, 35],
+   526→      },
+   527→    };
+   528→  }
+   529→
+   530→  /**
+   531→   * Merge refinement context from a previous output into the current outline.
+   532→   * Used during the refinement loop to incorporate quality feedback.
+   533→   */
+   534→  private mergeRefinementContext(
+   535→    outline: Array<{ title: string; contentType: string; bullets: string[]; speakerNote: string; dataHint?: Record<string, unknown> }>,
+   536→    previousOutput: Record<string, unknown>,
+   537→  ): void {
+   538→    // If the previous output had slides with better content, copy their bullets
+   539→    const prevSlides = previousOutput.slides as Array<{ title: string; content: string[]; notes: string }> | undefined;
+   540→    if (!prevSlides || !Array.isArray(prevSlides)) return;
+   541→
+   542→    for (let i = 0; i < Math.min(outline.length, prevSlides.length); i++) {
+   543→      const prev = prevSlides[i];
+   544→      if (prev?.content && Array.isArray(prev.content) && prev.content.length > 0) {
+   545→        outline[i].bullets = prev.content;
+   546→      }
+   547→      if (prev?.notes && typeof prev.notes === 'string' && prev.notes.length > 0) {
+   548→        outline[i].speakerNote = prev.notes;
+   549→      }
+   550→    }
+   551→  }
+   552→
+   553→  // ─── Quality Scoring Helpers ───────────────────────────
+   554→
+   555→  /**
+   556→   * Score content quality: checks that slide content is substantive
+   557→   * (not just titles) and that bullets have meaningful length.
+   558→   */
+   559→  private scoreContentQuality(output: SlidesOutput, suggestions: string[]): number {
+   560→    if (output.slides.length === 0) {
+   561→      suggestions.push('Presentation has no slides');
+   562→      return 0;
+   563→    }
+   564→
+   565→    let totalScore = 0;
+   566→    const slideScores: number[] = [];
+   567→
+   568→    for (const slide of output.slides) {
+   569→      let slideScore = 0;
+   570→
+   571→      // Title slide: content is less critical
+   572→      if (slide.layout === 'title') {
+   573→        slideScore = slide.title.length > 3 ? 0.8 : 0.4;
+   574→      } else {
+   575→        // Content slides should have substantive bullets
+   576→        const bulletCount = slide.content.length;
+   577→        const avgBulletLen =
+   578→          bulletCount > 0
+   579→            ? slide.content.reduce((sum, b) => sum + b.split(/\s+/).length, 0) / bulletCount
+   580→            : 0;
+   581→
+   582→        // At least 2 bullets, averaging 4+ words each
+   583→        if (bulletCount >= 2) slideScore += 0.3;
+   584→        if (bulletCount >= 3) slideScore += 0.2;
+   585→        if (avgBulletLen >= 4) slideScore += 0.3;
+   586→        if (avgBulletLen >= 8) slideScore += 0.2;
+   587→      }
+   588→
+   589→      slideScores.push(slideScore);
+   590→      totalScore += slideScore;
+   591→    }
+   592→
+   593→    const avg = totalScore / output.slides.length;
+   594→
+   595→    if (avg < 0.5) {
+   596→      suggestions.push('Slide content is too thin — add more substantive bullet points');
+   597→    }
+   598→    if (output.slides.some((s) => s.content.length === 0 && s.layout !== 'blank')) {
+   599→      suggestions.push('Some non-blank slides have no content');
+   600→    }
+   601→
+   602→    return Math.min(1, avg);
+   603→  }
+   604→
+   605→  /**
+   606→   * Score visual design: validates layout variety and theme consistency.
+   607→   */
+   608→  private scoreVisualDesign(output: SlidesOutput, suggestions: string[]): number {
+   609→    let score = 0;
+   610→
+   611→    // Layout variety: at least 2 different layouts for 4+ slides
+   612→    const layoutTypes = new Set(output.slides.map((s) => s.layout));
+   613→    if (output.totalSlides >= 4 && layoutTypes.size >= 2) score += 0.3;
+   614→    if (output.totalSlides >= 6 && layoutTypes.size >= 3) score += 0.2;
+   615→
+   616→    // Theme consistency: primary color is a valid hex
+   617→    const hexRe = /^#[0-9A-Fa-f]{6}$/;
+   618→    if (hexRe.test(output.theme.primary)) score += 0.15;
+   619→    if (hexRe.test(output.theme.secondary)) score += 0.1;
+   620→    if (hexRe.test(output.theme.accent)) score += 0.1;
+   621→
+   622→    // Font names present
+   623→    if (output.theme.fontHeading) score += 0.05;
+   624→    if (output.theme.fontBody) score += 0.05;
+   625→
+   626→    // Background style valid
+   627→    if (['light', 'dark', 'gradient'].includes(output.theme.backgroundStyle)) score += 0.05;
+   628→
+   629→    if (layoutTypes.size === 1 && output.totalSlides > 3) {
+   630→      suggestions.push('All slides use the same layout — add variety (two-column, chart, quote)');
+   631→    }
+   632→
+   633→    return Math.min(1, score);
+   634→  }
+   635→
+   636→  /**
+   637→   * Score narrative flow: checks logical progression
+   638→   * (intro/title → body → conclusion).
+   639→   */
+   640→  private scoreNarrativeFlow(output: SlidesOutput, suggestions: string[]): number {
+   641→    let score = 0;
+   642→    const slides = output.slides;
+   643→
+   644→    if (slides.length === 0) return 0;
+   645→
+   646→    // First slide should be title layout
+   647→    if (slides[0].layout === 'title') {
+   648→      score += 0.3;
+   649→    } else {
+   650→      suggestions.push('First slide should use the title layout for a strong opening');
+   651→    }
+   652→
+   653→    // Last slide should be conclusion-ish (content or quote layout)
+   654→    if (slides.length >= 2) {
+   655→      const last = slides[slides.length - 1];
+   656→      const lastTitle = last.title.toLowerCase();
+   657→      if (
+   658→        lastTitle.includes('conclusion') ||
+   659→        lastTitle.includes('summary') ||
+   660→        lastTitle.includes('next step') ||
+   661→        lastTitle.includes('takeaway') ||
+   662→        lastTitle.includes('q&a') ||
+   663→        last.layout === 'content'
+   664→      ) {
+   665→        score += 0.3;
+   666→      } else {
+   667→        suggestions.push('Last slide should be a conclusion, summary, or Q&A');
+   668→      }
+   669→    }
+   670→
+   671→    // Middle slides should have consistent progression
+   672→    if (slides.length >= 4) {
+   673→      const hasMiddleContent = slides.slice(1, -1).every((s) => s.content.length > 0);
+   674→      if (hasMiddleContent) score += 0.2;
+   675→    }
+   676→
+   677→    // Total slide count is reasonable (3–50 range)
+   678→    if (output.totalSlides >= 3 && output.totalSlides <= 30) {
+   679→      score += 0.2;
+   680→    } else if (output.totalSlides > 30) {
+   681→      suggestions.push('Presentation is very long — consider splitting into sections');
+   682→    }
+   683→
+   684→    return Math.min(1, score);
+   685→  }
+   686→
+   687→  /**
+   688→   * Score data accuracy: basic validation of chart configs
+   689→   * (structure, non-empty data, valid chart type).
+   690→   */
+   691→  private scoreDataAccuracy(output: SlidesOutput, suggestions: string[]): number {
+   692→    const chartSlides = output.slides.filter((s) => s.chartConfig);
+   693→
+   694→    if (chartSlides.length === 0) {
+   695→      // No charts — not penalized, but not rewarded either
+   696→      return 0.7;
+   697→    }
+   698→
+   699→    let score = 0;
+   700→    const validTypes = new Set(['bar', 'line', 'pie', 'scatter', 'area']);
+   701→
+   702→    for (const slide of chartSlides) {
+   703→      const cfg = slide.chartConfig!;
+   704→
+   705→      // Valid chart type
+   706→      if (validTypes.has(cfg.type)) score += 0.2;
+   707→
+   708→      // Title present
+   709→      if (cfg.title && cfg.title.length > 0) score += 0.1;
+   710→
+   711→      // Data object is non-empty
+   712→      if (cfg.data && Object.keys(cfg.data).length > 0) score += 0.2;
+   713→
+   714→      // Data has expected keys (labels and values is common)
+   715→      if (cfg.data.labels || cfg.data.values || cfg.data.datasets) score += 0.1;
+   716→    }
+   717→
+   718→    const avgChartScore = score / chartSlides.length;
+   719→
+   720→    if (chartSlides.some((s) => !s.chartConfig!.data || Object.keys(s.chartConfig!.data).length === 0)) {
+   721→      suggestions.push('Some chart slides have empty data configurations');
+   722→    }
+   723→
+   724→    return Math.min(1, avgChartScore);
+   725→  }
+   726→
+   727→  /**
+   728→   * Score accessibility: checks contrast ratios, alt text (backgroundImage
+   729→   * descriptions), and font legibility.
+   730→   */
+   731→  private scoreAccessibility(output: SlidesOutput, suggestions: string[]): number {
+   732→    let score = 0;
+   733→
+   734→    // Check contrast ratio between primary text color and background
+   735→    const bgColors: Record<string, string> = {
+   736→      dark: '#1E1B4B',
+   737→      light: '#FFFFFF',
+   738→      gradient: '#2D2B55',
+   739→    };
+   740→    const bgColor = bgColors[output.theme.backgroundStyle] ?? '#1E1B4B';
+   741→    const ratio = contrastRatio(output.theme.primary, bgColor);
+   742→
+   743→    // WCAG AA requires 4.5:1 for normal text, 3:1 for large text
+   744→    if (ratio >= 4.5) {
+   745→      score += 0.4;
+   746→    } else if (ratio >= 3) {
+   747→      score += 0.25;
+   748→      suggestions.push('Text contrast meets large-text standards but not normal-text AA — consider lighter primary color');
+   749→    } else {
+   750→      suggestions.push('Text contrast is too low — increase contrast between primary color and background');
+   751→    }
+   752→
+   753→    // Check for alt text / meaningful descriptions on image slides
+   754→    const imageSlides = output.slides.filter((s) => s.layout === 'image' || s.backgroundImage);
+   755→    if (imageSlides.length > 0) {
+   756→      // If they have content (which can serve as alt text description)
+   757→      const withAltText = imageSlides.filter((s) => s.content.length > 0 || s.title.length > 5);
+   758→      const altRatio = withAltText.length / imageSlides.length;
+   759→      score += altRatio * 0.3;
+   760→      if (altRatio < 1) {
+   761→        suggestions.push('Some image slides lack descriptive content for accessibility');
+   762→      }
+   763→    } else {
+   764→      score += 0.3; // No image slides, no alt-text issues
+   765→    }
+   766→
+   767→    // Font legibility: known legible fonts
+   768→    const legibleFonts = new Set([
+   769→      'inter', 'roboto', 'open sans', 'lato', 'montserrat',
+   770→      'helvetica', 'arial', 'system-ui', 'segoe ui', 'noto sans',
+   771→    ]);
+   772→    const headingOk = legibleFonts.has(output.theme.fontHeading.toLowerCase());
+   773→    const bodyOk = legibleFonts.has(output.theme.fontBody.toLowerCase());
+   774→    if (headingOk) score += 0.15;
+   775→    if (bodyOk) score += 0.15;
+   776→
+   777→    if (!headingOk || !bodyOk) {
+   778→      suggestions.push('Consider using widely-available legible fonts for better cross-platform rendering');
+   779→    }
+   780→
+   781→    return Math.min(1, score);
+   782→  }
+   783→
+   784→  // ─── Render Helpers ────────────────────────────────────
+   785→
+   786→  /**
+   787→   * Render the presentation as basic HTML markup.
+   788→   * Each slide becomes a <section> with appropriate styling hooks.
+   789→   */
+   790→  private renderAsHtml(output: SlidesOutput): string {
+   791→    const { theme } = output;
+   792→    const bgStyle =
+   793→      theme.backgroundStyle === 'dark'
+   794→        ? `background: ${theme.secondary}; color: #FFFFFF;`
+   795→        : theme.backgroundStyle === 'gradient'
+   796→          ? `background: linear-gradient(135deg, ${theme.secondary}, ${theme.primary}); color: #FFFFFF;`
+   797→          : `background: #FFFFFF; color: ${theme.secondary};`;
+   798→
+   799→    const slidesHtml = output.slides
+   800→      .map(
+   801→        (slide) => `    <section class="slide slide-${slide.layout}" id="slide-${slide.number}" style="${bgStyle} padding: 40px; min-height: 100vh; display: flex; flex-direction: column; justify-content: center;">
+   802→      <h2 style="font-family: ${theme.fontHeading}; color: ${theme.primary};">${this.escapeHtml(slide.title)}</h2>
+   803→      <ul style="font-family: ${theme.fontBody};">
+   804→${slide.content.map((b) => `        <li>${this.escapeHtml(b)}</li>`).join('\n')}
+   805→      </ul>
+   806→      ${slide.notes ? `<!-- Speaker Note: ${this.escapeHtml(slide.notes)} -->` : ''}
+   807→    </section>`,
+   808→      )
+   809→      .join('\n');
+   810→
+   811→    return `<!DOCTYPE html>
+   812→<html lang="en">
+   813→<head>
+   814→  <meta charset="UTF-8">
+   815→  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+   816→  <title>${this.escapeHtml(output.title)}</title>
+   817→  <style>
+   818→    * { margin: 0; padding: 0; box-sizing: border-box; }
+   819→    body { font-family: ${theme.fontBody}, sans-serif; }
+   820→    .slide { page-break-after: always; }
+   821→    h2 { margin-bottom: 20px; }
+   822→    ul { list-style: disc; padding-left: 24px; }
+   823→    li { margin-bottom: 8px; line-height: 1.6; }
+   824→  </style>
+   825→</head>
+   826→<body>
+   827→${slidesHtml}
+   828→</body>
+   829→</html>`;
+   830→  }
+   831→
+   832→  /**
+   833→   * Escape HTML special characters to prevent injection.
+   834→   */
+   835→  private escapeHtml(text: string): string {
+   836→    return text
+   837→      .replace(/&/g, '&amp;')
+   838→      .replace(/</g, '&lt;')
+   839→      .replace(/>/g, '&gt;')
+   840→      .replace(/"/g, '&quot;')
+   841→      .replace(/'/g, '&#039;');
+   842→  }
+   843→}
+   844→

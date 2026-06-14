@@ -1,0 +1,817 @@
+     1→// ============================================================
+     2→// AgentForge - Projects Page
+     3→// Full CRUD with create modal, edit modal, expandable details,
+     4→// delete confirmation, search/filter, toast notifications
+     5→// ============================================================
+     6→
+     7→import React, { useState, useEffect, useCallback } from 'react';
+     8→import {
+     9→  FolderKanban, Plus, Trash2, RefreshCw, X, Loader2,
+    10→  ChevronDown, ChevronUp, Clock, Code2, FileText,
+    11→  BarChart3, Search, Mail, Megaphone, Presentation,
+    12→  Copy, CheckCircle, AlertTriangle, Pencil, Filter,
+    13→} from 'lucide-react';
+    14→import { AGENT_REGISTRY } from '@agentforge/shared';
+    15→import type { AgentId } from '@agentforge/shared';
+    16→import { api } from '../lib/api';
+    17→import { cn } from '../lib/cn';
+    18→import { useToast } from '../components/common/Toast';
+    19→
+    20→// ── Status Badge Config ──────────────────────────────────
+    21→const STATUS_CONFIG: Record<string, { bg: string; text: string; dot: string; editable?: boolean }> = {
+    22→  draft:      { bg: 'bg-gray-500/10',  text: 'text-gray-400',  dot: 'bg-gray-400', editable: true },
+    23→  generating: { bg: 'bg-blue-500/10',  text: 'text-blue-400',  dot: 'bg-blue-400', editable: true },
+    24→  reviewing:  { bg: 'bg-yellow-500/10', text: 'text-yellow-400', dot: 'bg-yellow-400', editable: true },
+    25→  deployed:   { bg: 'bg-green-500/10',  text: 'text-green-400',  dot: 'bg-green-400' },
+    26→  failed:     { bg: 'bg-red-500/10',    text: 'text-red-400',    dot: 'bg-red-400', editable: true },
+    27→  archived:   { bg: 'bg-gray-500/10',   text: 'text-gray-500',   dot: 'bg-gray-500', editable: true },
+    28→};
+    29→
+    30→const ALL_STATUSES = ['draft', 'generating', 'reviewing', 'deployed', 'failed', 'archived'];
+    31→
+    32→// ── Agent icon map ───────────────────────────────────────
+    33→const AGENT_ICON_MAP: Record<string, React.ElementType> = {
+    34→  DEV: Code2,
+    35→  SLIDES: Presentation,
+    36→  DOC: FileText,
+    37→  DATA: BarChart3,
+    38→  RECHERCHE: Search,
+    39→  EMAIL: Mail,
+    40→  MARKETING: Megaphone,
+    41→};
+    42→
+    43→// ── Sub-components ───────────────────────────────────────
+    44→function StatusBadge({ status }: { status: string }) {
+    45→  const cfg = STATUS_CONFIG[status] || STATUS_CONFIG.draft;
+    46→  return (
+    47→    <span className={cn('inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium', cfg.bg, cfg.text)}>
+    48→      <span className={cn('w-1.5 h-1.5 rounded-full', cfg.dot)} />
+    49→      {status}
+    50→    </span>
+    51→  );
+    52→}
+    53→
+    54→function AgentBadge({ agentId }: { agentId: string }) {
+    55→  const config = AGENT_REGISTRY[agentId as AgentId];
+    56→  const Icon = AGENT_ICON_MAP[agentId] || Code2;
+    57→  const color = config?.color || '#6B7280';
+    58→  return (
+    59→    <span
+    60→      className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium"
+    61→      style={{ backgroundColor: `${color}15`, color }}
+    62→    >
+    63→      <Icon className="w-3 h-3" />
+    64→      {agentId}
+    65→    </span>
+    66→  );
+    67→}
+    68→
+    69→function SkeletonCard() {
+    70→  return (
+    71→    <div className="glass-card rounded-xl p-5 animate-pulse">
+    72→      <div className="flex items-start justify-between mb-3">
+    73→        <div className="flex items-center gap-3">
+    74→          <div className="w-10 h-10 rounded-lg bg-gray-800" />
+    75→          <div className="space-y-2">
+    76→            <div className="h-4 w-32 rounded bg-gray-800" />
+    77→            <div className="h-3 w-20 rounded bg-gray-800/60" />
+    78→          </div>
+    79→        </div>
+    80→        <div className="h-6 w-20 rounded-full bg-gray-800" />
+    81→      </div>
+    82→      <div className="h-3 w-full rounded bg-gray-800/40" />
+    83→    </div>
+    84→  );
+    85→}
+    86→
+    87→// ── Main Component ───────────────────────────────────────
+    88→export function Projects() {
+    89→  const { addToast } = useToast();
+    90→  const [projects, setProjects] = useState<any[]>([]);
+    91→  const [loading, setLoading] = useState(true);
+    92→  const [error, setError] = useState<string | null>(null);
+    93→  const [showCreate, setShowCreate] = useState(false);
+    94→  const [editingProject, setEditingProject] = useState<any | null>(null);
+    95→  const [expandedId, setExpandedId] = useState<string | null>(null);
+    96→  const [projectDetail, setProjectDetail] = useState<Record<string, any>>({});
+    97→  const [detailLoading, setDetailLoading] = useState<string | null>(null);
+    98→  const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null);
+    99→  const [deleteLoading, setDeleteLoading] = useState<string | null>(null);
+   100→
+   101→  // Search & filter state
+   102→  const [searchQuery, setSearchQuery] = useState('');
+   103→  const [filterStatus, setFilterStatus] = useState<string>('all');
+   104→  const [filterAgent, setFilterAgent] = useState<string>('all');
+   105→  const [showFilters, setShowFilters] = useState(false);
+   106→
+   107→  const fetchProjects = useCallback(async () => {
+   108→    try {
+   109→      setLoading(true);
+   110→      setError(null);
+   111→      const res = await api.getProjects();
+   112→      setProjects(res.data || []);
+   113→    } catch (err: any) {
+   114→      setError(err.message || 'Failed to load projects');
+   115→    } finally {
+   116→      setLoading(false);
+   117→    }
+   118→  }, []);
+   119→
+   120→  useEffect(() => {
+   121→    fetchProjects();
+   122→  }, [fetchProjects]);
+   123→
+   124→  const toggleExpand = async (projectId: string) => {
+   125→    if (expandedId === projectId) {
+   126→      setExpandedId(null);
+   127→      return;
+   128→    }
+   129→    setExpandedId(projectId);
+   130→    setDetailLoading(projectId);
+   131→    try {
+   132→      const res = await api.getProject(projectId);
+   133→      setProjectDetail((prev) => ({ ...prev, [projectId]: res.data }));
+   134→    } catch {
+   135→      // partial data is fine
+   136→    } finally {
+   137→      setDetailLoading(null);
+   138→    }
+   139→  };
+   140→
+   141→  const handleDelete = async (projectId: string) => {
+   142→    try {
+   143→      setDeleteLoading(projectId);
+   144→      await api.deleteProject(projectId);
+   145→      setDeleteConfirmId(null);
+   146→      setExpandedId(null);
+   147→      addToast('success', 'Project deleted successfully');
+   148→      await fetchProjects();
+   149→    } catch (err: any) {
+   150→      addToast('error', err.message || 'Failed to delete project');
+   151→    } finally {
+   152→      setDeleteLoading(null);
+   153→    }
+   154→  };
+   155→
+   156→  // Filtered projects
+   157→  const filteredProjects = projects.filter((p) => {
+   158→    const matchesSearch = !searchQuery ||
+   159→      p.name?.toLowerCase().includes(searchQuery.toLowerCase()) ||
+   160→      p.description?.toLowerCase().includes(searchQuery.toLowerCase()) ||
+   161→      p.id?.toLowerCase().includes(searchQuery.toLowerCase());
+   162→    const matchesStatus = filterStatus === 'all' || p.status === filterStatus;
+   163→    const matchesAgent = filterAgent === 'all' || p.agentId === filterAgent;
+   164→    return matchesSearch && matchesStatus && matchesAgent;
+   165→  });
+   166→
+   167→  return (
+   168→    <div className="p-6 lg:p-8 max-w-7xl mx-auto animate-fade-in">
+   169→      {/* Header */}
+   170→      <div className="flex items-center justify-between mb-6">
+   171→        <div>
+   172→          <div className="flex items-center gap-3 mb-1">
+   173→            <FolderKanban className="w-7 h-7 text-green-400" />
+   174→            <h1 className="text-3xl font-bold gradient-text">Projects</h1>
+   175→          </div>
+   176→          <p className="text-gray-500 text-sm">Manage your generated projects and deployments</p>
+   177→        </div>
+   178→        <div className="flex items-center gap-3">
+   179→          <button
+   180→            onClick={fetchProjects}
+   181→            className="p-2.5 rounded-lg bg-gray-800 hover:bg-gray-700 text-gray-400 hover:text-white transition-colors"
+   182→          >
+   183→            <RefreshCw className="w-4 h-4" />
+   184→          </button>
+   185→          <button
+   186→            onClick={() => setShowCreate(true)}
+   187→            className="inline-flex items-center gap-2 px-4 py-2.5 rounded-lg bg-blue-500 hover:bg-blue-600 text-white text-sm font-medium transition-colors"
+   188→          >
+   189→            <Plus className="w-4 h-4" />
+   190→            Create Project
+   191→          </button>
+   192→        </div>
+   193→      </div>
+   194→
+   195→      {/* Search & Filter Bar */}
+   196→      <div className="mb-6 space-y-3">
+   197→        <div className="flex items-center gap-3">
+   198→          <div className="flex-1 relative">
+   199→            <Search className="w-4 h-4 text-gray-500 absolute left-3 top-1/2 -translate-y-1/2" />
+   200→            <input
+   201→              type="text"
+   202→              value={searchQuery}
+   203→              onChange={(e) => setSearchQuery(e.target.value)}
+   204→              placeholder="Search projects by name, description, or ID..."
+   205→              className="w-full pl-10 pr-4 py-2.5 rounded-lg bg-gray-800 border border-gray-700 text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-sm"
+   206→            />
+   207→          </div>
+   208→          <button
+   209→            onClick={() => setShowFilters(!showFilters)}
+   210→            className={cn(
+   211→              'p-2.5 rounded-lg border transition-colors',
+   212→              showFilters
+   213→                ? 'bg-blue-500/10 border-blue-500/30 text-blue-400'
+   214→                : 'bg-gray-800 border-gray-700 text-gray-400 hover:text-white'
+   215→            )}
+   216→          >
+   217→            <Filter className="w-4 h-4" />
+   218→          </button>
+   219→        </div>
+   220→
+   221→        {/* Expanded Filters */}
+   222→        {showFilters && (
+   223→          <div className="flex items-center gap-3 animate-fade-in">
+   224→            <div className="flex items-center gap-2">
+   225→              <label className="text-xs text-gray-500">Status:</label>
+   226→              <select
+   227→                value={filterStatus}
+   228→                onChange={(e) => setFilterStatus(e.target.value)}
+   229→                className="px-3 py-1.5 rounded-lg bg-gray-800 border border-gray-700 text-white text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+   230→              >
+   231→                <option value="all">All Statuses</option>
+   232→                {ALL_STATUSES.map(s => (
+   233→                  <option key={s} value={s}>{s.charAt(0).toUpperCase() + s.slice(1)}</option>
+   234→                ))}
+   235→              </select>
+   236→            </div>
+   237→            <div className="flex items-center gap-2">
+   238→              <label className="text-xs text-gray-500">Agent:</label>
+   239→              <select
+   240→                value={filterAgent}
+   241→                onChange={(e) => setFilterAgent(e.target.value)}
+   242→                className="px-3 py-1.5 rounded-lg bg-gray-800 border border-gray-700 text-white text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+   243→              >
+   244→                <option value="all">All Agents</option>
+   245→                {(Object.keys(AGENT_REGISTRY) as AgentId[]).map(id => (
+   246→                  <option key={id} value={id}>{id}</option>
+   247→                ))}
+   248→              </select>
+   249→            </div>
+   250→            {(filterStatus !== 'all' || filterAgent !== 'all' || searchQuery) && (
+   251→              <button
+   252→                onClick={() => { setFilterStatus('all'); setFilterAgent('all'); setSearchQuery(''); }}
+   253→                className="text-xs text-blue-400 hover:text-blue-300 transition-colors"
+   254→              >
+   255→                Clear filters
+   256→              </button>
+   257→            )}
+   258→          </div>
+   259→        )}
+   260→      </div>
+   261→
+   262→      {/* Error */}
+   263→      {error && (
+   264→        <div className="mb-6 px-4 py-3 rounded-lg bg-red-500/10 border border-red-500/20 text-red-400 text-sm flex items-center justify-between">
+   265→          <span>{error}</span>
+   266→          <button onClick={() => setError(null)}>
+   267→            <X className="w-4 h-4" />
+   268→          </button>
+   269→        </div>
+   270→      )}
+   271→
+   272→      {/* Projects Grid / List */}
+   273→      {loading ? (
+   274→        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+   275→          <SkeletonCard />
+   276→          <SkeletonCard />
+   277→          <SkeletonCard />
+   278→          <SkeletonCard />
+   279→          <SkeletonCard />
+   280→          <SkeletonCard />
+   281→        </div>
+   282→      ) : filteredProjects.length === 0 ? (
+   283→        <div className="glass-card rounded-2xl p-16 flex items-center justify-center text-gray-600">
+   284→          <div className="text-center">
+   285→            <FolderKanban className="w-16 h-16 mx-auto mb-4 opacity-30" />
+   286→            <p className="text-lg font-medium">
+   287→              {projects.length === 0 ? 'No projects yet' : 'No matching projects'}
+   288→            </p>
+   289→            <p className="text-sm mt-1">
+   290→              {projects.length === 0
+   291→                ? 'Create your first project or execute an agent to get started'
+   292→                : 'Try adjusting your search or filters'}
+   293→            </p>
+   294→          </div>
+   295→        </div>
+   296→      ) : (
+   297→        <div className="space-y-4">
+   298→          {filteredProjects.map((project) => {
+   299→            const isExpanded = expandedId === project.id;
+   300→            const detail = projectDetail[project.id];
+   301→            const isDeleting = deleteLoading === project.id;
+   302→
+   303→            return (
+   304→              <div key={project.id} className="glass-card rounded-xl overflow-hidden">
+   305→                {/* Project Header Row */}
+   306→                <button
+   307→                  onClick={() => toggleExpand(project.id)}
+   308→                  className="w-full flex items-center justify-between p-5 hover:bg-gray-800/30 transition-colors text-left"
+   309→                >
+   310→                  <div className="flex items-center gap-4">
+   311→                    <div
+   312→                      className="w-11 h-11 rounded-xl flex items-center justify-center flex-shrink-0"
+   313→                      style={{ backgroundColor: `${AGENT_REGISTRY[project.agentId as AgentId]?.color || '#6B7280'}15` }}
+   314→                    >
+   315→                      {(() => {
+   316→                        const Icon = AGENT_ICON_MAP[project.agentId] || Code2;
+   317→                        return <Icon className="w-5 h-5" style={{ color: AGENT_REGISTRY[project.agentId as AgentId]?.color || '#6B7280' }} />;
+   318→                      })()}
+   319→                    </div>
+   320→                    <div>
+   321→                      <div className="flex items-center gap-3 flex-wrap">
+   322→                        <p className="text-base font-semibold text-white">{project.name}</p>
+   323→                        <AgentBadge agentId={project.agentId} />
+   324→                        <StatusBadge status={project.status} />
+   325→                      </div>
+   326→                      <div className="flex items-center gap-3 mt-0.5">
+   327→                        <span className="text-xs text-gray-500 flex items-center gap-1">
+   328→                          <Clock className="w-3 h-3" />
+   329→                          {new Date(project.createdAt).toLocaleDateString()}
+   330→                        </span>
+   331→                        {project.description && (
+   332→                          <span className="text-xs text-gray-600 truncate max-w-xs">{project.description}</span>
+   333→                        )}
+   334→                      </div>
+   335→                    </div>
+   336→                  </div>
+   337→                  <div className="flex items-center gap-3">
+   338→                    <span className="text-xs text-gray-600">{project.id}</span>
+   339→                    {isExpanded ? (
+   340→                      <ChevronUp className="w-5 h-5 text-gray-500" />
+   341→                    ) : (
+   342→                      <ChevronDown className="w-5 h-5 text-gray-500" />
+   343→                    )}
+   344→                  </div>
+   345→                </button>
+   346→
+   347→                {/* Expanded Details */}
+   348→                {isExpanded && (
+   349→                  <div className="border-t border-gray-800 p-5 animate-fade-in">
+   350→                    {detailLoading === project.id ? (
+   351→                      <div className="flex items-center justify-center py-8">
+   352→                        <Loader2 className="w-6 h-6 text-blue-400 animate-spin" />
+   353→                      </div>
+   354→                    ) : (
+   355→                      <div className="space-y-5">
+   356→                        {/* Description */}
+   357→                        {project.description && (
+   358→                          <div>
+   359→                            <h4 className="text-sm font-semibold text-white mb-2">Description</h4>
+   360→                            <p className="text-sm text-gray-400">{project.description}</p>
+   361→                          </div>
+   362→                        )}
+   363→
+   364→                        {/* Metadata Grid */}
+   365→                        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+   366→                          <div className="px-3 py-2 rounded-lg bg-gray-800/40">
+   367→                            <p className="text-xs text-gray-500">Status</p>
+   368→                            <StatusBadge status={project.status} />
+   369→                          </div>
+   370→                          <div className="px-3 py-2 rounded-lg bg-gray-800/40">
+   371→                            <p className="text-xs text-gray-500 mb-1">Agent</p>
+   372→                            <AgentBadge agentId={project.agentId} />
+   373→                          </div>
+   374→                          <div className="px-3 py-2 rounded-lg bg-gray-800/40">
+   375→                            <p className="text-xs text-gray-500">Created</p>
+   376→                            <p className="text-sm text-gray-300">{new Date(project.createdAt).toLocaleString()}</p>
+   377→                          </div>
+   378→                          <div className="px-3 py-2 rounded-lg bg-gray-800/40">
+   379→                            <p className="text-xs text-gray-500">Updated</p>
+   380→                            <p className="text-sm text-gray-300">{new Date(project.updatedAt).toLocaleString()}</p>
+   381→                          </div>
+   382→                        </div>
+   383→
+   384→                        {/* Config */}
+   385→                        {(detail?.config || project.config) && (
+   386→                          <div>
+   387→                            <div className="flex items-center justify-between mb-2">
+   388→                              <h4 className="text-sm font-semibold text-white flex items-center gap-2">
+   389→                                <Code2 className="w-4 h-4 text-blue-400" />
+   390→                                Config
+   391→                              </h4>
+   392→                              <CopyButton text={JSON.stringify(detail?.config || project.config, null, 2)} />
+   393→                            </div>
+   394→                            <div className="bg-gray-900 rounded-xl p-4 max-h-64 overflow-y-auto">
+   395→                              <pre className="text-sm text-gray-300 whitespace-pre-wrap font-mono">
+   396→                                {JSON.stringify(detail?.config || project.config, null, 2)}
+   397→                              </pre>
+   398→                            </div>
+   399→                          </div>
+   400→                        )}
+   401→
+   402→                        {/* Files */}
+   403→                        {(detail?.files || project.files) && (
+   404→                          <div>
+   405→                            <h4 className="text-sm font-semibold text-white mb-2 flex items-center gap-2">
+   406→                              <FileText className="w-4 h-4 text-green-400" />
+   407→                              Files
+   408→                            </h4>
+   409→                            <div className="bg-gray-900 rounded-xl p-4 max-h-64 overflow-y-auto">
+   410→                              <pre className="text-sm text-gray-300 whitespace-pre-wrap font-mono">
+   411→                                {typeof (detail?.files || project.files) === 'string'
+   412→                                  ? detail?.files || project.files
+   413→                                  : JSON.stringify(detail?.files || project.files, null, 2)}
+   414→                              </pre>
+   415→                            </div>
+   416→                          </div>
+   417→                        )}
+   418→
+   419→                        {/* Actions */}
+   420→                        <div className="flex items-center justify-end gap-3 pt-2 border-t border-gray-800">
+   421→                          <button
+   422→                            onClick={(e) => {
+   423→                              e.stopPropagation();
+   424→                              setEditingProject(project);
+   425→                            }}
+   426→                            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-gray-500 hover:text-blue-400 hover:bg-blue-500/10 text-xs font-medium transition-colors"
+   427→                          >
+   428→                            <Pencil className="w-3.5 h-3.5" />
+   429→                            Edit
+   430→                          </button>
+   431→                          {deleteConfirmId === project.id ? (
+   432→                            <>
+   433→                              <span className="text-sm text-red-400">Delete this project?</span>
+   434→                              <button
+   435→                                onClick={() => setDeleteConfirmId(null)}
+   436→                                className="px-3 py-1.5 rounded-lg bg-gray-800 hover:bg-gray-700 text-gray-300 text-xs font-medium transition-colors"
+   437→                              >
+   438→                                Cancel
+   439→                              </button>
+   440→                              <button
+   441→                                onClick={() => handleDelete(project.id)}
+   442→                                disabled={isDeleting}
+   443→                                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-red-500 hover:bg-red-600 text-white text-xs font-medium transition-colors disabled:opacity-50"
+   444→                              >
+   445→                                {isDeleting ? (
+   446→                                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+   447→                                ) : (
+   448→                                  <Trash2 className="w-3.5 h-3.5" />
+   449→                                )}
+   450→                                Confirm Delete
+   451→                              </button>
+   452→                            </>
+   453→                          ) : (
+   454→                            <button
+   455→                              onClick={(e) => {
+   456→                                e.stopPropagation();
+   457→                                setDeleteConfirmId(project.id);
+   458→                              }}
+   459→                              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-gray-500 hover:text-red-400 hover:bg-red-500/10 text-xs font-medium transition-colors"
+   460→                            >
+   461→                              <Trash2 className="w-3.5 h-3.5" />
+   462→                              Delete
+   463→                            </button>
+   464→                          )}
+   465→                        </div>
+   466→                      </div>
+   467→                    )}
+   468→                  </div>
+   469→                )}
+   470→              </div>
+   471→            );
+   472→          })}
+   473→        </div>
+   474→      )}
+   475→
+   476→      {/* Create Project Modal */}
+   477→      {showCreate && (
+   478→        <CreateProjectModal
+   479→          onClose={() => setShowCreate(false)}
+   480→          onCreated={() => {
+   481→            setShowCreate(false);
+   482→            fetchProjects();
+   483→          }}
+   484→        />
+   485→      )}
+   486→
+   487→      {/* Edit Project Modal */}
+   488→      {editingProject && (
+   489→        <EditProjectModal
+   490→          project={editingProject}
+   491→          onClose={() => setEditingProject(null)}
+   492→          onSaved={() => {
+   493→            setEditingProject(null);
+   494→            fetchProjects();
+   495→          }}
+   496→        />
+   497→      )}
+   498→    </div>
+   499→  );
+   500→}
+   501→
+   502→// ── Copy Button ──────────────────────────────────────────
+   503→function CopyButton({ text }: { text: string }) {
+   504→  const [copied, setCopied] = useState(false);
+   505→
+   506→  const handleCopy = () => {
+   507→    navigator.clipboard.writeText(text);
+   508→    setCopied(true);
+   509→    setTimeout(() => setCopied(false), 2000);
+   510→  };
+   511→
+   512→  return (
+   513→    <button
+   514→      onClick={handleCopy}
+   515→      className="text-xs text-gray-500 hover:text-gray-300 transition-colors flex items-center gap-1"
+   516→    >
+   517→      {copied ? (
+   518→        <>
+   519→          <CheckCircle className="w-3 h-3 text-green-400" />
+   520→          <span className="text-green-400">Copied</span>
+   521→        </>
+   522→      ) : (
+   523→        <>
+   524→          <Copy className="w-3 h-3" />
+   525→          Copy
+   526→        </>
+   527→      )}
+   528→    </button>
+   529→  );
+   530→}
+   531→
+   532→// ── Create Project Modal ─────────────────────────────────
+   533→function CreateProjectModal({ onClose, onCreated }: { onClose: () => void; onCreated: () => void }) {
+   534→  const { addToast } = useToast();
+   535→  const [name, setName] = useState('');
+   536→  const [description, setDescription] = useState('');
+   537→  const [agentId, setAgentId] = useState<AgentId>('DEV');
+   538→  const [config, setConfig] = useState('');
+   539→  const [submitting, setSubmitting] = useState(false);
+   540→  const [error, setError] = useState<string | null>(null);
+   541→
+   542→  const handleSubmit = async (e: React.FormEvent) => {
+   543→    e.preventDefault();
+   544→    try {
+   545→      setSubmitting(true);
+   546→      setError(null);
+   547→      let parsedConfig = {};
+   548→      if (config.trim()) {
+   549→        try {
+   550→          parsedConfig = JSON.parse(config);
+   551→        } catch {
+   552→          setError('Invalid JSON in config field');
+   553→          setSubmitting(false);
+   554→          return;
+   555→        }
+   556→      }
+   557→      await api.createProject({ name, description, agentId, config: parsedConfig });
+   558→      addToast('success', `Project "${name}" created successfully`);
+   559→      onCreated();
+   560→    } catch (err: any) {
+   561→      setError(err.message || 'Failed to create project');
+   562→      addToast('error', err.message || 'Failed to create project');
+   563→    } finally {
+   564→      setSubmitting(false);
+   565→    }
+   566→  };
+   567→
+   568→  return (
+   569→    <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+   570→      <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={onClose} />
+   571→      <div className="relative w-full max-w-lg glass-card rounded-2xl p-6 animate-fade-in">
+   572→        <div className="flex items-center justify-between mb-6">
+   573→          <h2 className="text-xl font-semibold text-white">Create Project</h2>
+   574→          <button onClick={onClose} className="p-1.5 rounded-lg text-gray-500 hover:text-white hover:bg-gray-800 transition-colors">
+   575→            <X className="w-5 h-5" />
+   576→          </button>
+   577→        </div>
+   578→
+   579→        {error && (
+   580→          <div className="mb-4 px-3 py-2 rounded-lg bg-red-500/10 border border-red-500/20 text-red-400 text-sm">
+   581→            {error}
+   582→          </div>
+   583→        )}
+   584→
+   585→        <form onSubmit={handleSubmit} className="space-y-5">
+   586→          {/* Name */}
+   587→          <div>
+   588→            <label className="block text-sm font-medium text-gray-300 mb-1.5">Name</label>
+   589→            <input
+   590→              type="text"
+   591→              value={name}
+   592→              onChange={(e) => setName(e.target.value)}
+   593→              placeholder="My Project"
+   594→              className="w-full px-4 py-2.5 rounded-lg bg-gray-800 border border-gray-700 text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-sm"
+   595→              required
+   596→            />
+   597→          </div>
+   598→
+   599→          {/* Description */}
+   600→          <div>
+   601→            <label className="block text-sm font-medium text-gray-300 mb-1.5">Description</label>
+   602→            <textarea
+   603→              value={description}
+   604→              onChange={(e) => setDescription(e.target.value)}
+   605→              placeholder="Describe what this project does..."
+   606→              rows={3}
+   607→              className="w-full px-4 py-2.5 rounded-lg bg-gray-800 border border-gray-700 text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-sm resize-none"
+   608→            />
+   609→          </div>
+   610→
+   611→          {/* Agent ID */}
+   612→          <div>
+   613→            <label className="block text-sm font-medium text-gray-300 mb-2">Agent</label>
+   614→            <div className="grid grid-cols-4 gap-2">
+   615→              {(Object.keys(AGENT_REGISTRY) as AgentId[]).map((id) => {
+   616→                const agentConfig = AGENT_REGISTRY[id];
+   617→                const Icon = AGENT_ICON_MAP[id] || Code2;
+   618→                return (
+   619→                  <button
+   620→                    key={id}
+   621→                    type="button"
+   622→                    onClick={() => setAgentId(id)}
+   623→                    className={cn(
+   624→                      'flex flex-col items-center gap-1.5 px-2 py-2.5 rounded-lg text-xs font-medium transition-all border',
+   625→                      agentId === id
+   626→                        ? 'bg-blue-500/10 text-blue-400 border-blue-500/30'
+   627→                        : 'bg-gray-800 text-gray-400 border-gray-700 hover:border-gray-600'
+   628→                    )}
+   629→                  >
+   630→                    <Icon className="w-4 h-4" style={{ color: agentConfig?.color }} />
+   631→                    {id}
+   632→                  </button>
+   633→                );
+   634→              })}
+   635→            </div>
+   636→          </div>
+   637→
+   638→          {/* Config (optional JSON) */}
+   639→          <div>
+   640→            <label className="block text-sm font-medium text-gray-300 mb-1.5">
+   641→              Config <span className="text-gray-600">(optional JSON)</span>
+   642→            </label>
+   643→            <textarea
+   644→              value={config}
+   645→              onChange={(e) => setConfig(e.target.value)}
+   646→              placeholder='{"key": "value"}'
+   647→              rows={4}
+   648→              className="w-full px-4 py-2.5 rounded-lg bg-gray-800 border border-gray-700 text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-sm font-mono"
+   649→            />
+   650→          </div>
+   651→
+   652→          {/* Actions */}
+   653→          <div className="flex items-center justify-end gap-3 pt-2">
+   654→            <button
+   655→              type="button"
+   656→              onClick={onClose}
+   657→              className="px-4 py-2.5 rounded-lg bg-gray-800 hover:bg-gray-700 text-gray-300 text-sm font-medium transition-colors"
+   658→            >
+   659→              Cancel
+   660→            </button>
+   661→            <button
+   662→              type="submit"
+   663→              disabled={submitting}
+   664→              className="inline-flex items-center gap-2 px-5 py-2.5 rounded-lg bg-blue-500 hover:bg-blue-600 text-white text-sm font-medium transition-colors disabled:opacity-50"
+   665→            >
+   666→              {submitting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />}
+   667→              Create
+   668→            </button>
+   669→          </div>
+   670→        </form>
+   671→      </div>
+   672→    </div>
+   673→  );
+   674→}
+   675→
+   676→// ── Edit Project Modal ───────────────────────────────────
+   677→function EditProjectModal({ project, onClose, onSaved }: { project: any; onClose: () => void; onSaved: () => void }) {
+   678→  const { addToast } = useToast();
+   679→  const [name, setName] = useState(project.name || '');
+   680→  const [description, setDescription] = useState(project.description || '');
+   681→  const [status, setStatus] = useState(project.status || 'draft');
+   682→  const [config, setConfig] = useState(
+   683→    project.config ? JSON.stringify(project.config, null, 2) : ''
+   684→  );
+   685→  const [submitting, setSubmitting] = useState(false);
+   686→  const [error, setError] = useState<string | null>(null);
+   687→
+   688→  const handleSubmit = async (e: React.FormEvent) => {
+   689→    e.preventDefault();
+   690→    try {
+   691→      setSubmitting(true);
+   692→      setError(null);
+   693→      let parsedConfig: Record<string, unknown> | undefined;
+   694→      if (config.trim()) {
+   695→        try {
+   696→          parsedConfig = JSON.parse(config);
+   697→        } catch {
+   698→          setError('Invalid JSON in config field');
+   699→          setSubmitting(false);
+   700→          return;
+   701→        }
+   702→      }
+   703→      await api.updateProject(project.id, {
+   704→        name: name !== project.name ? name : undefined,
+   705→        description: description !== project.description ? description : undefined,
+   706→        status: status !== project.status ? status : undefined,
+   707→        config: parsedConfig,
+   708→      });
+   709→      addToast('success', `Project "${name}" updated successfully`);
+   710→      onSaved();
+   711→    } catch (err: any) {
+   712→      setError(err.message || 'Failed to update project');
+   713→      addToast('error', err.message || 'Failed to update project');
+   714→    } finally {
+   715→      setSubmitting(false);
+   716→    }
+   717→  };
+   718→
+   719→  const editableStatuses = ALL_STATUSES.filter(s => STATUS_CONFIG[s]?.editable !== false);
+   720→
+   721→  return (
+   722→    <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+   723→      <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={onClose} />
+   724→      <div className="relative w-full max-w-lg glass-card rounded-2xl p-6 animate-fade-in">
+   725→        <div className="flex items-center justify-between mb-6">
+   726→          <h2 className="text-xl font-semibold text-white flex items-center gap-2">
+   727→            <Pencil className="w-5 h-5 text-blue-400" />
+   728→            Edit Project
+   729→          </h2>
+   730→          <button onClick={onClose} className="p-1.5 rounded-lg text-gray-500 hover:text-white hover:bg-gray-800 transition-colors">
+   731→            <X className="w-5 h-5" />
+   732→          </button>
+   733→        </div>
+   734→
+   735→        {error && (
+   736→          <div className="mb-4 px-3 py-2 rounded-lg bg-red-500/10 border border-red-500/20 text-red-400 text-sm">
+   737→            {error}
+   738→          </div>
+   739→        )}
+   740→
+   741→        <form onSubmit={handleSubmit} className="space-y-5">
+   742→          {/* Name */}
+   743→          <div>
+   744→            <label className="block text-sm font-medium text-gray-300 mb-1.5">Name</label>
+   745→            <input
+   746→              type="text"
+   747→              value={name}
+   748→              onChange={(e) => setName(e.target.value)}
+   749→              className="w-full px-4 py-2.5 rounded-lg bg-gray-800 border border-gray-700 text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-sm"
+   750→              required
+   751→            />
+   752→          </div>
+   753→
+   754→          {/* Description */}
+   755→          <div>
+   756→            <label className="block text-sm font-medium text-gray-300 mb-1.5">Description</label>
+   757→            <textarea
+   758→              value={description}
+   759→              onChange={(e) => setDescription(e.target.value)}
+   760→              placeholder="Describe what this project does..."
+   761→              rows={3}
+   762→              className="w-full px-4 py-2.5 rounded-lg bg-gray-800 border border-gray-700 text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-sm resize-none"
+   763→            />
+   764→          </div>
+   765→
+   766→          {/* Status */}
+   767→          <div>
+   768→            <label className="block text-sm font-medium text-gray-300 mb-1.5">Status</label>
+   769→            <select
+   770→              value={status}
+   771→              onChange={(e) => setStatus(e.target.value)}
+   772→              className="w-full px-4 py-2.5 rounded-lg bg-gray-800 border border-gray-700 text-white focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-sm"
+   773→            >
+   774→              {editableStatuses.map(s => (
+   775→                <option key={s} value={s}>{s.charAt(0).toUpperCase() + s.slice(1)}</option>
+   776→              ))}
+   777→            </select>
+   778→          </div>
+   779→
+   780→          {/* Config (optional JSON) */}
+   781→          <div>
+   782→            <label className="block text-sm font-medium text-gray-300 mb-1.5">
+   783→              Config <span className="text-gray-600">(JSON)</span>
+   784→            </label>
+   785→            <textarea
+   786→              value={config}
+   787→              onChange={(e) => setConfig(e.target.value)}
+   788→              placeholder='{"key": "value"}'
+   789→              rows={5}
+   790→              className="w-full px-4 py-2.5 rounded-lg bg-gray-800 border border-gray-700 text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-sm font-mono"
+   791→            />
+   792→          </div>
+   793→
+   794→          {/* Actions */}
+   795→          <div className="flex items-center justify-end gap-3 pt-2">
+   796→            <button
+   797→              type="button"
+   798→              onClick={onClose}
+   799→              className="px-4 py-2.5 rounded-lg bg-gray-800 hover:bg-gray-700 text-gray-300 text-sm font-medium transition-colors"
+   800→            >
+   801→              Cancel
+   802→            </button>
+   803→            <button
+   804→              type="submit"
+   805→              disabled={submitting}
+   806→              className="inline-flex items-center gap-2 px-5 py-2.5 rounded-lg bg-blue-500 hover:bg-blue-600 text-white text-sm font-medium transition-colors disabled:opacity-50"
+   807→            >
+   808→              {submitting ? <Loader2 className="w-4 h-4 animate-spin" /> : <CheckCircle className="w-4 h-4" />}
+   809→              Save Changes
+   810→            </button>
+   811→          </div>
+   812→        </form>
+   813→      </div>
+   814→    </div>
+   815→  );
+   816→}
+   817→

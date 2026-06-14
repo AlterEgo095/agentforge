@@ -1,0 +1,1143 @@
+     1→// ============================================================================
+     2→// @alterego/research-worker — Comprehensive Tests
+     3→// ============================================================================
+     4→
+     5→import { describe, it, expect, vi, beforeEach } from 'vitest';
+     6→
+     7→import type {
+     8→  ResearchSource,
+     9→  SourceId,
+    10→  ResearchSessionId,
+    11→  IBrowserCapability,
+    12→  IEventEmitter,
+    13→  IKnowledgeStore,
+    14→  IMemoryStore,
+    15→  SourceContent,
+    16→  FindingId,
+    17→} from '../types';
+    18→
+    19→import { DEFAULT_RESEARCH_CONFIG } from '../types';
+    20→
+    21→// Modules under test
+    22→import {
+    23→  detectSourceType,
+    24→  assessCredibility,
+    25→  computeRelevance,
+    26→  deduplicateSources,
+    27→  filterByRelevance,
+    28→  sortSourcesByRelevance,
+    29→  sortSourcesByCredibility,
+    30→  extractTags,
+    31→} from '../search';
+    32→
+    33→import {
+    34→  cleanContent,
+    35→  detectLanguage,
+    36→  extractRelevantExcerpt,
+    37→} from '../reader';
+    38→
+    39→import {
+    40→  compareSources,
+    41→  comparePair,
+    42→  extractKeyClaims,
+    43→  checkNegationDisagreement,
+    44→  getComparisonOverview,
+    45→} from '../comparator';
+    46→
+    47→import {
+    48→  generateSummary,
+    49→  extractKeyPhrases,
+    50→  generateExecutiveSummary,
+    51→  detectConsensus,
+    52→  detectControversies,
+    53→  detectGaps,
+    54→  generateRecommendations,
+    55→} from '../summarizer';
+    56→
+    57→import {
+    58→  classifyResearch,
+    59→  detectDomain,
+    60→  extractSubTopics,
+    61→  extractEntities,
+    62→  analyzeSentiment,
+    63→  detectTemporalFocus,
+    64→} from '../classifier';
+    65→
+    66→import {
+    67→  generateReferences,
+    68→  formatAPA,
+    69→  formatMLA,
+    70→  formatChicago,
+    71→  formatBibTeX,
+    72→  formatPlain,
+    73→  extractAuthor,
+    74→  extractPublishedDate,
+    75→  extractDomain,
+    76→} from '../referencer';
+    77→
+    78→import {
+    79→  extractFindingsFromSources,
+    80→  detectFindingType,
+    81→  assessFindingSentiment,
+    82→  computeConfidence,
+    83→  extractTopics,
+    84→  deduplicateFindings,
+    85→} from '../findings';
+    86→
+    87→import {
+    88→  RESEARCH_WORKER_MANIFEST,
+    89→  createResearchWorker,
+    90→} from '../plugin';
+    91→
+    92→import { ResearchWorker } from '../research-worker';
+    93→
+    94→// ============================================================================
+    95→// Test Fixtures
+    96→// ============================================================================
+    97→
+    98→function createMockSource(overrides?: Partial<ResearchSource>): ResearchSource {
+    99→  return {
+   100→    id: `src_${Math.random().toString(36).slice(2, 8)}` as SourceId,
+   101→    url: 'https://example.com/article',
+   102→    title: 'Test Article About React Performance',
+   103→    snippet: 'React is a popular JavaScript library for building user interfaces with excellent performance.',
+   104→    type: 'article',
+   105→    credibility: 'medium',
+   106→    engine: 'duckduckgo',
+   107→    position: 1,
+   108→    relevanceScore: 0.8,
+   109→    tags: ['react', 'javascript', 'performance'],
+   110→    ...overrides,
+   111→  };
+   112→}
+   113→
+   114→function createMockSourceWithContent(
+   115→  overrides?: Partial<ResearchSource>,
+   116→  text?: string,
+   117→): ResearchSource {
+   118→  const source = createMockSource(overrides);
+   119→  const contentText = text ?? 'React is a JavaScript library for building user interfaces. ' +
+   120→    'It was created by Facebook and is widely used. React provides excellent performance ' +
+   121→    'through its virtual DOM implementation. According to research, React has the largest ' +
+   122→    'market share among frontend frameworks. The library supports component-based architecture.';
+   123→
+   124→  source.content = {
+   125→    text: contentText,
+   126→    links: ['https://react.dev'],
+   127→    images: [],
+   128→    meta: {
+   129→      title: source.title,
+   130→      description: 'A comprehensive guide to React',
+   131→      author: 'John Doe',
+   132→      publishedTime: '2024-01-15',
+   133→      keywords: ['react', 'javascript', 'frontend'],
+   134→    },
+   135→    wordCount: contentText.split(/\s+/).length,
+   136→    language: 'en',
+   137→  };
+   138→  source.readAt = new Date();
+   139→  return source;
+   140→}
+   141→
+   142→function createMockBrowser(searchResults?: Array<{ url: string; title: string; snippet: string }>): IBrowserCapability {
+   143→  const defaultResults = searchResults ?? [
+   144→    { url: 'https://react.dev/learn', title: 'React Documentation', snippet: 'Learn React, a JavaScript library for building user interfaces.' },
+   145→    { url: 'https://github.com/facebook/react', title: 'React GitHub Repository', snippet: 'A declarative, efficient, and flexible JavaScript library for building user interfaces.' },
+   146→  ];
+   147→
+   148→  return {
+   149→    search: vi.fn().mockResolvedValue(defaultResults),
+   150→    read: vi.fn().mockResolvedValue({
+   151→      url: defaultResults[0]!.url,
+   152→      text: 'React is a JavaScript library for building user interfaces. It was created by Facebook and released in 2013.',
+   153→      links: ['https://react.dev'],
+   154→      images: [],
+   155→      meta: {
+   156→        title: defaultResults[0]!.title,
+   157→        description: defaultResults[0]!.snippet,
+   158→        author: 'Facebook',
+   159→        publishedTime: '2024-01-15',
+   160→      },
+   161→    }),
+   162→    isAvailable: vi.fn().mockResolvedValue(true),
+   163→    dispose: vi.fn().mockResolvedValue(undefined),
+   164→  };
+   165→}
+   166→
+   167→function createMockEventEmitter(): IEventEmitter {
+   168→  return {
+   169→    emit: vi.fn(),
+   170→    on: vi.fn(),
+   171→    off: vi.fn(),
+   172→  };
+   173→}
+   174→
+   175→function createMockKnowledgeStore(): IKnowledgeStore {
+   176→  return {
+   177→    createDocument: vi.fn().mockResolvedValue({ id: 'doc_123' }),
+   178→  };
+   179→}
+   180→
+   181→function createMockMemoryStore(): IMemoryStore {
+   182→  return {
+   183→    record: vi.fn().mockResolvedValue(undefined),
+   184→  };
+   185→}
+   186→
+   187→// ============================================================================
+   188→// SEARCH MODULE TESTS
+   189→// ============================================================================
+   190→
+   191→describe('Search Module', () => {
+   192→  describe('detectSourceType', () => {
+   193→    it('should detect repository type from GitHub URL', () => {
+   194→      expect(detectSourceType('https://github.com/facebook/react', 'React', 'A library')).toBe('repository');
+   195→    });
+   196→
+   197→    it('should detect paper type from arxiv URL', () => {
+   198→      expect(detectSourceType('https://arxiv.org/abs/2301.12345', 'Research Paper', 'A study')).toBe('paper');
+   199→    });
+   200→
+   201→    it('should detect documentation type from docs URL', () => {
+   202→      expect(detectSourceType('https://docs.python.org/3/', 'Python Docs', 'Documentation')).toBe('documentation');
+   203→    });
+   204→
+   205→    it('should detect blog type from medium URL', () => {
+   206→      expect(detectSourceType('https://medium.com/test', 'Blog Post', 'A blog')).toBe('blog');
+   207→    });
+   208→
+   209→    it('should detect tutorial type from title', () => {
+   210→      expect(detectSourceType('https://example.com/test', 'Getting Started Tutorial', 'How to get started')).toBe('tutorial');
+   211→    });
+   212→
+   213→    it('should default to article for unknown patterns', () => {
+   214→      expect(detectSourceType('https://example.com/something', 'Some Page', 'Some content')).toBe('article');
+   215→    });
+   216→
+   217→    it('should detect forum type from stackoverflow URL', () => {
+   218→      expect(detectSourceType('https://stackoverflow.com/questions/12345', 'Question', 'How to do X')).toBe('forum');
+   219→    });
+   220→
+   221→    it('should detect news type from URL', () => {
+   222→      expect(detectSourceType('https://techcrunch.com/2024/01/15/test', 'Breaking News', 'Announced today')).toBe('news');
+   223→    });
+   224→  });
+   225→
+   226→  describe('assessCredibility', () => {
+   227→    it('should assess high credibility for known domains', () => {
+   228→      expect(assessCredibility('https://github.com/facebook/react', 'repository')).toBe('high');
+   229→      expect(assessCredibility('https://developer.mozilla.org/en-US/', 'documentation')).toBe('high');
+   230→    });
+   231→
+   232→    it('should assess medium credibility for medium-trust domains', () => {
+   233→      expect(assessCredibility('https://medium.com/@user/article', 'blog')).toBe('medium');
+   234→      expect(assessCredibility('https://dev.to/user/article', 'blog')).toBe('medium');
+   235→    });
+   236→
+   237→    it('should assess medium for paper type on unknown domain', () => {
+   238→      expect(assessCredibility('https://unknown.org/paper/123', 'paper')).toBe('medium');
+   239→    });
+   240→
+   241→    it('should assess unverified for unknown HTTP domains', () => {
+   242→      expect(assessCredibility('http://random-site.xyz/page', 'article')).toBe('unverified');
+   243→    });
+   244→
+   245→    it('should assess medium for HTTPS on unknown domain', () => {
+   246→      expect(assessCredibility('https://random-site.com/page', 'article')).toBe('medium');
+   247→    });
+   248→  });
+   249→
+   250→  describe('computeRelevance', () => {
+   251→    it('should return higher score when query terms are in title', () => {
+   252→      const titleMatch = computeRelevance('react performance', 'React Performance Guide', 'snippet', 1);
+   253→      const snippetOnly = computeRelevance('react performance', 'Some Guide', 'React performance tips', 1);
+   254→      expect(titleMatch).toBeGreaterThan(snippetOnly);
+   255→    });
+   256→
+   257→    it('should return lower score for higher position', () => {
+   258→      const pos1 = computeRelevance('react', 'React Guide', 'About React', 1);
+   259→      const pos10 = computeRelevance('react', 'React Guide', 'About React', 10);
+   260→      expect(pos1).toBeGreaterThan(pos10);
+   261→    });
+   262→
+   263→    it('should return 0 for empty query', () => {
+   264→      expect(computeRelevance('', 'Title', 'Snippet', 1)).toBe(0);
+   265→    });
+   266→
+   267→    it('should return high score for perfect match', () => {
+   268→      const score = computeRelevance('react', 'React Guide', 'Learn React', 1);
+   269→      expect(score).toBeGreaterThan(0.5);
+   270→    });
+   271→  });
+   272→
+   273→  describe('filterByRelevance', () => {
+   274→    it('should filter sources below minimum relevance', () => {
+   275→      const sources = [
+   276→        createMockSource({ relevanceScore: 0.8 }),
+   277→        createMockSource({ relevanceScore: 0.2 }),
+   278→        createMockSource({ relevanceScore: 0.5 }),
+   279→      ];
+   280→      const filtered = filterByRelevance(sources, 0.4);
+   281→      expect(filtered).toHaveLength(2);
+   282→    });
+   283→  });
+   284→
+   285→  describe('sortSourcesByRelevance', () => {
+   286→    it('should sort sources by relevance descending', () => {
+   287→      const sources = [
+   288→        createMockSource({ relevanceScore: 0.3 }),
+   289→        createMockSource({ relevanceScore: 0.9 }),
+   290→        createMockSource({ relevanceScore: 0.6 }),
+   291→      ];
+   292→      const sorted = sortSourcesByRelevance(sources);
+   293→      expect(sorted[0]!.relevanceScore).toBe(0.9);
+   294→      expect(sorted[2]!.relevanceScore).toBe(0.3);
+   295→    });
+   296→  });
+   297→
+   298→  describe('sortSourcesByCredibility', () => {
+   299→    it('should sort sources by credibility level', () => {
+   300→      const sources = [
+   301→        createMockSource({ credibility: 'low' }),
+   302→        createMockSource({ credibility: 'high' }),
+   303→        createMockSource({ credibility: 'medium' }),
+   304→      ];
+   305→      const sorted = sortSourcesByCredibility(sources);
+   306→      expect(sorted[0]!.credibility).toBe('high');
+   307→      expect(sorted[2]!.credibility).toBe('low');
+   308→    });
+   309→  });
+   310→
+   311→  describe('deduplicateSources', () => {
+   312→    it('should remove duplicate URLs keeping higher relevance', () => {
+   313→      const sources = [
+   314→        createMockSource({ url: 'https://example.com/page', relevanceScore: 0.5 }),
+   315→        createMockSource({ url: 'https://example.com/page', relevanceScore: 0.9 }),
+   316→      ];
+   317→      const deduped = deduplicateSources(sources);
+   318→      expect(deduped).toHaveLength(1);
+   319→      expect(deduped[0]!.relevanceScore).toBe(0.9);
+   320→    });
+   321→  });
+   322→
+   323→  describe('extractTags', () => {
+   324→    it('should extract known tech terms as tags', () => {
+   325→      const tags = extractTags('React TypeScript Tutorial', 'Learn React with TypeScript');
+   326→      expect(tags).toContain('react');
+   327→      expect(tags).toContain('typescript');
+   328→      expect(tags).toContain('tutorial');
+   329→    });
+   330→
+   331→    it('should return empty array for non-tech text', () => {
+   332→      const tags = extractTags('Weather Forecast', 'Sunny skies expected');
+   333→      expect(tags).toHaveLength(0);
+   334→    });
+   335→  });
+   336→});
+   337→
+   338→// ============================================================================
+   339→// READER MODULE TESTS
+   340→// ============================================================================
+   341→
+   342→describe('Reader Module', () => {
+   343→  describe('cleanContent', () => {
+   344→    it('should remove HTML comments', () => {
+   345→      const result = cleanContent('Hello <!-- this is a comment --> World');
+   346→      expect(result).not.toContain('<!--');
+   347→      expect(result).toContain('Hello');
+   348→      expect(result).toContain('World');
+   349→    });
+   350→
+   351→    it('should remove cookie notices', () => {
+   352→      const result = cleanContent('Accept all cookies to continue reading. Main content here.');
+   353→      expect(result).not.toContain('Accept all cookies');
+   354→    });
+   355→
+   356→    it('should normalize excessive whitespace', () => {
+   357→      const result = cleanContent('Hello    World\n\n\n\n\nMore text');
+   358→      expect(result).not.toContain('    ');
+   359→    });
+   360→
+   361→    it('should remove navigation artifacts', () => {
+   362→      const result = cleanContent('Skip to main content. Article body.');
+   363→      expect(result).not.toContain('Skip to main content');
+   364→    });
+   365→  });
+   366→
+   367→  describe('detectLanguage', () => {
+   368→    it('should detect English', () => {
+   369→      expect(detectLanguage('This is an English text about programming and software development.')).toBe('en');
+   370→    });
+   371→
+   372→    it('should detect Chinese', () => {
+   373→      expect(detectLanguage('这是一段中文文本，用于测试语言检测功能。')).toBe('zh');
+   374→    });
+   375→
+   376→    it('should detect Japanese', () => {
+   377→      expect(detectLanguage('これは日本語のテキストです。プログラミングについて書いています。')).toBe('ja');
+   378→    });
+   379→
+   380→    it('should detect Russian', () => {
+   381→      expect(detectLanguage('Это русский текст для проверки определения языка.')).toBe('ru');
+   382→    });
+   383→
+   384→    it('should detect Arabic', () => {
+   385→      expect(detectLanguage('هذا نص باللغة العربية لاختبار اكتشاف اللغة.')).toBe('ar');
+   386→    });
+   387→
+   388→    it('should return unknown for very short text', () => {
+   389→      expect(detectLanguage('Hi')).toBe('unknown');
+   390→    });
+   391→  });
+   392→
+   393→  describe('extractRelevantExcerpt', () => {
+   394→    it('should extract sentences relevant to the query', () => {
+   395→      const text = 'React is a JavaScript library. Vue is another framework. Angular is by Google. React was created by Facebook.';
+   396→      const excerpt = extractRelevantExcerpt(text, 'React', 500);
+   397→      expect(excerpt).toContain('React');
+   398→    });
+   399→
+   400→    it('should respect maxChars limit', () => {
+   401→      const text = 'First sentence about React. Second sentence about Vue. Third sentence about Angular. Fourth about Svelte.';
+   402→      const excerpt = extractRelevantExcerpt(text, 'React', 50);
+   403→      expect(excerpt.length).toBeLessThanOrEqual(60); // Allow some margin
+   404→    });
+   405→
+   406→    it('should return beginning of text for empty query', () => {
+   407→      const text = 'Some text content here that is not empty.';
+   408→      const excerpt = extractRelevantExcerpt(text, '', 100);
+   409→      expect(excerpt.length).toBeGreaterThan(0);
+   410→    });
+   411→  });
+   412→});
+   413→
+   414→// ============================================================================
+   415→// COMPARATOR MODULE TESTS
+   416→// ============================================================================
+   417→
+   418→describe('Comparator Module', () => {
+   419→  describe('compareSources', () => {
+   420→    it('should return empty for less than 2 sources', async () => {
+   421→      const result = await compareSources([createMockSource()]);
+   422→      expect(result).toHaveLength(0);
+   423→    });
+   424→
+   425→    it('should compare pairs of sources', async () => {
+   426→      const sources = [
+   427→        createMockSourceWithContent({ id: 'src_a' as SourceId }, 'React is fast and efficient. React supports components.'),
+   428→        createMockSourceWithContent({ id: 'src_b' as SourceId }, 'React is fast and reliable. React supports hooks.'),
+   429→      ];
+   430→      const comparisons = await compareSources(sources);
+   431→      expect(comparisons.length).toBeGreaterThan(0);
+   432→    });
+   433→
+   434→    it('should produce comparisons with valid similarity scores', async () => {
+   435→      const sources = [
+   436→        createMockSourceWithContent({ id: 'src_a' as SourceId }, 'React is fast.'),
+   437→        createMockSourceWithContent({ id: 'src_b' as SourceId }, 'React is slow.'),
+   438→      ];
+   439→      const comparisons = await compareSources(sources);
+   440→      expect(comparisons[0]!.similarity).toBeGreaterThanOrEqual(0);
+   441→      expect(comparisons[0]!.similarity).toBeLessThanOrEqual(1);
+   442→    });
+   443→  });
+   444→
+   445→  describe('extractKeyClaims', () => {
+   446→    it('should extract claims with indicator words', () => {
+   447→      const text = 'Research shows that React is the most popular framework. The sky is blue. It is clear that Vue has advantages.';
+   448→      const claims = extractKeyClaims(text);
+   449→      expect(claims.length).toBeGreaterThan(0);
+   450→    });
+   451→
+   452→    it('should return empty for text without claims', () => {
+   453→      const text = 'Hello world. How are you. Nice day.';
+   454→      const claims = extractKeyClaims(text);
+   455→      expect(claims).toHaveLength(0);
+   456→    });
+   457→  });
+   458→
+   459→  describe('checkNegationDisagreement', () => {
+   460→    it('should detect negation disagreements', () => {
+   461→      expect(checkNegationDisagreement('This is good', 'This is not good')).toBe(true);
+   462→    });
+   463→
+   464→    it('should detect always/never disagreements', () => {
+   465→      expect(checkNegationDisagreement('It always works', 'It never works')).toBe(true);
+   466→    });
+   467→
+   468→    it('should return false for agreeing texts', () => {
+   469→      expect(checkNegationDisagreement('React is great', 'React is excellent')).toBe(false);
+   470→    });
+   471→  });
+   472→
+   473→  describe('getComparisonOverview', () => {
+   474→    it('should return zeroed overview for empty comparisons', () => {
+   475→      const overview = getComparisonOverview([]);
+   476→      expect(overview.totalPairs).toBe(0);
+   477→      expect(overview.averageSimilarity).toBe(0);
+   478→    });
+   479→
+   480→    it('should compute overview correctly', async () => {
+   481→      const sources = [
+   482→        createMockSourceWithContent({ id: 'src_a' as SourceId }, 'React is popular and efficient.'),
+   483→        createMockSourceWithContent({ id: 'src_b' as SourceId }, 'React is popular and fast.'),
+   484→        createMockSourceWithContent({ id: 'src_c' as SourceId }, 'Vue is popular and simple.'),
+   485→      ];
+   486→      const comparisons = await compareSources(sources);
+   487→      const overview = getComparisonOverview(comparisons);
+   488→      expect(overview.totalPairs).toBe(3); // C(3,2) = 3 pairs
+   489→      expect(overview.averageSimilarity).toBeGreaterThanOrEqual(0);
+   490→    });
+   491→  });
+   492→});
+   493→
+   494→// ============================================================================
+   495→// SUMMARIZER MODULE TESTS
+   496→// ============================================================================
+   497→
+   498→describe('Summarizer Module', () => {
+   499→  const mockSources = [
+   500→    createMockSourceWithContent({}, 'React is popular. React is efficient. React was created by Facebook. ' +
+   501→      'According to research, React leads the market. React supports component architecture.'),
+   502→  ];
+   503→  const mockFindings = extractFindingsFromSources(mockSources);
+   504→  const mockComparisons: Array<import('../types').SourceComparison> = [];
+   505→
+   506→  describe('generateSummary', () => {
+   507→    it('should generate a complete summary', () => {
+   508→      const summary = generateSummary('react', mockSources, mockFindings, mockComparisons);
+   509→      expect(summary).toHaveProperty('executive');
+   510→      expect(summary).toHaveProperty('keyFindings');
+   511→      expect(summary).toHaveProperty('consensus');
+   512→      expect(summary).toHaveProperty('controversies');
+   513→      expect(summary).toHaveProperty('gaps');
+   514→      expect(summary).toHaveProperty('recommendations');
+   515→    });
+   516→  });
+   517→
+   518→  describe('extractKeyPhrases', () => {
+   519→    it('should extract repeated phrases', () => {
+   520→      const phrases = extractKeyPhrases('React components provide reusable UI patterns. React components are efficient. React components support hooks.');
+   521→      expect(phrases.length).toBeGreaterThan(0);
+   522→    });
+   523→
+   524→    it('should return empty for empty text', () => {
+   525→      expect(extractKeyPhrases('')).toHaveLength(0);
+   526→    });
+   527→  });
+   528→
+   529→  describe('generateExecutiveSummary', () => {
+   530→    it('should generate summary text', () => {
+   531→      const summary = generateExecutiveSummary('react', mockSources, mockFindings);
+   532→      expect(summary.length).toBeGreaterThan(0);
+   533→    });
+   534→
+   535→    it('should handle no content gracefully', () => {
+   536→      const summary = generateExecutiveSummary('test', [], []);
+   537→      expect(summary).toContain('test');
+   538→    });
+   539→  });
+   540→
+   541→  describe('detectConsensus', () => {
+   542→    it('should detect consensus from agreement comparisons', () => {
+   543→      const comparisons: Array<import('../types').SourceComparison> = [
+   544→        {
+   545→          sourceIds: ['a' as SourceId, 'b' as SourceId],
+   546→          type: 'agreement',
+   547→          agreements: ['React is popular'],
+   548→          disagreements: [],
+   549→          uniqueToA: [],
+   550→          uniqueToB: [],
+   551→          similarity: 0.7,
+   552→        },
+   553→      ];
+   554→      const consensus = detectConsensus(comparisons);
+   555→      expect(consensus).toContain('React is popular');
+   556→    });
+   557→  });
+   558→
+   559→  describe('detectControversies', () => {
+   560→    it('should detect controversies from contradiction comparisons', () => {
+   561→      const comparisons: Array<import('../types').SourceComparison> = [
+   562→        {
+   563→          sourceIds: ['a' as SourceId, 'b' as SourceId],
+   564→          type: 'contradiction',
+   565→          agreements: [],
+   566→          disagreements: ['React is slow vs fast'],
+   567→          uniqueToA: [],
+   568→          uniqueToB: [],
+   569→          similarity: 0.2,
+   570→        },
+   571→      ];
+   572→      const controversies = detectControversies(comparisons);
+   573→      expect(controversies).toContain('React is slow vs fast');
+   574→    });
+   575→  });
+   576→
+   577→  describe('detectGaps', () => {
+   578→    it('should detect coverage gaps', () => {
+   579→      const gaps = detectGaps('rust web assembly performance', [
+   580→        createMockSource({ snippet: 'Rust is a programming language', relevanceScore: 0.5 }),
+   581→      ]);
+   582→      expect(gaps.length).toBeGreaterThan(0);
+   583→    });
+   584→
+   585→    it('should detect source type diversity gaps', () => {
+   586→      const gaps = detectGaps('react tutorial', [
+   587→        createMockSource({ type: 'blog', snippet: 'React blog post' }),
+   588→      ]);
+   589→      expect(gaps.some((g) => g.includes('No'))).toBe(true);
+   590→    });
+   591→  });
+   592→
+   593→  describe('generateRecommendations', () => {
+   594→    it('should generate recommendations based on gaps', () => {
+   595→      const gaps = ['No paper sources found'];
+   596→      const recs = generateRecommendations('react', mockSources, gaps);
+   597→      expect(recs.length).toBeGreaterThan(0);
+   598→    });
+   599→  });
+   600→});
+   601→
+   602→// ============================================================================
+   603→// CLASSIFIER MODULE TESTS
+   604→// ============================================================================
+   605→
+   606→describe('Classifier Module', () => {
+   607→  describe('classifyResearch', () => {
+   608→    it('should classify research results', () => {
+   609→      const sources = [
+   610→        createMockSourceWithContent({}, 'React is a JavaScript library for building user interfaces with TypeScript support.'),
+   611→      ];
+   612→      const classification = classifyResearch('react typescript', sources);
+   613→      expect(classification).toHaveProperty('primaryTopic');
+   614→      expect(classification).toHaveProperty('subTopics');
+   615→      expect(classification).toHaveProperty('domain');
+   616→      expect(classification).toHaveProperty('entities');
+   617→      expect(classification).toHaveProperty('overallSentiment');
+   618→      expect(classification).toHaveProperty('temporalFocus');
+   619→    });
+   620→  });
+   621→
+   622→  describe('detectDomain', () => {
+   623→    it('should detect web-development domain', () => {
+   624→      expect(detectDomain('React is a JavaScript frontend framework for web development with CSS and HTML')).toBe('web-development');
+   625→    });
+   626→
+   627→    it('should detect machine-learning domain', () => {
+   628→      expect(detectDomain('Training neural networks with deep learning and transformer models for NLP')).toBe('machine-learning');
+   629→    });
+   630→
+   631→    it('should detect devops domain', () => {
+   632→      expect(detectDomain('Docker containers on Kubernetes with Terraform infrastructure and AWS cloud deployment')).toBe('devops');
+   633→    });
+   634→
+   635→    it('should detect security domain', () => {
+   636→      expect(detectDomain('Security vulnerability encryption authentication authorization and OWASP compliance')).toBe('security');
+   637→    });
+   638→
+   639→    it('should return general for ambiguous text', () => {
+   640→      expect(detectDomain('The weather is nice today')).toBe('general');
+   641→    });
+   642→  });
+   643→
+   644→  describe('extractSubTopics', () => {
+   645→    it('should extract related sub-topics', () => {
+   646→      const text = 'React uses JavaScript and TypeScript. The framework supports testing with Jest and Vitest.';
+   647→      const subTopics = extractSubTopics(text, 'react');
+   648→      expect(subTopics.length).toBeGreaterThan(0);
+   649→    });
+   650→  });
+   651→
+   652→  describe('extractEntities', () => {
+   653→    it('should extract named entities from sources', () => {
+   654→      const sources = [
+   655→        createMockSourceWithContent({}, 'React and TypeScript are popular. Vue and Angular are alternatives. Docker is used for deployment.'),
+   656→      ];
+   657→      const entities = extractEntities(sources);
+   658→      expect(entities.length).toBeGreaterThan(0);
+   659→      // Should find React, TypeScript, Vue, Angular, Docker
+   660→      const names = entities.map((e) => e.name);
+   661→      expect(names).toContain('React');
+   662→      expect(names).toContain('TypeScript');
+   663→    });
+   664→  });
+   665→
+   666→  describe('analyzeSentiment', () => {
+   667→    it('should detect positive sentiment', () => {
+   668→      expect(analyzeSentiment('React is excellent, powerful, and robust. It provides great benefits.')).toBe('positive');
+   669→    });
+   670→
+   671→    it('should detect negative sentiment', () => {
+   672→      expect(analyzeSentiment('This tool is terrible, buggy, and unreliable with many problems.')).toBe('negative');
+   673→    });
+   674→
+   675→    it('should detect neutral sentiment', () => {
+   676→      expect(analyzeSentiment('React is a JavaScript library created by Facebook.')).toBe('neutral');
+   677→    });
+   678→
+   679→    it('should detect mixed sentiment', () => {
+   680→      expect(analyzeSentiment('React is excellent but has some difficult problems and risks.')).toBe('mixed');
+   681→    });
+   682→  });
+   683→
+   684→  describe('detectTemporalFocus', () => {
+   685→    it('should detect past focus', () => {
+   686→      expect(detectTemporalFocus('was originally developed, previously known as, historically used')).toBe('past');
+   687→    });
+   688→
+   689→    it('should detect present focus', () => {
+   690→      expect(detectTemporalFocus('is currently the most popular, now widely adopted, modern approach')).toBe('present');
+   691→    });
+   692→
+   693→    it('should detect future focus', () => {
+   694→      expect(detectTemporalFocus('will be released, planned for the future, upcoming roadmap')).toBe('future');
+   695→    });
+   696→  });
+   697→});
+   698→
+   699→// ============================================================================
+   700→// REFERENCER MODULE TESTS
+   701→// ============================================================================
+   702→
+   703→describe('Referencer Module', () => {
+   704→  const mockSource = createMockSourceWithContent();
+   705→
+   706→  describe('formatAPA', () => {
+   707→    it('should format citation in APA style', () => {
+   708→      const citation = formatAPA({
+   709→        author: 'John Doe',
+   710→        publishedDate: '2024-01-15',
+   711→        title: 'React Guide',
+   712→        url: 'https://example.com',
+   713→        accessDate: '2024-02-01',
+   714→      });
+   715→      expect(citation).toContain('John Doe');
+   716→      expect(citation).toContain('2024-01-15');
+   717→      expect(citation).toContain('React Guide');
+   718→      expect(citation).toContain('https://example.com');
+   719→    });
+   720→
+   721→    it('should handle missing author', () => {
+   722→      const citation = formatAPA({
+   723→        title: 'React Guide',
+   724→        url: 'https://example.com',
+   725→        accessDate: '2024-02-01',
+   726→      });
+   727→      expect(citation).toContain('n.d.');
+   728→      expect(citation).toContain('Retrieved from');
+   729→    });
+   730→  });
+   731→
+   732→  describe('formatMLA', () => {
+   733→    it('should format citation in MLA style', () => {
+   734→      const citation = formatMLA({
+   735→        author: 'John Doe',
+   736→        publishedDate: '2024-01-15',
+   737→        title: 'React Guide',
+   738→        url: 'https://example.com',
+   739→        accessDate: '2024-02-01',
+   740→      });
+   741→      expect(citation).toContain('John Doe');
+   742→      expect(citation).toContain('"React Guide."');
+   743→      expect(citation).toContain('Accessed 2024-02-01');
+   744→    });
+   745→  });
+   746→
+   747→  describe('formatChicago', () => {
+   748→    it('should format citation in Chicago style', () => {
+   749→      const citation = formatChicago({
+   750→        author: 'John Doe',
+   751→        title: 'React Guide',
+   752→        url: 'https://example.com',
+   753→        accessDate: '2024-02-01',
+   754→      });
+   755→      expect(citation).toContain('John Doe');
+   756→      expect(citation).toContain('"React Guide."');
+   757→      expect(citation).toContain('Accessed');
+   758→    });
+   759→  });
+   760→
+   761→  describe('formatBibTeX', () => {
+   762→    it('should format citation in BibTeX style', () => {
+   763→      const citation = formatBibTeX({
+   764→        author: 'John Doe',
+   765→        publishedDate: '2024-01-15',
+   766→        title: 'React Guide',
+   767→        url: 'https://example.com',
+   768→        accessDate: '2024-02-01',
+   769→      });
+   770→      expect(citation).toContain('@misc');
+   771→      expect(citation).toContain('title = {React Guide}');
+   772→      expect(citation).toContain('author = {John Doe}');
+   773→    });
+   774→  });
+   775→
+   776→  describe('formatPlain', () => {
+   777→    it('should format citation in plain style', () => {
+   778→      const citation = formatPlain({
+   779→        author: 'John Doe',
+   780→        title: 'React Guide',
+   781→        url: 'https://example.com',
+   782→        accessDate: '2024-02-01',
+   783→      });
+   784→      expect(citation).toContain('React Guide');
+   785→      expect(citation).toContain('by John Doe');
+   786→      expect(citation).toContain('https://example.com');
+   787→    });
+   788→  });
+   789→
+   790→  describe('extractAuthor', () => {
+   791→    it('should extract author from content meta', () => {
+   792→      expect(extractAuthor(mockSource)).toBe('John Doe');
+   793→    });
+   794→
+   795→    it('should extract author from "by" pattern', () => {
+   796→      const source = createMockSource({ snippet: 'By Jane Smith' });
+   797→      expect(extractAuthor(source)).toBe('Jane Smith');
+   798→    });
+   799→
+   800→    it('should return undefined when no author found', () => {
+   801→      const source = createMockSource({ snippet: 'Some random text without author info' });
+   802→      expect(extractAuthor(source)).toBeUndefined();
+   803→    });
+   804→  });
+   805→
+   806→  describe('extractPublishedDate', () => {
+   807→    it('should extract date from content meta', () => {
+   808→      expect(extractPublishedDate(mockSource)).toBe('2024-01-15');
+   809→    });
+   810→
+   811→    it('should extract ISO date from snippet', () => {
+   812→      const source = createMockSource({ snippet: 'Published on 2023-06-20' });
+   813→      expect(extractPublishedDate(source)).toBe('2023-06-20');
+   814→    });
+   815→  });
+   816→
+   817→  describe('extractDomain', () => {
+   818→    it('should extract domain from URL', () => {
+   819→      expect(extractDomain('https://www.example.com/path')).toBe('example.com');
+   820→    });
+   821→
+   822→    it('should handle invalid URLs gracefully', () => {
+   823→      expect(extractDomain('not-a-url')).toBe('not-a-url');
+   824→    });
+   825→  });
+   826→
+   827→  describe('generateReferences', () => {
+   828→    it('should generate references for all sources in specified format', () => {
+   829→      const sources = [mockSource, createMockSource()];
+   830→      const refs = generateReferences(sources, 'apa');
+   831→      expect(refs).toHaveLength(2);
+   832→      expect(refs[0]!.format).toBe('apa');
+   833→      expect(refs[0]!.citation).toBeTruthy();
+   834→    });
+   835→  });
+   836→});
+   837→
+   838→// ============================================================================
+   839→// FINDINGS MODULE TESTS
+   840→// ============================================================================
+   841→
+   842→describe('Findings Module', () => {
+   843→  describe('detectFindingType', () => {
+   844→    it('should detect statistic type', () => {
+   845→      expect(detectFindingType('75% of developers use React for their projects.')).toBe('statistic');
+   846→    });
+   847→
+   848→    it('should detect definition type', () => {
+   849→      expect(detectFindingType('React is defined as a JavaScript library for building user interfaces.')).toBe('definition');
+   850→    });
+   851→
+   852→    it('should detect comparison type', () => {
+   853→      expect(detectFindingType('React is faster than Vue when it comes to rendering.')).toBe('comparison');
+   854→    });
+   855→
+   856→    it('should detect recommendation type', () => {
+   857→      expect(detectFindingType('It is recommended to use TypeScript with React projects.')).toBe('recommendation');
+   858→    });
+   859→
+   860→    it('should detect warning type', () => {
+   861→      expect(detectFindingType('Warning: do not use this API in production environments.')).toBe('warning');
+   862→    });
+   863→
+   864→    it('should detect trend type', () => {
+   865→      expect(detectFindingType('React is growing in popularity among enterprise teams.')).toBe('trend');
+   866→    });
+   867→
+   868→    it('should detect fact type', () => {
+   869→      expect(detectFindingType('React was created by Facebook in 2013 for building UIs.')).toBe('fact');
+   870→    });
+   871→
+   872→    it('should detect opinion type', () => {
+   873→      expect(detectFindingType('I think React is the best framework available today.')).toBe('opinion');
+   874→    });
+   875→
+   876→    it('should return null for very short sentences', () => {
+   877→      expect(detectFindingType('Short')).toBeNull();
+   878→    });
+   879→  });
+   880→
+   881→  describe('assessFindingSentiment', () => {
+   882→    it('should detect positive sentiment', () => {
+   883→      expect(assessFindingSentiment('React provides excellent performance and reliability')).toBe('positive');
+   884→    });
+   885→
+   886→    it('should detect negative sentiment', () => {
+   887→      expect(assessFindingSentiment('This approach has a serious risk of failure and problems')).toBe('negative');
+   888→    });
+   889→
+   890→    it('should detect mixed sentiment', () => {
+   891→      expect(assessFindingSentiment('React is great but has some difficult issues')).toBe('mixed');
+   892→    });
+   893→
+   894→    it('should detect neutral sentiment', () => {
+   895→      expect(assessFindingSentiment('React was released in 2013')).toBe('neutral');
+   896→    });
+   897→  });
+   898→
+   899→  describe('computeConfidence', () => {
+   900→    it('should give higher confidence for statistics', () => {
+   901→      const statConf = computeConfidence('75% of developers use React', 'statistic');
+   902→      const opinionConf = computeConfidence('I think React is nice', 'opinion');
+   903→      expect(statConf).toBeGreaterThan(opinionConf);
+   904→    });
+   905→
+   906→    it('should reduce confidence for hedging words', () => {
+   907→      const hedged = computeConfidence('This might possibly be true', 'fact');
+   908→      const direct = computeConfidence('Research confirms this is true', 'fact');
+   909→      expect(direct).toBeGreaterThan(hedged);
+   910→    });
+   911→  });
+   912→
+   913→  describe('extractTopics', () => {
+   914→    it('should extract tech topics from text', () => {
+   915→      const topics = extractTopics('React uses JavaScript and TypeScript for frontend development');
+   916→      expect(topics).toContain('react');
+   917→      expect(topics).toContain('javascript');
+   918→      expect(topics).toContain('typescript');
+   919→      expect(topics).toContain('frontend');
+   920→    });
+   921→  });
+   922→
+   923→  describe('extractFindingsFromSources', () => {
+   924→    it('should extract findings from source content', () => {
+   925→      const sources = [
+   926→        createMockSourceWithContent({}, 'React is defined as a library. 75% of developers use React. React was created by Facebook.'),
+   927→      ];
+   928→      const findings = extractFindingsFromSources(sources);
+   929→      expect(findings.length).toBeGreaterThan(0);
+   930→    });
+   931→
+   932→    it('should handle sources without content', () => {
+   933→      const sources = [createMockSource()];
+   934→      const findings = extractFindingsFromSources(sources);
+   935→      // Should still extract from snippet
+   936→      expect(Array.isArray(findings)).toBe(true);
+   937→    });
+   938→  });
+   939→
+   940→  describe('deduplicateFindings', () => {
+   941→    it('should remove duplicate findings', () => {
+   942→      const findings = [
+   943→        { id: 'f1' as FindingId, content: 'React is popular for web development', type: 'fact' as const, sourceIds: ['s1' as SourceId], sentiment: 'neutral' as const, confidence: 0.8, topics: ['react'], extractedAt: new Date() },
+   944→        { id: 'f2' as FindingId, content: 'React is popular for web development', type: 'fact' as const, sourceIds: ['s2' as SourceId], sentiment: 'neutral' as const, confidence: 0.7, topics: ['react'], extractedAt: new Date() },
+   945→      ];
+   946→      const deduped = deduplicateFindings(findings);
+   947→      expect(deduped).toHaveLength(1);
+   948→    });
+   949→  });
+   950→});
+   951→
+   952→// ============================================================================
+   953→// PLUGIN MODULE TESTS
+   954→// ============================================================================
+   955→
+   956→describe('Plugin Module', () => {
+   957→  describe('RESEARCH_WORKER_MANIFEST', () => {
+   958→    it('should have correct manifest properties', () => {
+   959→      expect(RESEARCH_WORKER_MANIFEST.id).toBe('research-worker');
+   960→      expect(RESEARCH_WORKER_MANIFEST.type).toBe('worker');
+   961→      expect(RESEARCH_WORKER_MANIFEST.capabilities).toContain('research');
+   962→      expect(RESEARCH_WORKER_MANIFEST.capabilities).toContain('web-search');
+   963→      expect(RESEARCH_WORKER_MANIFEST.capabilities).toContain('document-analysis');
+   964→      expect(RESEARCH_WORKER_MANIFEST.capabilities).toContain('source-comparison');
+   965→      expect(RESEARCH_WORKER_MANIFEST.capabilities).toContain('classification');
+   966→      expect(RESEARCH_WORKER_MANIFEST.capabilities).toContain('summarization');
+   967→      expect(RESEARCH_WORKER_MANIFEST.capabilities).toContain('citation');
+   968→      expect(RESEARCH_WORKER_MANIFEST.version).toBe('1.0.0');
+   969→    });
+   970→  });
+   971→
+   972→  describe('createResearchWorker', () => {
+   973→    it('should create a worker with default browser', () => {
+   974→      const worker = createResearchWorker();
+   975→      expect(worker).toBeDefined();
+   976→      expect(typeof worker.research).toBe('function');
+   977→      expect(typeof worker.quickSearch).toBe('function');
+   978→    });
+   979→
+   980→    it('should create a worker with custom browser', () => {
+   981→      const browser = createMockBrowser();
+   982→      const worker = createResearchWorker({ browser });
+   983→      expect(worker).toBeDefined();
+   984→    });
+   985→  });
+   986→
+   987→  describe('dispose', () => {
+   988→    it('should dispose the worker and prevent further operations', async () => {
+   989→      const browser = createMockBrowser();
+   990→      const worker = createResearchWorker({ browser });
+   991→      await worker.dispose();
+   992→      await expect(worker.research('test')).rejects.toThrow('disposed');
+   993→    });
+   994→  });
+   995→});
+   996→
+   997→// ============================================================================
+   998→// RESEARCH WORKER INTEGRATION TESTS
+   999→// ============================================================================
+  1000→
+  1001→describe('ResearchWorker Integration', () => {
+  1002→  let worker: ResearchWorker;
+  1003→  let browser: IBrowserCapability;
+  1004→  let eventEmitter: IEventEmitter;
+  1005→
+  1006→  beforeEach(() => {
+  1007→    browser = createMockBrowser();
+  1008→    eventEmitter = createMockEventEmitter();
+  1009→    worker = new ResearchWorker({ browser, eventEmitter });
+  1010→  });
+  1011→
+  1012→  describe('quickSearch', () => {
+  1013→    it('should return filtered search results', async () => {
+  1014→      const results = await worker.quickSearch('react');
+  1015→      expect(results).toBeDefined();
+  1016→      expect(Array.isArray(results)).toBe(true);
+  1017→    });
+  1018→  });
+  1019→
+  1020→  describe('search', () => {
+  1021→    it('should return sorted search results', async () => {
+  1022→      const results = await worker.search('typescript');
+  1023→      expect(results).toBeDefined();
+  1024→      expect(Array.isArray(results)).toBe(true);
+  1025→    });
+  1026→  });
+  1027→
+  1028→  describe('classify', () => {
+  1029→    it('should classify given sources', () => {
+  1030→      const sources = [createMockSourceWithContent()];
+  1031→      const classification = worker.classify('react', sources);
+  1032→      expect(classification.primaryTopic).toBeTruthy();
+  1033→      expect(classification.domain).toBeTruthy();
+  1034→    });
+  1035→  });
+  1036→
+  1037→  describe('reference', () => {
+  1038→    it('should generate references for sources', () => {
+  1039→      const sources = [createMockSourceWithContent()];
+  1040→      const refs = worker.reference(sources);
+  1041→      expect(refs).toHaveLength(1);
+  1042→      expect(refs[0]!.citation).toBeTruthy();
+  1043→    });
+  1044→  });
+  1045→
+  1046→  describe('healthCheck', () => {
+  1047→    it('should return healthy status', async () => {
+  1048→      const health = await worker.healthCheck();
+  1049→      expect(health).toHaveProperty('healthy');
+  1050→      expect(health).toHaveProperty('browserAvailable');
+  1051→      expect(health).toHaveProperty('activeSessions');
+  1052→    });
+  1053→  });
+  1054→
+  1055→  describe('event emission', () => {
+  1056→    it('should emit events during research pipeline', async () => {
+  1057→      const results = await worker.research('react');
+  1058→      expect(eventEmitter.emit).toHaveBeenCalled();
+  1059→    });
+  1060→  });
+  1061→
+  1062→  describe('session management', () => {
+  1063→    it('should store and retrieve sessions', async () => {
+  1064→      const session = await worker.research('react');
+  1065→      const retrieved = worker.getSession(session.id);
+  1066→      expect(retrieved).toBeDefined();
+  1067→      expect(retrieved!.id).toBe(session.id);
+  1068→    });
+  1069→
+  1070→    it('should list all sessions', async () => {
+  1071→      await worker.research('react');
+  1072→      await worker.research('vue');
+  1073→      const sessions = worker.listSessions();
+  1074→      expect(sessions).toHaveLength(2);
+  1075→    });
+  1076→  });
+  1077→
+  1078→  describe('full research pipeline', () => {
+  1079→    it('should complete the full research pipeline', async () => {
+  1080→      const session = await worker.research('react performance');
+  1081→      expect(session.status).toBe('completed');
+  1082→      expect(session.sources.length).toBeGreaterThan(0);
+  1083→      expect(session.findings).toBeDefined();
+  1084→      expect(session.comparisons).toBeDefined();
+  1085→      expect(session.classification).toBeDefined();
+  1086→      expect(session.summary).toBeDefined();
+  1087→      expect(session.references).toBeDefined();
+  1088→      expect(session.completedAt).toBeDefined();
+  1089→    });
+  1090→  });
+  1091→
+  1092→  describe('archive', () => {
+  1093→    it('should archive to knowledge store', async () => {
+  1094→      const knowledgeStore = createMockKnowledgeStore();
+  1095→      const memoryStore = createMockMemoryStore();
+  1096→      const workerWithStores = new ResearchWorker({ browser, eventEmitter, knowledgeStore, memoryStore });
+  1097→
+  1098→      const session = await workerWithStores.research('react', {
+  1099→        archiveToKnowledge: true,
+  1100→        recordToMemory: true,
+  1101→      });
+  1102→
+  1103→      expect(knowledgeStore.createDocument).toHaveBeenCalled();
+  1104→      expect(memoryStore.record).toHaveBeenCalled();
+  1105→    });
+  1106→  });
+  1107→
+  1108→  describe('error handling', () => {
+  1109→    it('should handle browser search failures gracefully', async () => {
+  1110→      const failingBrowser: IBrowserCapability = {
+  1111→        search: vi.fn().mockRejectedValue(new Error('Network error')),
+  1112→        read: vi.fn().mockResolvedValue(undefined),
+  1113→        isAvailable: vi.fn().mockResolvedValue(true),
+  1114→        dispose: vi.fn().mockResolvedValue(undefined),
+  1115→      };
+  1116→      const failWorker = new ResearchWorker({ browser: failingBrowser, eventEmitter });
+  1117→
+  1118→      const session = await failWorker.research('test');
+  1119→      expect(session.status).toBe('failed');
+  1120→      expect(session.error).toContain('Network error');
+  1121→    });
+  1122→  });
+  1123→});
+  1124→
+  1125→// ============================================================================
+  1126→// DEFAULT CONFIG TEST
+  1127→// ============================================================================
+  1128→
+  1129→describe('DEFAULT_RESEARCH_CONFIG', () => {
+  1130→  it('should have correct default values', () => {
+  1131→    expect(DEFAULT_RESEARCH_CONFIG.maxSources).toBe(10);
+  1132→    expect(DEFAULT_RESEARCH_CONFIG.maxSearchResults).toBe(20);
+  1133→    expect(DEFAULT_RESEARCH_CONFIG.searchEngines).toEqual(['duckduckgo', 'github']);
+  1134→    expect(DEFAULT_RESEARCH_CONFIG.minRelevance).toBe(0.3);
+  1135→    expect(DEFAULT_RESEARCH_CONFIG.readFullContent).toBe(true);
+  1136→    expect(DEFAULT_RESEARCH_CONFIG.maxContentLength).toBe(50000);
+  1137→    expect(DEFAULT_RESEARCH_CONFIG.archiveToKnowledge).toBe(true);
+  1138→    expect(DEFAULT_RESEARCH_CONFIG.recordToMemory).toBe(true);
+  1139→    expect(DEFAULT_RESEARCH_CONFIG.readTimeout).toBe(30000);
+  1140→    expect(DEFAULT_RESEARCH_CONFIG.language).toBe('en');
+  1141→  });
+  1142→});
+  1143→

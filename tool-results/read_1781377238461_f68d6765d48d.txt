@@ -1,0 +1,736 @@
+     1→// ============================================================
+     2→// AgentForge - Admin Control Center Routes
+     3→// 8 modules: Users, Agents, Providers, Orchestration,
+     4→// Finances, Security, Infrastructure, Monitoring
+     5→// Phase 9: Admin Control Center
+     6→// P2.1.2: Enterprise RBAC — requirePermission replaces tier checks
+     7→// ============================================================
+     8→
+     9→import { Hono } from 'hono';
+    10→import { zValidator } from '@hono/zod-validator';
+    11→import { z } from 'zod';
+    12→import { requirePermission } from '../middleware/tenant';
+    13→import { db } from '../db';
+    14→import { users, generationSessions, costTracking, analyticsEvents, deployments } from '../db/schema';
+    15→import { eq, desc, sql, and, count, gte, lte } from 'drizzle-orm';
+    16→import { AGENT_REGISTRY, ALL_AGENT_IDS } from '@agentforge/shared';
+    17→import { metricsService } from '../services/telemetry/MetricsService';
+    18→import { alertManager } from '../services/telemetry/AlertManager';
+    19→import { tracingService } from '../services/telemetry/TracingService';
+    20→import { auditTrailService } from '../services/security/AuditTrailService';
+    21→import { threatDetectionService } from '../services/security/ThreatDetectionService';
+    22→import { sessionManager } from '../services/security/SessionManager';
+    23→import { distributedCache } from '../services/queue/DistributedCache';
+    24→import { SandboxManager } from '../services/SandboxManager';
+    25→import { CostOptimizer } from '../services/CostOptimizer';
+    26→
+    27→const admin = new Hono();
+    28→
+    29→// ─── P2.1.2: Admin Auth replaced by requirePermission ────────
+    30→// All admin routes now use RBAC requirePermission() instead of
+    31→// the old tier-based adminAuth middleware.
+    32→//
+    33→// Old: admin.use('*', adminAuth)  →  tier === 'enterprise'
+    34→// New: Each route uses requirePermission({ resource, action })
+    35→//      which checks the user's RBAC role in the tenant.
+    36→//
+    37→// This eliminates privilege escalation via tier manipulation.
+    38→
+    39→// ═══════════════════════════════════════════════════════════
+    40→// MODULE 1: Users Management
+    41→// P2.1.2: All endpoints protected by requirePermission
+    42→// ═══════════════════════════════════════════════════════════
+    43→
+    44→// GET /admin/users - List all users
+    45→admin.get('/users', requirePermission({ resource: 'users', action: 'read' }), async (c) => {
+    46→  try {
+    47→    const limit = parseInt(c.req.query('limit') || '50');
+    48→    const offset = parseInt(c.req.query('offset') || '0');
+    49→
+    50→    const userList = await db
+    51→      .select({
+    52→        id: users.id,
+    53→        email: users.email,
+    54→        name: users.name,
+    55→        tier: users.tier,
+    56→        mfaEnabled: users.mfaEnabled,
+    57→        createdAt: users.createdAt,
+    58→        updatedAt: users.updatedAt,
+    59→      })
+    60→      .from(users)
+    61→      .orderBy(desc(users.createdAt))
+    62→      .limit(Math.min(limit, 100))
+    63→      .offset(offset);
+    64→
+    65→    const total = await db.select({ count: count() }).from(users);
+    66→
+    67→    return c.json({
+    68→      success: true,
+    69→      data: {
+    70→        users: userList,
+    71→        total: total[0]?.count || 0,
+    72→        limit,
+    73→        offset,
+    74→      },
+    75→    });
+    76→  } catch (error) {
+    77→    console.error('[Admin] Failed to list users:', error);
+    78→    return c.json({ success: false, error: 'Failed to list users' }, 500);
+    79→  }
+    80→});
+    81→
+    82→// PATCH /admin/users - Update user (e.g., change tier)
+    83→const UpdateUserSchema = z.object({
+    84→  tier: z.enum(['free', 'pro', 'enterprise']).optional(),
+    85→  name: z.string().min(1).max(255).optional(),
+    86→});
+    87→
+    88→admin.patch('/users', requirePermission({ resource: 'users', action: 'update' }), zValidator('json', UpdateUserSchema), async (c) => {
+    89→  const data = c.req.valid('json');
+    90→  const targetUserId = c.req.query('userId');
+    91→
+    92→  if (!targetUserId) {
+    93→    return c.json({ success: false, error: 'userId query parameter required' }, 400);
+    94→  }
+    95→
+    96→  try {
+    97→    const result = await db
+    98→      .update(users)
+    99→      .set({ ...data, updatedAt: new Date() })
+   100→      .where(eq(users.id, targetUserId))
+   101→      .returning({
+   102→        id: users.id,
+   103→        email: users.email,
+   104→        name: users.name,
+   105→        tier: users.tier,
+   106→      });
+   107→
+   108→    if (!result.length) {
+   109→      return c.json({ success: false, error: 'User not found' }, 404);
+   110→    }
+   111→
+   112→    // Audit: admin user update — P2.1.1: No secrets in audit
+   113→    await auditTrailService.record({
+   114→      action: 'admin.user_update',
+   115→      actorId: c.get('userId'),
+   116→      actorType: 'admin',
+   117→      resourceType: 'user',
+   118→      resourceId: targetUserId,
+   119→      details: { updatedFields: Object.keys(data) },
+   120→      ipAddress: c.req.header('X-Forwarded-For')?.split(',')[0]?.trim() || 'unknown',
+   121→      userAgent: c.req.header('User-Agent') || 'unknown',
+   122→      success: true,
+   123→      riskLevel: 'medium',
+   124→    });
+   125→
+   126→    return c.json({ success: true, data: result[0] });
+   127→  } catch (error) {
+   128→    console.error('[Admin] Failed to update user:', error);
+   129→    return c.json({ success: false, error: 'Failed to update user' }, 500);
+   130→  }
+   131→});
+   132→
+   133→// GET /admin/users/:id - Get user details
+   134→admin.get('/users/:id', requirePermission({ resource: 'users', action: 'read' }), async (c) => {
+   135→  const userId = c.req.param('id');
+   136→
+   137→  try {
+   138→    const userRows = await db
+   139→      .select({
+   140→        id: users.id,
+   141→        email: users.email,
+   142→        name: users.name,
+   143→        tier: users.tier,
+   144→        mfaEnabled: users.mfaEnabled,
+   145→        avatarUrl: users.avatarUrl,
+   146→        createdAt: users.createdAt,
+   147→        updatedAt: users.updatedAt,
+   148→      })
+   149→      .from(users)
+   150→      .where(eq(users.id, userId))
+   151→      .limit(1);
+   152→
+   153→    if (!userRows.length) {
+   154→      return c.json({ success: false, error: 'User not found' }, 404);
+   155→    }
+   156→
+   157→    // Get user's session count and cost stats
+   158→    const sessionCount = await db
+   159→      .select({ count: count() })
+   160→      .from(generationSessions)
+   161→      .where(eq(generationSessions.userId, userId));
+   162→
+   163→    const costStats = await db
+   164→      .select({
+   165→        totalCost: sql<string>`coalesce(sum(${costTracking.costUsd}), 0)`,
+   166→        totalTokens: sql<string>`coalesce(sum(${costTracking.tokensPrompt} + ${costTracking.tokensCompletion}), 0)`,
+   167→      })
+   168→      .from(costTracking)
+   169→      .where(eq(costTracking.userId, userId));
+   170→
+   171→    return c.json({
+   172→      success: true,
+   173→      data: {
+   174→        user: userRows[0],
+   175→        stats: {
+   176→          sessions: sessionCount[0]?.count || 0,
+   177→          totalCost: costStats[0]?.totalCost || '0',
+   178→          totalTokens: costStats[0]?.totalTokens || '0',
+   179→        },
+   180→      },
+   181→    });
+   182→  } catch (error) {
+   183→    console.error('[Admin] Failed to get user:', error);
+   184→    return c.json({ success: false, error: 'Failed to get user details' }, 500);
+   185→  }
+   186→});
+   187→
+   188→// DELETE /admin/users/:id - Delete user (P2.1.2: requires 'manage' permission — highest privilege)
+   189→admin.delete('/users/:id', requirePermission({ resource: 'users', action: 'manage' }), async (c) => {
+   190→  const userId = c.req.param('id');
+   191→
+   192→  try {
+   193→    // Safety check: don't allow self-deletion
+   194→    const actorId = c.get('userId');
+   195→    if (actorId === userId) {
+   196→      return c.json({ success: false, error: 'Cannot delete your own account' }, 400);
+   197→    }
+   198→
+   199→    const result = await db.delete(users).where(eq(users.id, userId)).returning({ id: users.id });
+   200→
+   201→    if (!result.length) {
+   202→      return c.json({ success: false, error: 'User not found' }, 404);
+   203→    }
+   204→
+   205→    // Audit: admin user deletion
+   206→    await auditTrailService.record({
+   207→      action: 'admin.user_delete',
+   208→      actorId,
+   209→      actorType: 'admin',
+   210→      resourceType: 'user',
+   211→      resourceId: userId,
+   212→      details: {},
+   213→      ipAddress: c.req.header('X-Forwarded-For')?.split(',')[0]?.trim() || 'unknown',
+   214→      userAgent: c.req.header('User-Agent') || 'unknown',
+   215→      success: true,
+   216→      riskLevel: 'high',
+   217→    });
+   218→
+   219→    return c.json({ success: true, message: 'User deleted' });
+   220→  } catch (error) {
+   221→    console.error('[Admin] Failed to delete user:', error);
+   222→    return c.json({ success: false, error: 'Failed to delete user' }, 500);
+   223→  }
+   224→});
+   225→
+   226→// ═══════════════════════════════════════════════════════════
+   227→// MODULE 2: Agents Management
+   228→// ═══════════════════════════════════════════════════════════
+   229→
+   230→// GET /admin/agents - List all agent configurations
+   231→admin.get('/agents', requirePermission({ resource: 'agents', action: 'read' }), (c) => {
+   232→  const agentList = ALL_AGENT_IDS.map(id => {
+   233→    const config = AGENT_REGISTRY[id];
+   234→    return {
+   235→      id: config.id,
+   236→      name: config.name,
+   237→      description: config.description,
+   238→      icon: config.icon,
+   239→      color: config.color,
+   240→      outputFormat: config.outputFormat,
+   241→      sandboxEnabled: config.sandboxEnabled,
+   242→      deploymentTarget: config.deploymentTarget,
+   243→      confidenceThreshold: config.confidenceThreshold,
+   244→      maxIterations: config.maxIterations,
+   245→      dagNodes: config.dagTemplate.nodes.length,
+   246→      llmPool: {
+   247→        primary: config.llmPool.primary.map(p => ({ id: p.id, name: p.name, model: p.model })),
+   248→        secondary: config.llmPool.secondary.map(p => ({ id: p.id, name: p.name, model: p.model })),
+   249→        fallback: config.llmPool.fallback.map(p => ({ id: p.id, name: p.name, model: p.model })),
+   250→      },
+   251→      moaConfig: config.moaConfig ? {
+   252→        feedbackInjection: config.moaConfig.feedbackInjection,
+   253→        roundsCount: config.moaConfig.rounds.length,
+   254→      } : null,
+   255→    };
+   256→  });
+   257→
+   258→  return c.json({ success: true, data: agentList });
+   259→});
+   260→
+   261→// PATCH /admin/agents - Update agent configuration (runtime overrides)
+   262→admin.patch('/agents', requirePermission({ resource: 'agents', action: 'manage' }), (c) => {
+   263→  // Agent configs are currently static from AGENT_REGISTRY
+   264→  // In a production system, this would update a database-backed config
+   265→  return c.json({
+   266→    success: false,
+   267→    error: 'Agent configuration updates are not yet supported at runtime. Modify AGENT_REGISTRY in shared package.',
+   268→  }, 501);
+   269→});
+   270→
+   271→// GET /admin/agents/:id/config - Get detailed agent config
+   272→admin.get('/agents/:id/config', requirePermission({ resource: 'agents', action: 'read' }), (c) => {
+   273→  const agentId = c.req.param('id');
+   274→  const config = AGENT_REGISTRY[agentId as keyof typeof AGENT_REGISTRY];
+   275→
+   276→  if (!config) {
+   277→    return c.json({ success: false, error: `Agent not found: ${agentId}` }, 404);
+   278→  }
+   279→
+   280→  return c.json({ success: true, data: config });
+   281→});
+   282→
+   283→// ═══════════════════════════════════════════════════════════
+   284→// MODULE 3: Providers Management
+   285→// ═══════════════════════════════════════════════════════════
+   286→
+   287→// GET /admin/providers - List LLM provider status
+   288→admin.get('/providers', requirePermission({ resource: 'providers', action: 'read' }), (c) => {
+   289→  const providers = [
+   290→    { id: 'anthropic', name: 'Anthropic', configured: !!process.env.ANTHROPIC_API_KEY, models: ['claude-3.7-sonnet', 'claude-3.5-haiku'] },
+   291→    { id: 'openai', name: 'OpenAI', configured: !!process.env.OPENAI_API_KEY, models: ['gpt-4o', 'gpt-4o-mini'] },
+   292→    { id: 'google', name: 'Google', configured: !!process.env.GOOGLE_API_KEY, models: ['gemini-2.5-pro', 'gemini-2.0-flash'] },
+   293→    { id: 'deepseek', name: 'DeepSeek', configured: !!process.env.DEEPSEEK_API_KEY, models: ['deepseek-r1', 'deepseek-chat'] },
+   294→    { id: 'mistral', name: 'Mistral', configured: !!process.env.MISTRAL_API_KEY, models: ['mistral-large'] },
+   295→    { id: 'together', name: 'Together AI', configured: !!process.env.TOGETHER_API_KEY, models: ['various'] },
+   296→  ];
+   297→
+   298→  return c.json({
+   299→    success: true,
+   300→    data: {
+   301→      providers,
+   302→      totalConfigured: providers.filter(p => p.configured).length,
+   303→      totalProviders: providers.length,
+   304→    },
+   305→  });
+   306→});
+   307→
+   308→// PATCH /admin/providers - Update provider configuration
+   309→admin.patch('/providers', requirePermission({ resource: 'providers', action: 'update' }), (c) => {
+   310→  // Provider configuration is managed via environment variables
+   311→  return c.json({
+   312→    success: false,
+   313→    error: 'Provider configuration is managed via environment variables. Update .env file to change API keys.',
+   314→  }, 501);
+   315→});
+   316→
+   317→// POST /admin/providers/:id/test - Test a provider connection
+   318→admin.post('/providers/:id/test', requirePermission({ resource: 'providers', action: 'read' }), async (c) => {
+   319→  const providerId = c.req.param('id');
+   320→
+   321→  // Simple connectivity test
+   322→  const apiKeyMap: Record<string, string | undefined> = {
+   323→    anthropic: process.env.ANTHROPIC_API_KEY,
+   324→    openai: process.env.OPENAI_API_KEY,
+   325→    google: process.env.GOOGLE_API_KEY,
+   326→    deepseek: process.env.DEEPSEEK_API_KEY,
+   327→    mistral: process.env.MISTRAL_API_KEY,
+   328→    together: process.env.TOGETHER_API_KEY,
+   329→  };
+   330→
+   331→  const apiKey = apiKeyMap[providerId];
+   332→
+   333→  if (!apiKey) {
+   334→    return c.json({
+   335→      success: true,
+   336→      data: {
+   337→        provider: providerId,
+   338→        configured: false,
+   339→        status: 'not_configured',
+   340→        message: 'API key not set',
+   341→      },
+   342→    });
+   343→  }
+   344→
+   345→  return c.json({
+   346→    success: true,
+   347→    data: {
+   348→      provider: providerId,
+   349→      configured: true,
+   350→      status: 'configured',
+   351→      message: 'API key is configured',
+   352→      keyMasked: '•••••••••••••••',  // Generic mask — never reveal actual key material
+   353→    },
+   354→  });
+   355→});
+   356→
+   357→// ═══════════════════════════════════════════════════════════
+   358→// MODULE 4: Orchestration Configuration
+   359→// ═══════════════════════════════════════════════════════════
+   360→
+   361→// GET /admin/orchestration/config - Get orchestration config
+   362→admin.get('/orchestration/config', requirePermission({ resource: 'settings', action: 'read' }), (c) => {
+   363→  return c.json({
+   364→    success: true,
+   365→    data: {
+   366→      moa: {
+   367→        defaultRounds: 3,
+   368→        feedbackInjection: true,
+   369→        votingStrategy: 'weighted_average',
+   370→      },
+   371→      reflection: {
+   372→        maxIterations: 3,
+   373→        defaultConfidenceThreshold: 0.7,
+   374→        autoFixLevels: ['pattern', 'ast', 'llm'],
+   375→      },
+   376→      cache: {
+   377→        enabled: true,
+   378→        defaultTtlMs: 3600000,
+   379→      },
+   380→      dag: {
+   381→        maxParallelNodes: 10,
+   382→        maxLevels: 10,
+   383→        timeoutMs: 300000,
+   384→      },
+   385→      context: {
+   386→        maxTokens: 8000,
+   387→        defaultCompressionStrategy: 'skeleton',
+   388→        dependencyDepth: 2,
+   389→      },
+   390→    },
+   391→  });
+   392→});
+   393→
+   394→// PATCH /admin/orchestration/config - Update orchestration config
+   395→admin.patch('/orchestration/config', requirePermission({ resource: 'settings', action: 'update' }), (c) => {
+   396→  // Orchestration config is currently hardcoded
+   397→  return c.json({
+   398→    success: false,
+   399→    error: 'Runtime orchestration configuration updates are not yet supported.',
+   400→  }, 501);
+   401→});
+   402→
+   403→// ═══════════════════════════════════════════════════════════
+   404→// MODULE 5: Finances
+   405→// ═══════════════════════════════════════════════════════════
+   406→
+   407→// GET /admin/finances/overview - Financial overview
+   408→admin.get('/finances/overview', requirePermission({ resource: 'billing', action: 'read' }), async (c) => {
+   409→  try {
+   410→    // Total costs
+   411→    const totalCosts = await db
+   412→      .select({
+   413→        totalCost: sql<string>`coalesce(sum(${costTracking.costUsd}), 0)`,
+   414→        totalTokens: sql<string>`coalesce(sum(${costTracking.tokensPrompt} + ${costTracking.tokensCompletion}), 0)`,
+   415→        totalSessions: sql<number>`count(distinct ${costTracking.sessionId})`,
+   416→      })
+   417→      .from(costTracking);
+   418→
+   419→    // Costs by provider
+   420→    const costsByProvider = await db
+   421→      .select({
+   422→        provider: costTracking.provider,
+   423→        totalCost: sql<string>`coalesce(sum(${costTracking.costUsd}), 0)`,
+   424→        totalTokens: sql<string>`coalesce(sum(${costTracking.tokensPrompt} + ${costTracking.tokensCompletion}), 0)`,
+   425→        sessionCount: sql<number>`count(distinct ${costTracking.sessionId})`,
+   426→      })
+   427→      .from(costTracking)
+   428→      .groupBy(costTracking.provider)
+   429→      .orderBy(desc(sql`sum(${costTracking.costUsd})`));
+   430→
+   431→    // User count by tier
+   432→    const usersByTier = await db
+   433→      .select({
+   434→        tier: users.tier,
+   435→        count: count(),
+   436→      })
+   437→      .from(users)
+   438→      .groupBy(users.tier);
+   439→
+   440→    return c.json({
+   441→      success: true,
+   442→      data: {
+   443→        totals: {
+   444→          cost: totalCosts[0]?.totalCost || '0',
+   445→          tokens: totalCosts[0]?.totalTokens || '0',
+   446→          sessions: totalCosts[0]?.totalSessions || 0,
+   447→        },
+   448→        byProvider: costsByProvider,
+   449→        usersByTier,
+   450→      },
+   451→    });
+   452→  } catch (error) {
+   453→    console.error('[Admin] Failed to get finance overview:', error);
+   454→    return c.json({ success: false, error: 'Failed to get finance overview' }, 500);
+   455→  }
+   456→});
+   457→
+   458→// GET /admin/finances/costs - Detailed cost breakdown
+   459→admin.get('/finances/costs', requirePermission({ resource: 'billing', action: 'read' }), async (c) => {
+   460→  try {
+   461→    const days = parseInt(c.req.query('days') || '30');
+   462→    const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+   463→
+   464→    const recentCosts = await db
+   465→      .select({
+   466→        provider: costTracking.provider,
+   467→        model: costTracking.model,
+   468→        totalCost: sql<string>`coalesce(sum(${costTracking.costUsd}), 0)`,
+   469→        totalTokens: sql<string>`coalesce(sum(${costTracking.tokensPrompt} + ${costTracking.tokensCompletion}), 0)`,
+   470→        promptTokens: sql<string>`coalesce(sum(${costTracking.tokensPrompt}), 0)`,
+   471→        completionTokens: sql<string>`coalesce(sum(${costTracking.tokensCompletion}), 0)`,
+   472→        count: count(),
+   473→      })
+   474→      .from(costTracking)
+   475→      .where(gte(costTracking.createdAt, since))
+   476→      .groupBy(costTracking.provider, costTracking.model)
+   477→      .orderBy(desc(sql`sum(${costTracking.costUsd})`));
+   478→
+   479→    return c.json({ success: true, data: { period: `${days}d`, costs: recentCosts } });
+   480→  } catch (error) {
+   481→    console.error('[Admin] Failed to get cost breakdown:', error);
+   482→    return c.json({ success: false, error: 'Failed to get cost breakdown' }, 500);
+   483→  }
+   484→});
+   485→
+   486→// GET /admin/finances/revenue - Revenue tracking
+   487→admin.get('/finances/revenue', requirePermission({ resource: 'billing', action: 'read' }), async (c) => {
+   488→  try {
+   489→    const usersByTier = await db
+   490→      .select({
+   491→        tier: users.tier,
+   492→        count: count(),
+   493→      })
+   494→      .from(users)
+   495→      .groupBy(users.tier);
+   496→
+   497→    // Estimated revenue by tier (simplified)
+   498→    const pricingMap: Record<string, number> = {
+   499→      free: 0,
+   500→      pro: 29,
+   501→      enterprise: 299,
+   502→    };
+   503→
+   504→    const revenue = usersByTier.map(t => ({
+   505→      tier: t.tier,
+   506→      users: t.count,
+   507→      monthlyRevenue: t.count * (pricingMap[t.tier] || 0),
+   508→    }));
+   509→
+   510→    const totalMonthlyRevenue = revenue.reduce((sum, r) => sum + r.monthlyRevenue, 0);
+   511→
+   512→    return c.json({
+   513→      success: true,
+   514→      data: {
+   515→        revenue,
+   516→        totalMonthlyRevenue,
+   517→        currency: 'USD',
+   518→      },
+   519→    });
+   520→  } catch (error) {
+   521→    console.error('[Admin] Failed to get revenue:', error);
+   522→    return c.json({ success: false, error: 'Failed to get revenue data' }, 500);
+   523→  }
+   524→});
+   525→
+   526→// ═══════════════════════════════════════════════════════════
+   527→// MODULE 6: Security
+   528→// ═══════════════════════════════════════════════════════════
+   529→
+   530→// GET /admin/security/overview - Security overview
+   531→admin.get('/security/overview', requirePermission({ resource: 'security', action: 'read' }), async (c) => {
+   532→  try {
+   533→    // Recent audit entries
+   534→    const recentAudit = await auditTrailService.query({ limit: 10 });
+   535→
+   536→    // Active threats
+   537→    const activeThreats = threatDetectionService.getActiveThreats();
+   538→
+   539→    // Session stats (derived from distributed session store)
+   540→    const sessionStats = sessionManager.getSessionStats();
+   541→
+   542→    return c.json({
+   543→      success: true,
+   544→      data: {
+   545→        threats: {
+   546→          active: activeThreats.length,
+   547→          threatHistory: threatDetectionService.getHistory(10).length,
+   548→        },
+   549→        sessions: sessionStats,
+   550→        recentAuditCount: recentAudit.length,
+   551→        mfaStats: {
+   552→          encryptionEnabled: true, // P2.1.1: AES-256-GCM encryption is now active
+   553→        },
+   554→      },
+   555→    });
+   556→  } catch (error) {
+   557→    console.error('[Admin] Failed to get security overview:', error);
+   558→    return c.json({ success: false, error: 'Failed to get security overview' }, 500);
+   559→  }
+   560→});
+   561→
+   562→// GET /admin/security/threats - Active threats
+   563→admin.get('/security/threats', requirePermission({ resource: 'security', action: 'read' }), (c) => {
+   564→  const activeThreats = threatDetectionService.getActiveThreats();
+   565→  const threatHistory = threatDetectionService.getHistory(50);
+   566→
+   567→  return c.json({
+   568→    success: true,
+   569→    data: {
+   570→      activeThreats,
+   571→      threatHistory,
+   572→    },
+   573→  });
+   574→});
+   575→
+   576→// GET /admin/security/audit - Audit trail
+   577→admin.get('/security/audit', requirePermission({ resource: 'audit', action: 'read' }), async (c) => {
+   578→  const limit = parseInt(c.req.query('limit') || '50');
+   579→
+   580→  try {
+   581→    const entries = await auditTrailService.query({ limit });
+   582→    return c.json({ success: true, data: entries });
+   583→  } catch (error) {
+   584→    console.error('[Admin] Failed to get audit trail:', error);
+   585→    return c.json({ success: false, error: 'Failed to get audit trail' }, 500);
+   586→  }
+   587→});
+   588→
+   589→// ═══════════════════════════════════════════════════════════
+   590→// MODULE 7: Infrastructure
+   591→// ═══════════════════════════════════════════════════════════
+   592→
+   593→// GET /admin/infrastructure/status - Infrastructure status
+   594→admin.get('/infrastructure/status', requirePermission({ resource: 'infrastructure', action: 'read' }), (c) => {
+   595→  return c.json({
+   596→    success: true,
+   597→    data: {
+   598→      server: {
+   599→        uptime: process.uptime(),
+   600→        nodeVersion: process.version,
+   601→        platform: process.platform,
+   602→        pid: process.pid,
+   603→      },
+   604→      memory: {
+   605→        rss: Math.round(process.memoryUsage().rss / 1024 / 1024),
+   606→        heapUsed: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
+   607→        heapTotal: Math.round(process.memoryUsage().heapTotal / 1024 / 1024),
+   608→        external: Math.round(process.memoryUsage().external / 1024 / 1024),
+   609→      },
+   610→      cpu: {
+   611→        usage: process.cpuUsage(),
+   612→      },
+   613→      environment: {
+   614→        nodeEnv: process.env.NODE_ENV || 'development',
+   615→        databaseUrl: process.env.DATABASE_URL ? 'configured' : 'not configured',
+   616→        redisUrl: process.env.REDIS_URL ? 'configured' : 'not configured',
+   617→        mfaEncryptionKey: process.env.MFA_ENCRYPTION_KEY ? 'configured' : 'not configured', // P2.1.1
+   618→        cloudflare: {
+   619→          apiToken: process.env.CLOUDFLARE_API_TOKEN ? 'configured' : 'not configured',
+   620→          accountId: process.env.CLOUDFLARE_ACCOUNT_ID ? 'configured' : 'not configured',
+   621→        },
+   622→      },
+   623→      security: {
+   624→        mfaEncryption: 'AES-256-GCM', // P2.1.1
+   625→        jwtHardening: 'OWASP-compliant (iss, aud, sub, iat, exp, jti)', // P2.1.4
+   626→        rbacSystem: 'Enterprise 5-role (super_admin, admin, manager, user, viewer)', // P2.1.2
+   627→      },
+   628→    },
+   629→  });
+   630→});
+   631→
+   632→// GET /admin/infrastructure/cache - Cache status
+   633→admin.get('/infrastructure/cache', requirePermission({ resource: 'infrastructure', action: 'read' }), (c) => {
+   634→  const stats = distributedCache.getStats();
+   635→
+   636→  return c.json({
+   637→    success: true,
+   638→    data: {
+   639→      status: 'operational',
+   640→      type: 'distributed',
+   641→      description: 'L1 memory + L2 Redis distributed cache with pub/sub invalidation',
+   642→      stats: {
+   643→        l1Size: stats.l1Size,
+   644→        l1HitRate: stats.l1HitRate.toFixed(2),
+   645→        l2HitRate: stats.l2HitRate.toFixed(2),
+   646→        invalidations: stats.invalidations,
+   647→      },
+   648→    },
+   649→  });
+   650→});
+   651→
+   652→// GET /admin/infrastructure/sandbox - Sandbox status
+   653→admin.get('/infrastructure/sandbox', requirePermission({ resource: 'infrastructure', action: 'read' }), (c) => {
+   654→  return c.json({
+   655→    success: true,
+   656→    data: {
+   657→      status: 'operational',
+   658→      e2bConfigured: !!process.env.E2B_API_KEY,
+   659→      dockerAvailable: false,
+   660→      description: 'E2B sandbox for secure code execution',
+   661→    },
+   662→  });
+   663→});
+   664→
+   665→// ═══════════════════════════════════════════════════════════
+   666→// MODULE 8: Monitoring
+   667→// ═══════════════════════════════════════════════════════════
+   668→
+   669→// GET /admin/monitoring/metrics - System metrics
+   670→admin.get('/monitoring/metrics', requirePermission({ resource: 'monitoring', action: 'read' }), (c) => {
+   671→  const memUsage = process.memoryUsage();
+   672→
+   673→  return c.json({
+   674→    success: true,
+   675→    data: {
+   676→      system: {
+   677→        uptime: process.uptime(),
+   678→        memoryUsage: {
+   679→          rss: memUsage.rss,
+   680→          heapUsed: memUsage.heapUsed,
+   681→          heapTotal: memUsage.heapTotal,
+   682→          external: memUsage.external,
+   683→          arrayBuffers: memUsage.arrayBuffers,
+   684→        },
+   685→        cpuUsage: process.cpuUsage(),
+   686→      },
+   687→      application: {
+   688→        version: '1.0.0',
+   689→        environment: process.env.NODE_ENV || 'development',
+   690→      },
+   691→      telemetry: {
+   692→        tracingEnabled: tracingService.isEnabled(),
+   693→        metricsEnabled: metricsService.isEnabled(),
+   694→      },
+   695→    },
+   696→  });
+   697→});
+   698→
+   699→// GET /admin/monitoring/alerts - Active alerts
+   700→admin.get('/monitoring/alerts', requirePermission({ resource: 'monitoring', action: 'read' }), (c) => {
+   701→  const activeAlerts = alertManager.getActiveAlerts();
+   702→  const rules = alertManager.getRules();
+   703→
+   704→  return c.json({
+   705→    success: true,
+   706→    data: {
+   707→      active: activeAlerts,
+   708→      rulesCount: rules.length,
+   709→      rules: rules.map(r => ({
+   710→        id: r.id,
+   711→        name: r.name,
+   712→        category: r.category,
+   713→        severity: r.severity,
+   714→        metric: r.metric,
+   715→        threshold: r.threshold,
+   716→        description: r.description,
+   717→      })),
+   718→    },
+   719→  });
+   720→});
+   721→
+   722→// GET /admin/monitoring/traces - Trace data
+   723→admin.get('/monitoring/traces', requirePermission({ resource: 'monitoring', action: 'read' }), (c) => {
+   724→  return c.json({
+   725→    success: true,
+   726→    data: {
+   727→      enabled: tracingService.isEnabled(),
+   728→      exporter: process.env.OTEL_EXPORTER_OTLP_ENDPOINT || 'not configured',
+   729→      serviceName: process.env.OTEL_SERVICE_NAME || 'agentforge-api',
+   730→      description: 'OpenTelemetry tracing for distributed observability',
+   731→    },
+   732→  });
+   733→});
+   734→
+   735→export { admin };
+   736→

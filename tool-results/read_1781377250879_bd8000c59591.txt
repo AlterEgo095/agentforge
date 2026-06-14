@@ -1,0 +1,1108 @@
+     1→// ============================================================
+     2→// AgentForge - DOC Agent Worker
+     3→// Professional document generation agent (PDF, DOCX, reports).
+     4→// Extends BaseAgentWorker with a structured document pipeline:
+     5→//   parse type → outline → generate sections → TOC → references
+     6→//   → render (JSON / Markdown / HTML / PDF metadata)
+     7→// ============================================================
+     8→
+     9→import { BaseAgentWorker, type QualityReport } from './BaseAgentWorker';
+    10→import type { DocOutput, DocSection, DocTable, DocImage, DocCodeBlock, TocEntry, DocReference } from '@agentforge/shared';
+    11→import { adaptDocInputToResearchInput, adaptWriterSessionToDocOutput, type IWriterCapability } from './adapters/WriterDocAdapter';
+    12→
+    13→// ─── Lazy PluginLoader Access ────────────────────────────────
+    14→// We access the pluginLoader lazily via the global singleton set
+    15→// by PluginBootstrap at server startup. This avoids a hard import
+    16→// that would fail at test time when plugin packages aren't available.
+    17→
+    18→function getPluginLoader(): { getCapability<T = unknown>(name: string): T | undefined } | null {
+    19→  try {
+    20→    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    21→    const { pluginLoader } = require('../../services/PluginBootstrap');
+    22→    return pluginLoader;
+    23→  } catch {
+    24→    // PluginBootstrap not available (e.g. in tests without plugin packages)
+    25→    return null;
+    26→  }
+    27→}
+    28→
+    29→// ─── Document Type Detection ───────────────────────────────
+    30→
+    31→const DOCUMENT_TYPE_KEYWORDS: Record<string, string[]> = {
+    32→  report:      ['report', 'analysis', 'findings', 'assessment', 'evaluation', 'audit'],
+    33→  proposal:    ['proposal', 'pitch', 'bid', 'tender', 'grant', 'rfp', 'submission'],
+    34→  manual:      ['manual', 'guide', 'handbook', 'instructions', 'how-to', 'tutorial', 'walkthrough'],
+    35→  whitepaper:  ['whitepaper', 'white paper', 'research paper', 'position paper', 'technical brief'],
+    36→  memo:        ['memo', 'memorandum', 'brief', 'internal note'],
+    37→  letter:      ['letter', 'correspondence', 'cover letter', 'formal letter'],
+    38→  article:     ['article', 'blog post', 'blog article', 'opinion piece', 'editorial'],
+    39→  specification: ['specification', 'spec', 'requirements document', 'srs', 'functional spec'],
+    40→  plan:        ['plan', 'roadmap', 'strategy', 'action plan', 'business plan'],
+    41→};
+    42→
+    43→const DOCUMENT_TYPE_TEMPLATES: Record<string, SectionTemplate[]> = {
+    44→  report: [
+    45→    { heading: 'Executive Summary', level: 1 },
+    46→    { heading: 'Introduction', level: 1 },
+    47→    { heading: 'Background', level: 1, children: [{ heading: 'Context', level: 2 }, { heading: 'Scope', level: 2 }] },
+    48→    { heading: 'Methodology', level: 1 },
+    49→    { heading: 'Findings', level: 1, children: [{ heading: 'Key Results', level: 2 }, { heading: 'Detailed Analysis', level: 2 }] },
+    50→    { heading: 'Recommendations', level: 1 },
+    51→    { heading: 'Conclusion', level: 1 },
+    52→  ],
+    53→  proposal: [
+    54→    { heading: 'Executive Summary', level: 1 },
+    55→    { heading: 'Problem Statement', level: 1 },
+    56→    { heading: 'Proposed Solution', level: 1, children: [{ heading: 'Approach', level: 2 }, { heading: 'Methodology', level: 2 }, { heading: 'Deliverables', level: 2 }] },
+    57→    { heading: 'Timeline', level: 1 },
+    58→    { heading: 'Budget', level: 1 },
+    59→    { heading: 'Team & Qualifications', level: 1 },
+    60→    { heading: 'Conclusion', level: 1 },
+    61→  ],
+    62→  manual: [
+    63→    { heading: 'Introduction', level: 1 },
+    64→    { heading: 'Getting Started', level: 1, children: [{ heading: 'Prerequisites', level: 2 }, { heading: 'Installation', level: 2 }] },
+    65→    { heading: 'Core Concepts', level: 1 },
+    66→    { heading: 'Usage', level: 1, children: [{ heading: 'Basic Operations', level: 2 }, { heading: 'Advanced Features', level: 2 }] },
+    67→    { heading: 'Configuration', level: 1 },
+    68→    { heading: 'Troubleshooting', level: 1 },
+    69→    { heading: 'FAQ', level: 1 },
+    70→  ],
+    71→  whitepaper: [
+    72→    { heading: 'Abstract', level: 1 },
+    73→    { heading: 'Introduction', level: 1 },
+    74→    { heading: 'Problem Definition', level: 1 },
+    75→    { heading: 'Technical Background', level: 1 },
+    76→    { heading: 'Approach', level: 1, children: [{ heading: 'Architecture', level: 2 }, { heading: 'Implementation', level: 2 }] },
+    77→    { heading: 'Results & Evaluation', level: 1 },
+    78→    { heading: 'Discussion', level: 1 },
+    79→    { heading: 'Conclusion', level: 1 },
+    80→  ],
+    81→  memo: [
+    82→    { heading: 'Purpose', level: 1 },
+    83→    { heading: 'Background', level: 1 },
+    84→    { heading: 'Key Points', level: 1 },
+    85→    { heading: 'Action Items', level: 1 },
+    86→  ],
+    87→  letter: [
+    88→    { heading: 'Greeting', level: 1 },
+    89→    { heading: 'Body', level: 1 },
+    90→    { heading: 'Closing', level: 1 },
+    91→  ],
+    92→  article: [
+    93→    { heading: 'Introduction', level: 1 },
+    94→    { heading: 'Main Arguments', level: 1, children: [{ heading: 'Point 1', level: 2 }, { heading: 'Point 2', level: 2 }, { heading: 'Point 3', level: 2 }] },
+    95→    { heading: 'Discussion', level: 1 },
+    96→    { heading: 'Conclusion', level: 1 },
+    97→  ],
+    98→  specification: [
+    99→    { heading: 'Overview', level: 1 },
+   100→    { heading: 'Scope', level: 1 },
+   101→    { heading: 'Functional Requirements', level: 1, children: [{ heading: 'User Stories', level: 2 }, { heading: 'Acceptance Criteria', level: 2 }] },
+   102→    { heading: 'Non-Functional Requirements', level: 1 },
+   103→    { heading: 'Data Model', level: 1 },
+   104→    { heading: 'API Specification', level: 1 },
+   105→    { heading: 'Constraints & Assumptions', level: 1 },
+   106→  ],
+   107→  plan: [
+   108→    { heading: 'Executive Summary', level: 1 },
+   109→    { heading: 'Vision & Goals', level: 1 },
+   110→    { heading: 'Current State', level: 1 },
+   111→    { heading: 'Strategy', level: 1, children: [{ heading: 'Phase 1', level: 2 }, { heading: 'Phase 2', level: 2 }, { heading: 'Phase 3', level: 2 }] },
+   112→    { heading: 'Resource Requirements', level: 1 },
+   113→    { heading: 'Risk Assessment', level: 1 },
+   114→    { heading: 'Milestones & KPIs', level: 1 },
+   115→  ],
+   116→};
+   117→
+   118→interface SectionTemplate {
+   119→  heading: string;
+   120→  level: 1 | 2 | 3 | 4;
+   121→  children?: SectionTemplate[];
+   122→}
+   123→
+   124→// ─── DOC Agent Worker ──────────────────────────────────────
+   125→
+   126→export class DocAgentWorker extends BaseAgentWorker<DocOutput> {
+   127→  constructor() {
+   128→    super('DOC');
+   129→  }
+   130→
+   131→  // ─── Core Pipeline ─────────────────────────────────────
+   132→
+   133→  protected async generate(
+   134→    prompt: string,
+   135→    context: Record<string, unknown>,
+   136→    sessionId: string,
+   137→  ): Promise<DocOutput> {
+   138→    // ── Try WriterWorker plugin delegation first ──
+   139→    try {
+   140→      const loader = getPluginLoader();
+   141→      const writerCap = loader?.getCapability<IWriterCapability>('writing');
+   142→      if (writerCap && typeof writerCap.write === 'function') {
+   143→        console.log(`[DocAgentWorker] Delegating to WriterWorker plugin (session: ${sessionId})`);
+   144→        this.emitEvent('doc_plugin_delegation', sessionId, { plugin: 'writer-worker' });
+   145→
+   146→        const researchInput = adaptDocInputToResearchInput(prompt, context);
+   147→        const writerSession = await writerCap.write(researchInput, {
+   148→          defaultContentType: this.mapDocTypeToContentType(this.parseDocumentType(prompt)),
+   149→          enableQualityScoring: false, // DocAgentWorker has its own quality scoring
+   150→          enableRefinement: false,
+   151→        });
+   152→
+   153→        const docOutput = adaptWriterSessionToDocOutput(writerSession);
+   154→
+   155→        // Carry author from context if provided
+   156→        if (context.author && typeof context.author === 'string') {
+   157→          docOutput.author = context.author;
+   158→        }
+   159→
+   160→        console.log(`[DocAgentWorker] WriterWorker plugin succeeded (session: ${sessionId}, sections: ${docOutput.sections.length})`);
+   161→        return docOutput;
+   162→      }
+   163→    } catch (err) {
+   164→      console.warn(
+   165→        `[DocAgentWorker] WriterWorker plugin failed, falling back to internal pipeline (session: ${sessionId}):`,
+   166→        err instanceof Error ? err.message : err,
+   167→      );
+   168→    }
+   169→
+   170→    // ── Internal Pipeline (fallback) ──
+   171→    console.log(`[DocAgentWorker] Using internal pipeline (session: ${sessionId})`);
+   172→
+   173→    // Phase 1: Parse document type from prompt
+   174→    const docType = this.parseDocumentType(prompt);
+   175→    const topic = this.extractTopic(prompt);
+   176→
+   177→    this.emitEvent('doc_outline', sessionId, { docType, topic });
+   178→
+   179→    // Phase 2: Build document outline with proper hierarchy
+   180→    const outline = this.buildOutline(docType, topic);
+   181→
+   182→    // Phase 3: Generate content for each section
+   183→    // (structured data generation — actual LLM content is provided by the orchestrator)
+   184→    const sections = this.generateSectionContent(outline, prompt, context);
+   185→
+   186→    this.emitEvent('doc_content', sessionId, {
+   187→      sectionCount: sections.length,
+   188→      totalWordEstimate: this.estimateSectionWords(sections),
+   189→    });
+   190→
+   191→    // Phase 4: Build table of contents from section hierarchy
+   192→    const tableOfContents = this.buildToc(sections);
+   193→
+   194→    // Phase 5: Add references if sources are mentioned or available
+   195→    const references = this.extractReferences(prompt, context);
+   196→
+   197→    // Phase 6: Compute metadata
+   198→    const totalWordCount = this.computeTotalWordCount(sections);
+   199→    const readingTimeMinutes = Math.max(1, Math.round(totalWordCount / 238)); // avg 238 wpm
+   200→
+   201→    this.emitEvent('doc_formatting', sessionId, {
+   202→      wordCount: totalWordCount,
+   203→      readingTimeMinutes,
+   204→      format: 'document',
+   205→    });
+   206→
+   207→    return {
+   208→      title: this.generateTitle(docType, topic),
+   209→      subtitle: this.generateSubtitle(docType, topic),
+   210→      author: context.author as string | undefined,
+   211→      sections,
+   212→      tableOfContents,
+   213→      references,
+   214→      metadata: {
+   215→        wordCount: totalWordCount,
+   216→        readingTimeMinutes,
+   217→        format: docType,
+   218→        language: 'en',
+   219→        sourceCount: references.length,
+   220→      },
+   221→    };
+   222→  }
+   223→
+   224→  /**
+   225→   * Map DocAgentWorker document types to WriterWorker ContentType values.
+   226→   */
+   227→  private mapDocTypeToContentType(docType: string): 'article' | 'report' | 'documentation' | 'whitepaper' | 'tutorial' | 'summary' {
+   228→    const mapping: Record<string, 'article' | 'report' | 'documentation' | 'whitepaper' | 'tutorial' | 'summary'> = {
+   229→      report: 'report',
+   230→      proposal: 'report',
+   231→      manual: 'documentation',
+   232→      whitepaper: 'whitepaper',
+   233→      memo: 'summary',
+   234→      letter: 'article',
+   235→      article: 'article',
+   236→      specification: 'documentation',
+   237→      plan: 'report',
+   238→    };
+   239→    return mapping[docType] ?? 'article';
+   240→  }
+   241→
+   242→  // ─── Validation ────────────────────────────────────────
+   243→
+   244→  protected async validateOutput(output: DocOutput, _prompt: string): Promise<QualityReport> {
+   245→    const dimensions: Record<string, number> = {};
+   246→    const suggestions: string[] = [];
+   247→
+   248→    // 1. Content Depth (0–1)
+   249→    dimensions['Content Depth'] = this.scoreContentDepth(output, suggestions);
+   250→
+   251→    // 2. Structure & Organization (0–1)
+   252→    dimensions['Structure & Organization'] = this.scoreStructure(output, suggestions);
+   253→
+   254→    // 3. Formatting & Typography (0–1)
+   255→    dimensions['Formatting & Typography'] = this.scoreFormatting(output, suggestions);
+   256→
+   257→    // 4. Accuracy & Citations (0–1)
+   258→    dimensions['Accuracy & Citations'] = this.scoreCitations(output, suggestions);
+   259→
+   260→    // 5. Clarity & Readability (0–1)
+   261→    dimensions['Clarity & Readability'] = this.scoreReadability(output, suggestions);
+   262→
+   263→    const overall = this.computeWeightedScore(dimensions);
+   264→    const passed = this.isQualityPassing(overall);
+   265→
+   266→    return { overall, dimensions, passed, suggestions };
+   267→  }
+   268→
+   269→  // ─── Rendering ─────────────────────────────────────────
+   270→
+   271→  protected async renderOutput(output: DocOutput, format?: string): Promise<unknown> {
+   272→    switch (format) {
+   273→      case 'markdown':
+   274→        return this.renderMarkdown(output);
+   275→
+   276→      case 'html':
+   277→        return this.renderHtml(output);
+   278→
+   279→      case 'pdf':
+   280→        // Returns metadata for PDF generation (placeholder — actual PDF
+   281→        // generation would be delegated to a rendering service)
+   282→        return {
+   283→          type: 'pdf',
+   284→          title: output.title,
+   285→          subtitle: output.subtitle,
+   286→          metadata: output.metadata,
+   287→          sectionCount: output.sections.length,
+   288→          renderCommand: { engine: 'pdf', source: 'markdown', options: { pageSize: 'A4', margin: '2cm' } },
+   289→        };
+   290→
+   291→      case 'json':
+   292→      default:
+   293→        return output;
+   294→    }
+   295→  }
+   296→
+   297→  // ─── Helper: Document Type Parsing ─────────────────────
+   298→
+   299→  /**
+   300→   * Detect the document type from the user prompt by matching against
+   301→   * known keyword sets. Falls back to "report".
+   302→   */
+   303→  parseDocumentType(prompt: string): string {
+   304→    const lower = prompt.toLowerCase();
+   305→    let bestMatch = 'report';
+   306→    let bestScore = 0;
+   307→
+   308→    for (const [docType, keywords] of Object.entries(DOCUMENT_TYPE_KEYWORDS)) {
+   309→      let score = 0;
+   310→      for (const keyword of keywords) {
+   311→        if (lower.includes(keyword)) {
+   312→          score += keyword.length; // longer keyword matches are stronger signals
+   313→        }
+   314→      }
+   315→      if (score > bestScore) {
+   316→        bestScore = score;
+   317→        bestMatch = docType;
+   318→      }
+   319→    }
+   320→
+   321→    return bestMatch;
+   322→  }
+   323→
+   324→  /**
+   325→   * Extract the core topic / subject from the prompt.
+   326→   * Uses a simple heuristic: strips common command prefixes and returns
+   327→   * the remainder trimmed to a reasonable length.
+   328→   */
+   329→  private extractTopic(prompt: string): string {
+   330→    const prefixes = [
+   331→      /^(?:write|create|generate|draft|produce|build)\s+(?:a\s+)?(?:report|proposal|manual|whitepaper|memo|letter|article|specification|spec|plan|document)\s+(?:about|on|for|regarding)\s+/i,
+   332→      /^(?:write|create|generate|draft|produce|build)\s+(?:a\s+)?/i,
+   333→    ];
+   334→
+   335→    let topic = prompt.trim();
+   336→    for (const prefix of prefixes) {
+   337→      topic = topic.replace(prefix, '');
+   338→    }
+   339→
+   340→    // Truncate to first sentence or 120 characters whichever is shorter
+   341→    const firstSentence = topic.match(/^[^.!?\n]+/);
+   342→    if (firstSentence) {
+   343→      topic = firstSentence[0].trim();
+   344→    }
+   345→
+   346→    return topic.length > 120 ? topic.slice(0, 117) + '...' : topic;
+   347→  }
+   348→
+   349→  // ─── Helper: Outline Building ──────────────────────────
+   350→
+   351→  /**
+   352→   * Create a section hierarchy from a document-type template.
+   353→   * Each section gets a unique ID, placeholder content, and recursive
+   354→   * children based on the template.
+   355→   */
+   356→  buildOutline(docType: string, topic: string): DocSection[] {
+   357→    const templates = DOCUMENT_TYPE_TEMPLATES[docType] ?? DOCUMENT_TYPE_TEMPLATES['report'];
+   358→    return templates.map((tpl, index) => this.instantiateSection(tpl, topic, [index]));
+   359→  }
+   360→
+   361→  private instantiateSection(tpl: SectionTemplate, topic: string, path: number[]): DocSection {
+   362→    const id = `sec-${path.join('-')}`;
+   363→    const section: DocSection = {
+   364→      id,
+   365→      heading: tpl.heading,
+   366→      level: tpl.level,
+   367→      content: this.generatePlaceholderContent(tpl.heading, tpl.level, topic),
+   368→    };
+   369→
+   370→    if (tpl.children && tpl.children.length > 0) {
+   371→      section.children = tpl.children.map((child, childIndex) =>
+   372→        this.instantiateSection(child, topic, [...path, childIndex]),
+   373→      );
+   374→    }
+   375→
+   376→    return section;
+   377→  }
+   378→
+   379→  /**
+   380→   * Generate structured placeholder content for a section.
+   381→   * Real LLM-generated content would be injected by the orchestrator;
+   382→   * this provides a well-structured scaffold with appropriate depth cues.
+   383→   */
+   384→  private generatePlaceholderContent(heading: string, level: 1 | 2 | 3 | 4, topic: string): string {
+   385→    const minWords = level <= 2 ? 150 : 75;
+   386→    const base = `This section covers ${heading.toLowerCase()} in the context of ${topic}. `;
+   387→
+   388→    const elaborations = [
+   389→      `The following provides a comprehensive overview of ${heading.toLowerCase()}, including key considerations, analysis, and actionable insights relevant to ${topic}.`,
+   390→      `It is essential to understand the foundational aspects presented here, as they form the basis for subsequent sections and recommendations throughout this document.`,
+   391→      `The discussion that follows draws upon established practices and contemporary research, ensuring both rigor and relevance in addressing the core themes of ${topic}.`,
+   392→      `Stakeholders should consider the interdependencies between this area and the broader strategic context, as outlined in the executive summary and conclusion sections.`,
+   393→      `Further detail and supporting evidence can be found in the referenced sources appended to this document.`,
+   394→    ];
+   395→
+   396→    let content = base + elaborations.join(' ');
+   397→
+   398→    // Ensure minimum word count for level 1–2 sections
+   399→    while (this.countWords(content) < minWords) {
+   400→      content += ` Additional context and elaboration on ${heading.toLowerCase()} is provided to ensure comprehensive coverage of this important topic. The analysis considers multiple perspectives and draws on both qualitative and quantitative evidence where available.`;
+   401→    }
+   402→
+   403→    return content;
+   404→  }
+   405→
+   406→  // ─── Helper: Section Content Generation ────────────────
+   407→
+   408→  /**
+   409→   * Enrich sections with contextual content, tables, images, or code
+   410→   * blocks based on the document type and prompt signals.
+   411→   */
+   412→  private generateSectionContent(
+   413→    outline: DocSection[],
+   414→    prompt: string,
+   415→    context: Record<string, unknown>,
+   416→  ): DocSection[] {
+   417→    return outline.map((section) => {
+   418→      const enriched = { ...section };
+   419→
+   420→      // If the orchestrator has provided previous output feedback, incorporate it
+   421→      if (context.previousOutput && typeof context.previousOutput === 'object') {
+   422→        const prev = context.previousOutput as Record<string, unknown>;
+   423→        if (prev.sections && Array.isArray(prev.sections)) {
+   424→          const matching = (prev.sections as DocSection[]).find((s) => s.heading === section.heading);
+   425→          if (matching && matching.content) {
+   426→            enriched.content = matching.content;
+   427→          }
+   428→        }
+   429→      }
+   430→
+   431→      // Recursively enrich children
+   432→      if (enriched.children && enriched.children.length > 0) {
+   433→        enriched.children = this.generateSectionContent(enriched.children, prompt, context);
+   434→      }
+   435→
+   436→      // Add structural elements based on heading semantics
+   437→      enriched.tables = this.suggestTables(enriched.heading, prompt);
+   438→      enriched.images = this.suggestImages(enriched.heading, prompt);
+   439→      enriched.codeBlocks = this.suggestCodeBlocks(enriched.heading, prompt);
+   440→
+   441→      return enriched;
+   442→    });
+   443→  }
+   444→
+   445→  /**
+   446→   * Suggest tables for data-oriented sections.
+   447→   */
+   448→  private suggestTables(heading: string, _prompt: string): DocTable[] | undefined {
+   449→    const tableHeadings = ['budget', 'timeline', 'comparison', 'requirements', 'specification', 'data', 'metrics', 'kpi', 'resources', 'schedule'];
+   450→    const lower = heading.toLowerCase();
+   451→    if (!tableHeadings.some((h) => lower.includes(h))) return undefined;
+   452→
+   453→    return [
+   454→      {
+   455→        headers: ['Item', 'Description', 'Details', 'Status'],
+   456→        rows: [
+   457→          ['Item 1', 'Description of item 1', 'Additional detail', 'Pending'],
+   458→          ['Item 2', 'Description of item 2', 'Additional detail', 'Pending'],
+   459→          ['Item 3', 'Description of item 3', 'Additional detail', 'Pending'],
+   460→        ],
+   461→        caption: `${heading} — Overview Table`,
+   462→      },
+   463→    ];
+   464→  }
+   465→
+   466→  /**
+   467→   * Suggest images for visual-oriented sections.
+   468→   */
+   469→  private suggestImages(heading: string, _prompt: string): DocImage[] | undefined {
+   470→    const imageHeadings = ['architecture', 'diagram', 'overview', 'workflow', 'process', 'structure', 'design', 'layout'];
+   471→    const lower = heading.toLowerCase();
+   472→    if (!imageHeadings.some((h) => lower.includes(h))) return undefined;
+   473→
+   474→    return [
+   475→      {
+   476→        alt: `${heading} diagram`,
+   477→        caption: `Figure: ${heading}`,
+   478→      },
+   479→    ];
+   480→  }
+   481→
+   482→  /**
+   483→   * Suggest code blocks for technical sections.
+   484→   */
+   485→  private suggestCodeBlocks(heading: string, _prompt: string): DocCodeBlock[] | undefined {
+   486→    const codeHeadings = ['api', 'code', 'implementation', 'example', 'configuration', 'setup', 'installation', 'script', 'snippet'];
+   487→    const lower = heading.toLowerCase();
+   488→    if (!codeHeadings.some((h) => lower.includes(h))) return undefined;
+   489→
+   490→    return [
+   491→      {
+   492→        language: lower.includes('sql') ? 'sql' : lower.includes('python') ? 'python' : 'typescript',
+   493→        code: `// Example code for ${heading.toLowerCase()}\n// Replace with actual implementation\n`,
+   494→        caption: `Code Example: ${heading}`,
+   495→      },
+   496→    ];
+   497→  }
+   498→
+   499→  // ─── Helper: Table of Contents ─────────────────────────
+   500→
+   501→  /**
+   502→   * Generate a recursive Table of Contents from the section hierarchy.
+   503→   */
+   504→  buildToc(sections: DocSection[]): TocEntry[] {
+   505→    return sections.map((section) => {
+   506→      const entry: TocEntry = {
+   507→        id: section.id,
+   508→        title: section.heading,
+   509→        level: section.level,
+   510→      };
+   511→
+   512→      if (section.children && section.children.length > 0) {
+   513→        entry.children = this.buildToc(section.children);
+   514→      }
+   515→
+   516→      return entry;
+   517→    });
+   518→  }
+   519→
+   520→  // ─── Helper: References ────────────────────────────────
+   521→
+   522→  /**
+   523→   * Extract references from prompt and context. In production this
+   524→   * would be powered by the RECHERCHE agent; here we provide a
+   525→   * scaffold that detects explicit source mentions.
+   526→   */
+   527→  private extractReferences(prompt: string, context: Record<string, unknown>): DocReference[] {
+   528→    const references: DocReference[] = [];
+   529→    const sourcePattern = /(?:source|ref|cite|according to|referenced?)(?:\s+(?:to|from))?\s+["']([^"']+)["']/gi;
+   530→    let match: RegExpExecArray | null;
+   531→
+   532→    while ((match = sourcePattern.exec(prompt)) !== null) {
+   533→      references.push({
+   534→        id: `ref-${references.length + 1}`,
+   535→        type: 'other',
+   536→        title: match[1],
+   537→      });
+   538→    }
+   539→
+   540→    // Also include any references passed through context (e.g. from RECHERCHE agent)
+   541→    if (context.references && Array.isArray(context.references)) {
+   542→      for (const ref of context.references as DocReference[]) {
+   543→        if (ref.id && ref.title) {
+   544→          references.push(ref);
+   545→        }
+   546→      }
+   547→    }
+   548→
+   549→    return references;
+   550→  }
+   551→
+   552→  // ─── Helper: Title & Subtitle ──────────────────────────
+   553→
+   554→  private generateTitle(docType: string, topic: string): string {
+   555→    const titleMap: Record<string, string> = {
+   556→      report: 'Report',
+   557→      proposal: 'Proposal',
+   558→      manual: 'User Manual',
+   559→      whitepaper: 'White Paper',
+   560→      memo: 'Memorandum',
+   561→      letter: 'Letter',
+   562→      article: 'Article',
+   563→      specification: 'Specification',
+   564→      plan: 'Strategic Plan',
+   565→    };
+   566→    return `${topic} ${titleMap[docType] ?? 'Document'}`;
+   567→  }
+   568→
+   569→  private generateSubtitle(docType: string, _topic: string): string | undefined {
+   570→    const subtitleMap: Record<string, string> = {
+   571→      report: 'Comprehensive Analysis & Findings',
+   572→      proposal: 'Detailed Proposal for Review',
+   573→      manual: 'Complete Reference Guide',
+   574→      whitepaper: 'Technical Research & Insights',
+   575→      specification: 'Requirements & Technical Design',
+   576→      plan: 'Roadmap & Strategic Direction',
+   577→    };
+   578→    return subtitleMap[docType];
+   579→  }
+   580→
+   581→  // ─── Helper: Word Counting ─────────────────────────────
+   582→
+   583→  /**
+   584→   * Count words in a text string. Splits on whitespace and filters empties.
+   585→   */
+   586→  countWords(text: string): number {
+   587→    return text.split(/\s+/).filter((w) => w.length > 0).length;
+   588→  }
+   589→
+   590→  private computeTotalWordCount(sections: DocSection[]): number {
+   591→    let total = 0;
+   592→    for (const section of sections) {
+   593→      total += this.countWords(section.content);
+   594→      if (section.tables) {
+   595→        for (const table of section.tables) {
+   596→          total += table.headers.join(' ').split(/\s+/).length;
+   597→          for (const row of table.rows) {
+   598→            total += row.join(' ').split(/\s+/).length;
+   599→          }
+   600→        }
+   601→      }
+   602→      if (section.codeBlocks) {
+   603→        for (const block of section.codeBlocks) {
+   604→          total += this.countWords(block.code);
+   605→        }
+   606→      }
+   607→      if (section.children) {
+   608→        total += this.computeTotalWordCount(section.children);
+   609→      }
+   610→    }
+   611→    return total;
+   612→  }
+   613→
+   614→  private estimateSectionWords(sections: DocSection[]): number {
+   615→    return this.computeTotalWordCount(sections);
+   616→  }
+   617→
+   618→  // ─── Quality Scoring Helpers ───────────────────────────
+   619→
+   620→  private scoreContentDepth(output: DocOutput, suggestions: string[]): number {
+   621→    let totalSections = 0;
+   622→    let deepSections = 0;
+   623→
+   624→    const walk = (sections: DocSection[]): void => {
+   625→      for (const section of sections) {
+   626→        totalSections++;
+   627→        const wordCount = this.countWords(section.content);
+   628→        // Level 1–2 sections should have at least 150 words; levels 3–4 at least 75
+   629→        const minimum = section.level <= 2 ? 150 : 75;
+   630→        if (wordCount >= minimum) {
+   631→          deepSections++;
+   632→        } else {
+   633→          suggestions.push(
+   634→            `Section "${section.heading}" has only ${wordCount} words (minimum: ${minimum}). Consider expanding the content.`,
+   635→          );
+   636→        }
+   637→        if (section.children) walk(section.children);
+   638→      }
+   639→    };
+   640→
+   641→    walk(output.sections);
+   642→
+   643→    if (totalSections === 0) return 0;
+   644→    return deepSections / totalSections;
+   645→  }
+   646→
+   647→  private scoreStructure(output: DocOutput, suggestions: string[]): number {
+   648→    let score = 1.0;
+   649→
+   650→    // Must have at least 2 top-level sections
+   651→    if (output.sections.length < 2) {
+   652→      score -= 0.3;
+   653→      suggestions.push('Document should have at least 2 top-level sections.');
+   654→    }
+   655→
+   656→    // Validate heading hierarchy — each section's level should not skip (e.g. 1 → 3)
+   657→    let prevLevel = 0;
+   658→    const checkHierarchy = (sections: DocSection[]): void => {
+   659→      for (const section of sections) {
+   660→        if (prevLevel > 0 && section.level > prevLevel + 1) {
+   661→          score -= 0.1;
+   662→          suggestions.push(
+   663→            `Heading hierarchy skip detected: level ${prevLevel} → ${section.level} at "${section.heading}".`,
+   664→          );
+   665→        }
+   666→        prevLevel = section.level;
+   667→        if (section.children) checkHierarchy(section.children);
+   668→      }
+   669→    };
+   670→    checkHierarchy(output.sections);
+   671→
+   672→    // TOC should match sections
+   673→    if (output.tableOfContents.length !== output.sections.length) {
+   674→      score -= 0.15;
+   675→      suggestions.push('Table of contents entry count does not match top-level sections.');
+   676→    }
+   677→
+   678→    return Math.max(0, Math.min(1, score));
+   679→  }
+   680→
+   681→  private scoreFormatting(output: DocOutput, suggestions: string[]): number {
+   682→    let score = 1.0;
+   683→    const headingSet = new Set<string>();
+   684→    let duplicateHeadings = 0;
+   685→
+   686→    const walk = (sections: DocSection[]): void => {
+   687→      for (const section of sections) {
+   688→        if (headingSet.has(section.heading.toLowerCase())) {
+   689→          duplicateHeadings++;
+   690→        }
+   691→        headingSet.add(section.heading.toLowerCase());
+   692→
+   693→        // Check for empty content
+   694→        if (!section.content || section.content.trim().length === 0) {
+   695→          score -= 0.15;
+   696→          suggestions.push(`Section "${section.heading}" has empty content.`);
+   697→        }
+   698→
+   699→        // Validate tables have rows
+   700→        if (section.tables) {
+   701→          for (let i = 0; i < section.tables.length; i++) {
+   702→            const table = section.tables[i];
+   703→            if (table.rows.length === 0) {
+   704→              score -= 0.05;
+   705→              suggestions.push(`Table ${i + 1} in "${section.heading}" has no rows.`);
+   706→            }
+   707→            if (table.headers.length === 0) {
+   708→              score -= 0.05;
+   709→              suggestions.push(`Table ${i + 1} in "${section.heading}" has no headers.`);
+   710→            }
+   711→          }
+   712→        }
+   713→
+   714→        // Validate code blocks have code
+   715→        if (section.codeBlocks) {
+   716→          for (let i = 0; i < section.codeBlocks.length; i++) {
+   717→            if (!section.codeBlocks[i].code || section.codeBlocks[i].code.trim().length === 0) {
+   718→              score -= 0.05;
+   719→              suggestions.push(`Code block ${i + 1} in "${section.heading}" is empty.`);
+   720→            }
+   721→          }
+   722→        }
+   723→
+   724→        if (section.children) walk(section.children);
+   725→      }
+   726→    };
+   727→
+   728→    walk(output.sections);
+   729→
+   730→    if (duplicateHeadings > 0) {
+   731→      score -= 0.1 * duplicateHeadings;
+   732→      suggestions.push(`${duplicateHeadings} duplicate heading(s) detected. Use unique headings for each section.`);
+   733→    }
+   734→
+   735→    return Math.max(0, Math.min(1, score));
+   736→  }
+   737→
+   738→  private scoreCitations(output: DocOutput, suggestions: string[]): number {
+   739→    const refCount = output.references.length;
+   740→
+   741→    if (refCount === 0) {
+   742→      // Not necessarily a failure for shorter document types
+   743→      const docTypesRequiringRefs = ['whitepaper', 'report', 'specification', 'proposal'];
+   744→      if (docTypesRequiringRefs.includes(output.metadata.format)) {
+   745→        suggestions.push(`${output.metadata.format} documents typically require references. Consider adding sources.`);
+   746→        return 0.4;
+   747→      }
+   748→      return 0.8; // acceptable for memos, letters, etc.
+   749→    }
+   750→
+   751→    // Check reference completeness
+   752→    let incomplete = 0;
+   753→    for (const ref of output.references) {
+   754→      if (!ref.title || ref.title.trim().length === 0) incomplete++;
+   755→    }
+   756→
+   757→    if (incomplete > 0) {
+   758→      suggestions.push(`${incomplete} reference(s) have incomplete information.`);
+   759→    }
+   760→
+   761→    // Score based on completeness ratio
+   762→    const completeness = 1 - incomplete / refCount;
+   763→    // Bonus for having multiple well-formed references
+   764→    const countBonus = Math.min(refCount / 5, 1) * 0.2;
+   765→    return Math.min(1, completeness * 0.8 + countBonus);
+   766→  }
+   767→
+   768→  private scoreReadability(output: DocOutput, suggestions: string[]): number {
+   769→    let totalWords = 0;
+   770→    let totalSentences = 0;
+   771→    let totalSyllables = 0;
+   772→
+   773→    const walk = (sections: DocSection[]): void => {
+   774→      for (const section of sections) {
+   775→        const text = section.content;
+   776→        totalWords += this.countWords(text);
+   777→        totalSentences += this.countSentences(text);
+   778→        totalSyllables += this.estimateSyllables(text);
+   779→
+   780→        if (section.children) walk(section.children);
+   781→      }
+   782→    };
+   783→
+   784→    walk(output.sections);
+   785→
+   786→    if (totalSentences === 0 || totalWords === 0) return 0;
+   787→
+   788→    // Flesch-Kincaid Grade Level (approximate)
+   789→    const fkGrade = 0.39 * (totalWords / totalSentences) + 11.8 * (totalSyllables / totalWords) - 15.59;
+   790→
+   791→    // Ideal grade level for professional documents: 8–12
+   792→    // Score 1.0 for grade 10, decreasing as we move away
+   793→    const idealGrade = 10;
+   794→    const deviation = Math.abs(fkGrade - idealGrade);
+   795→    const score = Math.max(0, 1 - deviation / 10);
+   796→
+   797→    if (fkGrade > 14) {
+   798→      suggestions.push('Document may be too complex. Consider simplifying sentence structures.');
+   799→    } else if (fkGrade < 6) {
+   800→      suggestions.push('Document readability is very low grade-level. Consider if the tone is appropriate for the audience.');
+   801→    }
+   802→
+   803→    return Math.min(1, Math.max(0, score));
+   804→  }
+   805→
+   806→  private countSentences(text: string): number {
+   807→    const sentences = text.split(/[.!?]+/).filter((s) => s.trim().length > 0);
+   808→    return Math.max(1, sentences.length);
+   809→  }
+   810→
+   811→  private estimateSyllables(text: string): number {
+   812→    // Simple heuristic: count vowel groups per word
+   813→    const words = text.split(/\s+/).filter((w) => w.length > 0);
+   814→    let total = 0;
+   815→    for (const word of words) {
+   816→      const vowelGroups = word.toLowerCase().replace(/[^a-z]/g, '').match(/[aeiouy]+/g);
+   817→      total += vowelGroups ? Math.max(1, vowelGroups.length) : 1;
+   818→    }
+   819→    return total;
+   820→  }
+   821→
+   822→  // ─── Rendering: Markdown ────────────────────────────────
+   823→
+   824→  renderMarkdown(output: DocOutput): string {
+   825→    const lines: string[] = [];
+   826→
+   827→    // Title block
+   828→    lines.push(`# ${output.title}`);
+   829→    if (output.subtitle) lines.push(`## ${output.subtitle}`);
+   830→    if (output.author) lines.push(`*By ${output.author}*`);
+   831→    lines.push('');
+   832→
+   833→    // Table of Contents
+   834→    lines.push('## Table of Contents');
+   835→    lines.push('');
+   836→    for (const entry of output.tableOfContents) {
+   837→      lines.push(this.renderTocEntryMarkdown(entry));
+   838→    }
+   839→    lines.push('');
+   840→
+   841→    // Sections
+   842→    for (const section of output.sections) {
+   843→      lines.push(this.renderSectionMarkdown(section));
+   844→    }
+   845→
+   846→    // References
+   847→    if (output.references.length > 0) {
+   848→      lines.push('## References');
+   849→      lines.push('');
+   850→      for (const ref of output.references) {
+   851→        lines.push(this.renderReferenceMarkdown(ref));
+   852→      }
+   853→      lines.push('');
+   854→    }
+   855→
+   856→    // Footer metadata
+   857→    lines.push('---');
+   858→    lines.push(`*Word count: ${output.metadata.wordCount} | Reading time: ~${output.metadata.readingTimeMinutes} min*`);
+   859→
+   860→    return lines.join('\n');
+   861→  }
+   862→
+   863→  private renderTocEntryMarkdown(entry: TocEntry, indent = 0): string {
+   864→    const prefix = '  '.repeat(indent) + '- ';
+   865→    let line = `${prefix}[${entry.title}](#${entry.id})`;
+   866→    const childLines = entry.children
+   867→      ? entry.children.map((child: TocEntry) => this.renderTocEntryMarkdown(child, indent + 1)).join('\n')
+   868→      : '';
+   869→    return childLines ? line + '\n' + childLines : line;
+   870→  }
+   871→
+   872→  private renderSectionMarkdown(section: DocSection): string {
+   873→    const lines: string[] = [];
+   874→    const headingPrefix = '#'.repeat(section.level + 1); // level 1 → ##, level 2 → ###, etc.
+   875→    lines.push(`${headingPrefix} ${section.heading}`);
+   876→    lines.push('');
+   877→    lines.push(section.content);
+   878→    lines.push('');
+   879→
+   880→    // Tables
+   881→    if (section.tables) {
+   882→      for (const table of section.tables) {
+   883→        lines.push(this.renderTableMarkdown(table));
+   884→        lines.push('');
+   885→      }
+   886→    }
+   887→
+   888→    // Images
+   889→    if (section.images) {
+   890→      for (const image of section.images) {
+   891→        const alt = image.alt || 'image';
+   892→        const md = image.url ? `![${alt}](${image.url})` : `![${alt}]`;
+   893→        lines.push(md);
+   894→        if (image.caption) lines.push(`*${image.caption}*`);
+   895→        lines.push('');
+   896→      }
+   897→    }
+   898→
+   899→    // Code blocks
+   900→    if (section.codeBlocks) {
+   901→      for (const block of section.codeBlocks) {
+   902→        lines.push('```' + block.language);
+   903→        lines.push(block.code);
+   904→        lines.push('```');
+   905→        if (block.caption) lines.push(`*${block.caption}*`);
+   906→        lines.push('');
+   907→      }
+   908→    }
+   909→
+   910→    // Children
+   911→    if (section.children) {
+   912→      for (const child of section.children) {
+   913→        lines.push(this.renderSectionMarkdown(child));
+   914→      }
+   915→    }
+   916→
+   917→    return lines.join('\n');
+   918→  }
+   919→
+   920→  private renderTableMarkdown(table: DocTable): string {
+   921→    const lines: string[] = [];
+   922→    lines.push('| ' + table.headers.join(' | ') + ' |');
+   923→    lines.push('| ' + table.headers.map(() => '---').join(' | ') + ' |');
+   924→    for (const row of table.rows) {
+   925→      lines.push('| ' + row.join(' | ') + ' |');
+   926→    }
+   927→    if (table.caption) {
+   928→      lines.push(`*${table.caption}*`);
+   929→    }
+   930→    return lines.join('\n');
+   931→  }
+   932→
+   933→  private renderReferenceMarkdown(ref: DocReference): string {
+   934→    const parts: string[] = [];
+   935→    if (ref.authors && ref.authors.length > 0) parts.push(ref.authors.join(', '));
+   936→    if (ref.year) parts.push(`(${ref.year})`);
+   937→    parts.push(`*${ref.title}*`);
+   938→    if (ref.url) parts.push(`[Link](${ref.url})`);
+   939→    return `- [${ref.id}] ${parts.join(' ')}`;
+   940→  }
+   941→
+   942→  // ─── Rendering: HTML ───────────────────────────────────
+   943→
+   944→  renderHtml(output: DocOutput): string {
+   945→    const lines: string[] = [];
+   946→
+   947→    lines.push('<!DOCTYPE html>');
+   948→    lines.push('<html lang="en">');
+   949→    lines.push('<head>');
+   950→    lines.push('  <meta charset="UTF-8">');
+   951→    lines.push(`  <title>${this.escapeHtml(output.title)}</title>`);
+   952→    lines.push('  <style>');
+   953→    lines.push('    body { font-family: "Georgia", serif; max-width: 800px; margin: 0 auto; padding: 2rem; color: #1a1a1a; line-height: 1.7; }');
+   954→    lines.push('    h1 { border-bottom: 2px solid #10B981; padding-bottom: 0.5rem; }');
+   955→    lines.push('    h2 { border-bottom: 1px solid #e5e7eb; padding-bottom: 0.3rem; margin-top: 2rem; }');
+   956→    lines.push('    h3, h4 { margin-top: 1.5rem; }');
+   957→    lines.push('    table { border-collapse: collapse; width: 100%; margin: 1rem 0; }');
+   958→    lines.push('    th, td { border: 1px solid #d1d5db; padding: 0.5rem 0.75rem; text-align: left; }');
+   959→    lines.push('    th { background: #f3f4f6; font-weight: 600; }');
+   960→    lines.push('    pre { background: #1f2937; color: #e5e7eb; padding: 1rem; border-radius: 0.5rem; overflow-x: auto; }');
+   961→    lines.push('    code { font-family: "Fira Code", monospace; font-size: 0.9em; }');
+   962→    lines.push('    .toc a { text-decoration: none; color: #10B981; }');
+   963→    lines.push('    .toc a:hover { text-decoration: underline; }');
+   964→    lines.push('    .caption { font-style: italic; color: #6b7280; font-size: 0.9em; }');
+   965→    lines.push('    .subtitle { color: #6b7280; font-size: 1.2em; }');
+   966→    lines.push('    .metadata { color: #9ca3af; font-size: 0.85em; margin-top: 2rem; border-top: 1px solid #e5e7eb; padding-top: 1rem; }');
+   967→    lines.push('  </style>');
+   968→    lines.push('</head>');
+   969→    lines.push('<body>');
+   970→
+   971→    // Title block
+   972→    lines.push(`  <h1>${this.escapeHtml(output.title)}</h1>`);
+   973→    if (output.subtitle) lines.push(`  <p class="subtitle">${this.escapeHtml(output.subtitle)}</p>`);
+   974→    if (output.author) lines.push(`  <p><em>By ${this.escapeHtml(output.author)}</em></p>`);
+   975→
+   976→    // Table of Contents
+   977→    lines.push('  <nav class="toc">');
+   978→    lines.push('    <h2>Table of Contents</h2>');
+   979→    lines.push(this.renderTocHtml(output.tableOfContents, 1));
+   980→    lines.push('  </nav>');
+   981→
+   982→    // Sections
+   983→    for (const section of output.sections) {
+   984→      lines.push(this.renderSectionHtml(section));
+   985→    }
+   986→
+   987→    // References
+   988→    if (output.references.length > 0) {
+   989→      lines.push('  <section>');
+   990→      lines.push('    <h2>References</h2>');
+   991→      lines.push('    <ol>');
+   992→      for (const ref of output.references) {
+   993→        lines.push(`      <li>${this.renderReferenceHtml(ref)}</li>`);
+   994→      }
+   995→      lines.push('    </ol>');
+   996→      lines.push('  </section>');
+   997→    }
+   998→
+   999→    // Metadata footer
+  1000→    lines.push(`  <p class="metadata">Word count: ${output.metadata.wordCount} | Reading time: ~${output.metadata.readingTimeMinutes} min</p>`);
+  1001→
+  1002→    lines.push('</body>');
+  1003→    lines.push('</html>');
+  1004→
+  1005→    return lines.join('\n');
+  1006→  }
+  1007→
+  1008→  private renderTocHtml(entries: TocEntry[], depth: number): string {
+  1009→    const indent = '    '.repeat(depth);
+  1010→    const lines: string[] = [];
+  1011→    lines.push(`${indent}<ul>`);
+  1012→    for (const entry of entries) {
+  1013→      lines.push(`${indent}  <li><a href="#${entry.id}">${this.escapeHtml(entry.title)}</a>`);
+  1014→      if (entry.children && entry.children.length > 0) {
+  1015→        lines.push(this.renderTocHtml(entry.children, depth + 1));
+  1016→      }
+  1017→      lines.push(`${indent}  </li>`);
+  1018→    }
+  1019→    lines.push(`${indent}</ul>`);
+  1020→    return lines.join('\n');
+  1021→  }
+  1022→
+  1023→  private renderSectionHtml(section: DocSection): string {
+  1024→    const tag = `h${section.level + 1}`; // level 1 → h2, level 2 → h3, etc.
+  1025→    const lines: string[] = [];
+  1026→    lines.push(`  <section id="${section.id}">`);
+  1027→    lines.push(`    <${tag}>${this.escapeHtml(section.heading)}</${tag}>`);
+  1028→    lines.push(`    <p>${this.escapeHtml(section.content)}</p>`);
+  1029→
+  1030→    // Tables
+  1031→    if (section.tables) {
+  1032→      for (const table of section.tables) {
+  1033→        lines.push(this.renderTableHtml(table));
+  1034→      }
+  1035→    }
+  1036→
+  1037→    // Images
+  1038→    if (section.images) {
+  1039→      for (const image of section.images) {
+  1040→        const src = image.url ?? '';
+  1041→        const alt = this.escapeHtml(image.alt || 'image');
+  1042→        lines.push(`    <figure>`);
+  1043→        lines.push(`      <img src="${src}" alt="${alt}" />`);
+  1044→        if (image.caption) {
+  1045→          lines.push(`      <figcaption class="caption">${this.escapeHtml(image.caption)}</figcaption>`);
+  1046→        }
+  1047→        lines.push(`    </figure>`);
+  1048→      }
+  1049→    }
+  1050→
+  1051→    // Code blocks
+  1052→    if (section.codeBlocks) {
+  1053→      for (const block of section.codeBlocks) {
+  1054→        lines.push(`    <pre><code class="language-${this.escapeHtml(block.language)}">${this.escapeHtml(block.code)}</code></pre>`);
+  1055→        if (block.caption) {
+  1056→          lines.push(`    <p class="caption">${this.escapeHtml(block.caption)}</p>`);
+  1057→        }
+  1058→      }
+  1059→    }
+  1060→
+  1061→    // Children
+  1062→    if (section.children) {
+  1063→      for (const child of section.children) {
+  1064→        lines.push(this.renderSectionHtml(child));
+  1065→      }
+  1066→    }
+  1067→
+  1068→    lines.push('  </section>');
+  1069→    return lines.join('\n');
+  1070→  }
+  1071→
+  1072→  private renderTableHtml(table: DocTable): string {
+  1073→    const lines: string[] = [];
+  1074→    lines.push('    <table>');
+  1075→    lines.push('      <thead>');
+  1076→    lines.push('        <tr>' + table.headers.map((h: string) => `<th>${this.escapeHtml(h)}</th>`).join('') + '</tr>');
+  1077→    lines.push('      </thead>');
+  1078→    lines.push('      <tbody>');
+  1079→    for (const row of table.rows) {
+  1080→      lines.push('        <tr>' + row.map((cell: string) => `<td>${this.escapeHtml(cell)}</td>`).join('') + '</tr>');
+  1081→    }
+  1082→    lines.push('      </tbody>');
+  1083→    lines.push('    </table>');
+  1084→    if (table.caption) {
+  1085→      lines.push(`    <p class="caption">${this.escapeHtml(table.caption)}</p>`);
+  1086→    }
+  1087→    return lines.join('\n');
+  1088→  }
+  1089→
+  1090→  private renderReferenceHtml(ref: DocReference): string {
+  1091→    const parts: string[] = [];
+  1092→    if (ref.authors && ref.authors.length > 0) parts.push(this.escapeHtml(ref.authors.join(', ')));
+  1093→    if (ref.year) parts.push(`(${ref.year})`);
+  1094→    parts.push(`<em>${this.escapeHtml(ref.title)}</em>`);
+  1095→    if (ref.url) parts.push(`<a href="${this.escapeHtml(ref.url)}">Link</a>`);
+  1096→    return parts.join(' ');
+  1097→  }
+  1098→
+  1099→  private escapeHtml(text: string): string {
+  1100→    return text
+  1101→      .replace(/&/g, '&amp;')
+  1102→      .replace(/</g, '&lt;')
+  1103→      .replace(/>/g, '&gt;')
+  1104→      .replace(/"/g, '&quot;')
+  1105→      .replace(/'/g, '&#039;');
+  1106→  }
+  1107→}
+  1108→

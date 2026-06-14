@@ -1,0 +1,1328 @@
+     1→// ============================================================
+     2→// AgentForge - MARKETING Agent Worker
+     3→// Handles marketing strategy, content, and campaign generation.
+     4→// Extends BaseAgentWorker with a pipeline that parses briefs,
+     5→// builds audience profiles, develops strategies, generates
+     6→// multi-channel content, creates editorial calendars, defines
+     7→// KPIs, performs competitive analysis, and allocates budgets.
+     8→// ============================================================
+     9→
+    10→import { BaseAgentWorker, type QualityReport } from './BaseAgentWorker';
+    11→import { v4 as uuidv4 } from 'uuid';
+    12→
+    13→// ─── Type Definitions ──────────────────────────────────────
+    14→
+    15→export interface AudienceDemographics {
+    16→  ageRange: string;
+    17→  gender: string;
+    18→  location: string;
+    19→  income: string;
+    20→  education: string;
+    21→}
+    22→
+    23→export interface AudienceProfile {
+    24→  demographics: AudienceDemographics;
+    25→  psychographics: string[];
+    26→  painPoints: string[];
+    27→  preferredChannels: string[];
+    28→  segmentSize: number;
+    29→}
+    30→
+    31→export type ChannelType =
+    32→  | 'social-media'
+    33→  | 'email'
+    34→  | 'content'
+    35→  | 'ppc'
+    36→  | 'seo'
+    37→  | 'influencer'
+    38→  | 'events'
+    39→  | 'pr';
+    40→
+    41→export interface ChannelStrategy {
+    42→  channel: ChannelType;
+    43→  tactics: string[];
+    44→  budget: number;
+    45→  expectedROI: number;
+    46→}
+    47→
+    48→export type FunnelStageName =
+    49→  | 'awareness'
+    50→  | 'interest'
+    51→  | 'consideration'
+    52→  | 'conversion'
+    53→  | 'retention'
+    54→  | 'advocacy';
+    55→
+    56→export interface FunnelStage {
+    57→  stage: FunnelStageName;
+    58→  tactics: string[];
+    59→  contentTypes: string[];
+    60→  metrics: string[];
+    61→}
+    62→
+    63→export interface MarketingStrategy {
+    64→  positioning: string;
+    65→  messaging: string;
+    66→  channels: ChannelStrategy[];
+    67→  funnel: FunnelStage[];
+    68→  differentiators: string[];
+    69→}
+    70→
+    71→export type MarketingContentType =
+    72→  | 'blog-post'
+    73→  | 'social-post'
+    74→  | 'ad-copy'
+    75→  | 'landing-page'
+    76→  | 'email'
+    77→  | 'video-script'
+    78→  | 'infographic'
+    79→  | 'whitepaper'
+    80→  | 'case-study'
+    81→  | 'press-release';
+    82→
+    83→export interface MarketingContent {
+    84→  id: string;
+    85→  type: MarketingContentType;
+    86→  title: string;
+    87→  channel: string;
+    88→  headline: string;
+    89→  body: string;
+    90→  cta: string;
+    91→  seoKeywords?: string[];
+    92→  scheduledDate?: string;
+    93→}
+    94→
+    95→export interface CalendarItem {
+    96→  contentId: string;
+    97→  date: string;
+    98→  channel: string;
+    99→  action: string;
+   100→}
+   101→
+   102→export interface CalendarEntry {
+   103→  week: number;
+   104→  items: CalendarItem[];
+   105→}
+   106→
+   107→export interface KPIDefinition {
+   108→  name: string;
+   109→  target: number;
+   110→  unit: string;
+   111→  trackingMethod: string;
+   112→}
+   113→
+   114→export interface CompetitiveInsight {
+   115→  competitor: string;
+   116→  strength: string;
+   117→  weakness: string;
+   118→  opportunity: string;
+   119→}
+   120→
+   121→export interface BudgetBreakdown {
+   122→  channel: string;
+   123→  amount: number;
+   124→  percentage: number;
+   125→}
+   126→
+   127→export interface BudgetAllocation {
+   128→  total: number;
+   129→  breakdown: BudgetBreakdown[];
+   130→}
+   131→
+   132→export interface MarketingOutput {
+   133→  campaignName: string;
+   134→  objective: string;
+   135→  targetAudience: AudienceProfile;
+   136→  strategy: MarketingStrategy;
+   137→  content: MarketingContent[];
+   138→  calendar: CalendarEntry[];
+   139→  kpis: KPIDefinition[];
+   140→  competitiveAnalysis: CompetitiveInsight[];
+   141→  budget: BudgetAllocation;
+   142→  metadata: {
+   143→    channels: string[];
+   144→    duration: number;
+   145→    estimatedReach: number;
+   146→    roiProjection: number;
+   147→  };
+   148→}
+   149→
+   150→// ─── Internal Brief Type ───────────────────────────────────
+   151→
+   152→export interface CampaignBrief {
+   153→  industry: string;
+   154→  product: string;
+   155→  goals: string[];
+   156→  budget?: number;
+   157→  durationWeeks?: number;
+   158→  targetMarket?: string;
+   159→  competitors?: string[];
+   160→}
+   161→
+   162→// ─── MARKETING Agent Worker ────────────────────────────────
+   163→
+   164→export class MarketingAgentWorker extends BaseAgentWorker<MarketingOutput> {
+   165→  constructor() {
+   166→    super('MARKETING');
+   167→  }
+   168→
+   169→  // ─── Core Pipeline ──────────────────────────────────────
+   170→
+   171→  protected async generate(
+   172→    prompt: string,
+   173→    context: Record<string, unknown>,
+   174→    sessionId: string,
+   175→  ): Promise<MarketingOutput> {
+   176→    // Phase 1: Parse Campaign Brief
+   177→    this.emitEvent('marketing_analysis', sessionId, { status: 'started' });
+   178→    const brief = this.parseCampaignBrief(prompt, context);
+   179→    this.emitEvent('marketing_analysis', sessionId, {
+   180→      status: 'completed',
+   181→      industry: brief.industry,
+   182→      product: brief.product,
+   183→      goals: brief.goals,
+   184→    });
+   185→
+   186→    // Phase 2: Build Audience Profile
+   187→    const audience = this.buildAudienceProfile(brief);
+   188→    this.emitEvent('marketing_analysis', sessionId, {
+   189→      status: 'audience_profiled',
+   190→      segmentSize: audience.segmentSize,
+   191→      preferredChannels: audience.preferredChannels,
+   192→    });
+   193→
+   194→    // Phase 3: Develop Marketing Strategy
+   195→    this.emitEvent('marketing_strategy', sessionId, { status: 'started' });
+   196→    const strategy = this.developStrategy(brief, audience);
+   197→    this.emitEvent('marketing_strategy', sessionId, {
+   198→      status: 'completed',
+   199→      positioning: strategy.positioning,
+   200→      channels: strategy.channels.map(c => c.channel),
+   201→      differentiators: strategy.differentiators,
+   202→    });
+   203→
+   204→    // Phase 4: Generate Content Pieces
+   205→    this.emitEvent('marketing_content', sessionId, { status: 'started' });
+   206→    const channelNames = strategy.channels.map(c => c.channel);
+   207→    const content = this.generateContent(strategy, channelNames);
+   208→    this.emitEvent('marketing_content', sessionId, {
+   209→      status: 'completed',
+   210→      contentCount: content.length,
+   211→      contentTypes: content.map(c => c.type),
+   212→    });
+   213→
+   214→    // Phase 5: Create Campaign Calendar
+   215→    this.emitEvent('marketing_calendar', sessionId, { status: 'started' });
+   216→    const durationWeeks = brief.durationWeeks ?? 8;
+   217→    const calendar = this.createCalendar(content, durationWeeks);
+   218→    this.emitEvent('marketing_calendar', sessionId, {
+   219→      status: 'completed',
+   220→      weeks: calendar.length,
+   221→      totalItems: calendar.reduce((sum, w) => sum + w.items.length, 0),
+   222→    });
+   223→
+   224→    // Phase 6: Define KPIs
+   225→    const kpis = this.defineKPIs(brief.goals.join(', '), channelNames);
+   226→
+   227→    // Phase 7: Competitive Analysis
+   228→    const competitiveAnalysis = this.analyzeCompetition(brief.industry, brief.product);
+   229→
+   230→    // Phase 8: Budget Allocation
+   231→    const totalBudget = brief.budget ?? 10000;
+   232→    const budget = this.allocateBudget(strategy.channels, totalBudget);
+   233→
+   234→    // Phase 9: Calculate ROI Projection & Estimated Reach
+   235→    const roiProjection = this.projectROI(strategy, budget);
+   236→    const estimatedReach = this.estimateReach(audience, strategy, durationWeeks);
+   237→
+   238→    // Assemble output
+   239→    const output: MarketingOutput = {
+   240→      campaignName: this.generateCampaignName(brief),
+   241→      objective: brief.goals[0] ?? 'Increase brand awareness and drive conversions',
+   242→      targetAudience: audience,
+   243→      strategy,
+   244→      content,
+   245→      calendar,
+   246→      kpis,
+   247→      competitiveAnalysis,
+   248→      budget,
+   249→      metadata: {
+   250→        channels: channelNames,
+   251→        duration: durationWeeks,
+   252→        estimatedReach,
+   253→        roiProjection,
+   254→      },
+   255→    };
+   256→
+   257→    this.emitEvent('marketing_package', sessionId, {
+   258→      status: 'completed',
+   259→      campaignName: output.campaignName,
+   260→      contentPieces: content.length,
+   261→      calendarWeeks: calendar.length,
+   262→      kpis: kpis.length,
+   263→    });
+   264→
+   265→    return output;
+   266→  }
+   267→
+   268→  // ─── Validation ─────────────────────────────────────────
+   269→
+   270→  protected async validateOutput(output: MarketingOutput, prompt: string): Promise<QualityReport> {
+   271→    const dimensions: Record<string, number> = {};
+   272→    const suggestions: string[] = [];
+   273→
+   274→    // Strategy Quality (0-1): Validates strategy depth and coherence
+   275→    dimensions['Strategy Quality'] = this.scoreStrategyQuality(output, suggestions);
+   276→
+   277→    // Content Quality (0-1): Validates content variety and CTAs
+   278→    dimensions['Content Quality'] = this.scoreContentQuality(output, suggestions);
+   279→
+   280→    // Market Fit (0-1): Validates audience alignment
+   281→    dimensions['Market Fit'] = this.scoreMarketFit(output, suggestions);
+   282→
+   283→    // Actionability (0-1): Validates calendar, KPIs, budget
+   284→    dimensions['Actionability'] = this.scoreActionability(output, suggestions);
+   285→
+   286→    // ROI Potential (0-1): Validates budget allocation and projections
+   287→    dimensions['ROI Potential'] = this.scoreROIPotential(output, suggestions);
+   288→
+   289→    const overall = this.computeWeightedScore(dimensions);
+   290→    const passed = this.isQualityPassing(overall);
+   291→
+   292→    return { overall, dimensions, passed, suggestions };
+   293→  }
+   294→
+   295→  // ─── Rendering ──────────────────────────────────────────
+   296→
+   297→  protected async renderOutput(output: MarketingOutput, format?: string): Promise<unknown> {
+   298→    switch (format) {
+   299→      case 'strategy':
+   300→        return {
+   301→          campaignName: output.campaignName,
+   302→          objective: output.objective,
+   303→          targetAudience: output.targetAudience,
+   304→          strategy: output.strategy,
+   305→          competitiveAnalysis: output.competitiveAnalysis,
+   306→        };
+   307→
+   308→      case 'content':
+   309→        return {
+   310→          campaignName: output.campaignName,
+   311→          content: output.content,
+   312→        };
+   313→
+   314→      case 'calendar':
+   315→        return {
+   316→          campaignName: output.campaignName,
+   317→          objective: output.objective,
+   318→          calendar: output.calendar,
+   319→          kpis: output.kpis,
+   320→        };
+   321→
+   322→      case 'markdown':
+   323→        return this.renderMarkdown(output);
+   324→
+   325→      default:
+   326→        return output;
+   327→    }
+   328→  }
+   329→
+   330→  // ─── Helper: Campaign Brief Parsing ─────────────────────
+   331→
+   332→  private parseCampaignBrief(prompt: string, context?: Record<string, unknown>): CampaignBrief {
+   333→    // Check if context provides a brief directly
+   334→    if (context?.brief && typeof context.brief === 'object') {
+   335→      const b = context.brief as CampaignBrief;
+   336→      if (b.industry && b.product) {
+   337→        return b;
+   338→      }
+   339→    }
+   340→
+   341→    // Check for structured JSON brief in the prompt
+   342→    const jsonMatch = prompt.match(/```json\n([\s\S]*?)```/);
+   343→    if (jsonMatch) {
+   344→      try {
+   345→        const parsed = JSON.parse(jsonMatch[1]);
+   346→        if (parsed.industry && parsed.product) {
+   347→          return {
+   348→            industry: parsed.industry,
+   349→            product: parsed.product,
+   350→            goals: parsed.goals ?? ['Increase brand awareness'],
+   351→            budget: parsed.budget,
+   352→            durationWeeks: parsed.durationWeeks,
+   353→            targetMarket: parsed.targetMarket,
+   354→            competitors: parsed.competitors,
+   355→          };
+   356→        }
+   357→      } catch {
+   358→        // Fall through to NLP-style extraction
+   359→      }
+   360→    }
+   361→
+   362→    // Extract from natural language prompt
+   363→    const lower = prompt.toLowerCase();
+   364→
+   365→    const industry = this.extractKeyword(
+   366→      prompt,
+   367→      [
+   368→        'saas', 'e-commerce', 'fintech', 'healthcare', 'education', 'real estate',
+   369→        'food & beverage', 'travel', 'fitness', 'fashion', 'technology', 'automotive',
+   370→        'finance', 'entertainment', 'beauty', 'sports', 'non-profit', 'b2b', 'b2c',
+   371→      ],
+   372→      'technology',
+   373→    );
+   374→
+   375→    const product = this.extractProductFromPrompt(prompt);
+   376→
+   377→    const goals: string[] = [];
+   378→    if (/awareness|brand recognition|visibility/i.test(prompt)) {
+   379→      goals.push('Increase brand awareness');
+   380→    }
+   381→    if (/lead|conversion|sign.?up|registr/i.test(prompt)) {
+   382→      goals.push('Generate qualified leads');
+   383→    }
+   384→    if (/revenue|sales|purchase|buy/i.test(prompt)) {
+   385→      goals.push('Drive revenue growth');
+   386→    }
+   387→    if (/engagement|interact|communit/i.test(prompt)) {
+   388→      goals.push('Boost audience engagement');
+   389→    }
+   390→    if (/retention|loyalt|churn|repeat/i.test(prompt)) {
+   391→      goals.push('Improve customer retention');
+   392→    }
+   393→    if (goals.length === 0) {
+   394→      goals.push('Increase brand awareness', 'Generate qualified leads');
+   395→    }
+   396→
+   397→    // Extract budget if mentioned
+   398→    const budgetMatch = prompt.match(/\$?([\d,]+)\s*(?:dollar|budget|spend|invest)/i);
+   399→    const budget = budgetMatch ? parseInt(budgetMatch[1].replace(/,/g, ''), 10) : undefined;
+   400→
+   401→    // Extract duration if mentioned
+   402→    const durationMatch = prompt.match(/(\d+)\s*week/i);
+   403→    const durationWeeks = durationMatch ? parseInt(durationMatch[1], 10) : undefined;
+   404→
+   405→    // Extract competitors if mentioned
+   406→    const competitors: string[] = [];
+   407→    const competitorMatch = prompt.match(/(?:competitors?|vs\.?|against)\s*:?\s*(.+)/i);
+   408→    if (competitorMatch) {
+   409→      competitors.push(
+   410→        ...competitorMatch[1].split(/[,;]/).map(c => c.trim()).filter(Boolean),
+   411→      );
+   412→    }
+   413→
+   414→    return {
+   415→      industry,
+   416→      product,
+   417→      goals,
+   418→      budget,
+   419→      durationWeeks: durationWeeks ?? this.inferDuration(goals),
+   420→      competitors,
+   421→    };
+   422→  }
+   423→
+   424→  private extractProductFromPrompt(prompt: string): string {
+   425→    // Try patterns like "for [Product]", "promote [Product]", "campaign for [Product]"
+   426→    const patterns = [
+   427→      /(?:for|promote|market|launch|campaign\s+for)\s+["']?([A-Z][\w\s&-]{2,40})["']?/i,
+   428→      /["']([^"']{3,50})["']/,
+   429→    ];
+   430→
+   431→    for (const pattern of patterns) {
+   432→      const match = prompt.match(pattern);
+   433→      if (match) {
+   434→        return match[1].trim();
+   435→      }
+   436→    }
+   437→
+   438→    // Fallback: use first capitalized phrase
+   439→    const capMatch = prompt.match(/\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\b/);
+   440→    return capMatch ? capMatch[1] : 'Product';
+   441→  }
+   442→
+   443→  private extractKeyword(prompt: string, keywords: string[], fallback: string): string {
+   444→    const lower = prompt.toLowerCase();
+   445→    for (const keyword of keywords) {
+   446→      if (lower.includes(keyword.toLowerCase())) {
+   447→        return keyword;
+   448→      }
+   449→    }
+   450→    return fallback;
+   451→  }
+   452→
+   453→  private inferDuration(goals: string[]): number {
+   454→    if (goals.some(g => /awareness|brand/i.test(g))) return 12;
+   455→    if (goals.some(g => /lead|conversion/i.test(g))) return 8;
+   456→    if (goals.some(g => /retention|loyalt/i.test(g))) return 6;
+   457→    return 8;
+   458→  }
+   459→
+   460→  // ─── Helper: Audience Profile Builder ───────────────────
+   461→
+   462→  private buildAudienceProfile(brief: CampaignBrief): AudienceProfile {
+   463→    const industryProfiles: Record<string, Partial<AudienceProfile>> = {
+   464→      saas: {
+   465→        demographics: { ageRange: '28-45', gender: 'All', location: 'North America & Europe', income: '$60k-$120k', education: "Bachelor's+" },
+   466→        psychographics: ['Efficiency-driven', 'Data-informed decision makers', 'Early technology adopters', 'ROI-focused'],
+   467→        painPoints: ['High subscription costs', 'Integration complexity', 'Steep learning curves', 'Vendor lock-in'],
+   468→        preferredChannels: ['content', 'email', 'seo', 'ppc'],
+   469→      },
+   470→      'e-commerce': {
+   471→        demographics: { ageRange: '18-35', gender: 'All', location: 'Urban centers globally', income: '$30k-$80k', education: 'Varied' },
+   472→        psychographics: ['Deal-seekers', 'Mobile-first shoppers', 'Social media influenced', 'Brand-conscious'],
+   473→        painPoints: ['Shipping costs', 'Product quality uncertainty', 'Decision fatigue', 'Return friction'],
+   474→        preferredChannels: ['social-media', 'email', 'ppc', 'influencer'],
+   475→      },
+   476→      fintech: {
+   477→        demographics: { ageRange: '25-40', gender: 'All', location: 'Major metro areas', income: '$50k-$150k', education: "Bachelor's+" },
+   478→        psychographics: ['Financially savvy', 'Security-conscious', 'Mobile-banking users', 'Investment-minded'],
+   479→        painPoints: ['Security concerns', 'Complex fee structures', 'Lack of transparency', 'Regulatory confusion'],
+   480→        preferredChannels: ['content', 'seo', 'email', 'pr'],
+   481→      },
+   482→      healthcare: {
+   483→        demographics: { ageRange: '30-65', gender: 'All', location: 'Nationwide', income: '$40k-$100k', education: 'Varied' },
+   484→        psychographics: ['Health-conscious', 'Trust-seeking', 'Research-oriented', 'Prevention-minded'],
+   485→        painPoints: ['Cost of care', 'Access to specialists', 'Information overload', 'Privacy concerns'],
+   486→        preferredChannels: ['content', 'seo', 'email', 'pr'],
+   487→      },
+   488→      education: {
+   489→        demographics: { ageRange: '18-35', gender: 'All', location: 'Global', income: '$20k-$60k', education: 'High school+' },
+   490→        psychographics: ['Career-driven', 'Lifelong learners', 'Value-conscious', 'Community-oriented'],
+   491→        painPoints: ['Affordability', 'Time constraints', 'Credential value', 'Learning format fit'],
+   492→        preferredChannels: ['content', 'social-media', 'email', 'seo'],
+   493→      },
+   494→      technology: {
+   495→        demographics: { ageRange: '22-40', gender: 'All', location: 'Tech hubs globally', income: '$60k-$150k', education: "Bachelor's+" },
+   496→        psychographics: ['Innovation-seekers', 'Early adopters', 'Community-driven', 'Performance-focused'],
+   497→        painPoints: ['Complexity', 'Scalability concerns', 'Integration challenges', 'Technical debt'],
+   498→        preferredChannels: ['content', 'social-media', 'seo', 'influencer'],
+   499→      },
+   500→    };
+   501→
+   502→    const profile = industryProfiles[brief.industry.toLowerCase()] ?? industryProfiles['technology']!;
+   503→
+   504→    return {
+   505→      demographics: brief.targetMarket
+   506→        ? { ...profile.demographics!, location: brief.targetMarket }
+   507→        : profile.demographics!,
+   508→      psychographics: profile.psychographics ?? ['Quality-focused', 'Value-driven', 'Research-oriented'],
+   509→      painPoints: profile.painPoints ?? ['Time constraints', 'Budget limitations', 'Information overload'],
+   510→      preferredChannels: profile.preferredChannels ?? ['content', 'social-media', 'email'],
+   511→      segmentSize: this.estimateSegmentSize(brief.industry),
+   512→    };
+   513→  }
+   514→
+   515→  private estimateSegmentSize(industry: string): number {
+   516→    const sizes: Record<string, number> = {
+   517→      saas: 500000,
+   518→      'e-commerce': 2000000,
+   519→      fintech: 750000,
+   520→      healthcare: 1500000,
+   521→      education: 3000000,
+   522→      technology: 1200000,
+   523→      'real estate': 400000,
+   524→      'food & beverage': 5000000,
+   525→      fitness: 1800000,
+   526→      fashion: 3500000,
+   527→    };
+   528→    return sizes[industry.toLowerCase()] ?? 1000000;
+   529→  }
+   530→
+   531→  // ─── Helper: Strategy Development ───────────────────────
+   532→
+   533→  private developStrategy(brief: CampaignBrief, audience: AudienceProfile): MarketingStrategy {
+   534→    const channels = this.buildChannelStrategies(audience.preferredChannels, brief);
+   535→    const funnel = this.buildFunnelStages(brief.goals);
+   536→    const differentiators = this.buildDifferentiators(brief);
+   537→
+   538→    return {
+   539→      positioning: this.craftPositioning(brief, audience),
+   540→      messaging: this.craftMessaging(brief, audience),
+   541→      channels,
+   542→      funnel,
+   543→      differentiators,
+   544→    };
+   545→  }
+   546→
+   547→  private craftPositioning(brief: CampaignBrief, audience: AudienceProfile): string {
+   548→    const topPainPoint = audience.painPoints[0] ?? 'unmet needs';
+   549→    const industryLabel = brief.industry.charAt(0).toUpperCase() + brief.industry.slice(1);
+   550→    return `${brief.product} is the ${industryLabel} solution that eliminates ${topPainPoint} by delivering measurable results with minimal friction, empowering ${audience.demographics.ageRange} audiences in ${audience.demographics.location}.`;
+   551→  }
+   552→
+   553→  private craftMessaging(brief: CampaignBrief, audience: AudienceProfile): string {
+   554→    const valueProp = audience.painPoints.slice(0, 2).join(' and ');
+   555→    return `Stop letting ${valueProp} hold you back. ${brief.product} gives you the clarity and tools to move faster, spend smarter, and grow confidently — trusted by ${brief.industry} leaders worldwide.`;
+   556→  }
+   557→
+   558→  private buildChannelStrategies(preferredChannels: string[], brief: CampaignBrief): ChannelStrategy[] {
+   559→    const channelTactics: Record<string, { tactics: string[]; budgetPct: number; expectedROI: number }> = {
+   560→      'social-media': {
+   561→        tactics: ['Organic content calendar', 'Paid social campaigns', 'Community engagement', 'Hashtag strategy', 'Stories & Reels'],
+   562→        budgetPct: 0.25,
+   563→        expectedROI: 3.2,
+   564→      },
+   565→      email: {
+   566→        tactics: ['Drip campaigns', 'Newsletter', 'Behavioral triggers', 'Segmented blasts', 'Re-engagement sequences'],
+   567→        budgetPct: 0.15,
+   568→        expectedROI: 4.2,
+   569→      },
+   570→      content: {
+   571→        tactics: ['Blog articles', 'Ebooks & guides', 'Podcast appearances', 'Guest posts', 'Thought leadership'],
+   572→        budgetPct: 0.20,
+   573→        expectedROI: 3.0,
+   574→      },
+   575→      ppc: {
+   576→        tactics: ['Google Ads search', 'Display retargeting', 'Shopping ads', 'Competitor conquesting', 'A/B testing ad copy'],
+   577→        budgetPct: 0.20,
+   578→        expectedROI: 2.5,
+   579→      },
+   580→      seo: {
+   581→        tactics: ['Keyword optimization', 'Technical SEO audit', 'Link building', 'Content clusters', 'Local SEO'],
+   582→        budgetPct: 0.10,
+   583→        expectedROI: 5.0,
+   584→      },
+   585→      influencer: {
+   586→        tactics: ['Micro-influencer partnerships', 'Sponsored content', 'Affiliate programs', 'Brand ambassadorships', 'Co-creation campaigns'],
+   587→        budgetPct: 0.15,
+   588→        expectedROI: 2.8,
+   589→      },
+   590→      events: {
+   591→        tactics: ['Industry conferences', 'Webinars', 'Workshops', 'Networking meetups', 'Virtual summits'],
+   592→        budgetPct: 0.12,
+   593→        expectedROI: 2.0,
+   594→      },
+   595→      pr: {
+   596→        tactics: ['Press releases', 'Media outreach', 'Award submissions', 'Expert commentary', 'Crisis communication plan'],
+   597→        budgetPct: 0.08,
+   598→        expectedROI: 3.5,
+   599→      },
+   600→    };
+   601→
+   602→    const strategies: ChannelStrategy[] = preferredChannels
+   603→      .filter(ch => channelTactics[ch])
+   604→      .map(ch => ({
+   605→        channel: ch as ChannelType,
+   606→        tactics: channelTactics[ch]!.tactics,
+   607→        budget: Math.round(channelTactics[ch]!.budgetPct * 100),
+   608→        expectedROI: channelTactics[ch]!.expectedROI,
+   609→      }));
+   610→
+   611→    // Ensure at least 3 channels
+   612→    if (strategies.length < 3) {
+   613→      const defaultChannels: ChannelType[] = ['social-media', 'content', 'email'];
+   614→      for (const ch of defaultChannels) {
+   615→        if (!strategies.some(s => s.channel === ch) && channelTactics[ch]) {
+   616→          strategies.push({
+   617→            channel: ch,
+   618→            tactics: channelTactics[ch]!.tactics,
+   619→            budget: Math.round(channelTactics[ch]!.budgetPct * 100),
+   620→            expectedROI: channelTactics[ch]!.expectedROI,
+   621→          });
+   622→        }
+   623→      }
+   624→    }
+   625→
+   626→    // Normalize budget percentages to sum to 100
+   627→    const total = strategies.reduce((sum, s) => sum + s.budget, 0);
+   628→    if (total > 0) {
+   629→      const scale = 100 / total;
+   630→      strategies.forEach(s => {
+   631→        s.budget = Math.round(s.budget * scale);
+   632→      });
+   633→      // Fix rounding to exactly 100
+   634→      const newTotal = strategies.reduce((sum, s) => sum + s.budget, 0);
+   635→      if (newTotal !== 100 && strategies.length > 0) {
+   636→        strategies[0].budget += 100 - newTotal;
+   637→      }
+   638→    }
+   639→
+   640→    return strategies;
+   641→  }
+   642→
+   643→  private buildFunnelStages(goals: string[]): FunnelStage[] {
+   644→    const stages: FunnelStage[] = [
+   645→      {
+   646→        stage: 'awareness',
+   647→        tactics: ['SEO content', 'Social media presence', 'PR outreach', 'Display advertising'],
+   648→        contentTypes: ['blog-post', 'infographic', 'video-script', 'press-release'],
+   649→        metrics: ['Impressions', 'Reach', 'Brand mentions', 'Share of voice'],
+   650→      },
+   651→      {
+   652→        stage: 'interest',
+   653→        tactics: ['Educational content', 'Social engagement', 'Email nurture', 'Retargeting ads'],
+   654→        contentTypes: ['blog-post', 'social-post', 'email', 'video-script'],
+   655→        metrics: ['Click-through rate', 'Time on page', 'Email open rate', 'Social engagement rate'],
+   656→      },
+   657→      {
+   658→        stage: 'consideration',
+   659→        tactics: ['Case studies', 'Comparison content', 'Free trials', 'Webinars'],
+   660→        contentTypes: ['case-study', 'whitepaper', 'landing-page', 'email'],
+   661→        metrics: ['Demo requests', 'Trial sign-ups', 'Content downloads', 'Webinar attendance'],
+   662→      },
+   663→      {
+   664→        stage: 'conversion',
+   665→        tactics: ['Limited-time offers', 'Personalized outreach', 'Remarketing', 'Sales enablement'],
+   666→        contentTypes: ['ad-copy', 'landing-page', 'email', 'case-study'],
+   667→        metrics: ['Conversion rate', 'Cost per acquisition', 'Revenue per visitor', 'Cart abandonment rate'],
+   668→      },
+   669→      {
+   670→        stage: 'retention',
+   671→        tactics: ['Onboarding sequences', 'Loyalty programs', 'Exclusive content', 'Feedback loops'],
+   672→        contentTypes: ['email', 'blog-post', 'infographic', 'social-post'],
+   673→        metrics: ['Churn rate', 'Net promoter score', 'Repeat purchase rate', 'Customer lifetime value'],
+   674→      },
+   675→      {
+   676→        stage: 'advocacy',
+   677→        tactics: ['Referral programs', 'User-generated content', 'Community building', 'Review solicitation'],
+   678→        contentTypes: ['social-post', 'email', 'case-study', 'blog-post'],
+   679→        metrics: ['Referral rate', 'Social shares', 'Review count', 'Community growth'],
+   680→      },
+   681→    ];
+   682→
+   683→    // If goals are awareness-focused, emphasize top of funnel
+   684→    if (goals.some(g => /awareness|brand/i.test(g))) {
+   685→      stages[0].tactics.push('Influencer partnerships', 'Viral campaigns');
+   686→    }
+   687→
+   688→    // If goals are conversion-focused, emphasize bottom of funnel
+   689→    if (goals.some(g => /conversion|lead|revenue/i.test(g))) {
+   690→      stages[3].tactics.push('A/B testing', 'Urgency triggers', 'Social proof');
+   691→    }
+   692→
+   693→    return stages;
+   694→  }
+   695→
+   696→  private buildDifferentiators(brief: CampaignBrief): string[] {
+   697→    const differentiators: string[] = [];
+   698→
+   699→    differentiators.push(
+   700→      `${brief.product} offers a unique approach to ${brief.industry} challenges that competitors cannot replicate`,
+   701→    );
+   702→    differentiators.push(
+   703→      `Purpose-built for ${brief.industry} — not a generic solution adapted to fit`,
+   704→    );
+   705→    differentiators.push(
+   706→      `Proven ROI with measurable outcomes in ${brief.goals[0] ?? 'key performance areas'}`,
+   707→    );
+   708→
+   709→    if (brief.competitors && brief.competitors.length > 0) {
+   710→      differentiators.push(
+   711→        `Superior to ${brief.competitors[0]} in ease-of-use, speed, and total cost of ownership`,
+   712→      );
+   713→    }
+   714→
+   715→    differentiators.push(
+   716→      `Customer-centric design with continuous feedback integration`,
+   717→    );
+   718→
+   719→    return differentiators;
+   720→  }
+   721→
+   722→  // ─── Helper: Content Generation ─────────────────────────
+   723→
+   724→  private generateContent(strategy: MarketingStrategy, channels: string[]): MarketingContent[] {
+   725→    const content: MarketingContent[] = [];
+   726→    const channelToTypes: Record<string, MarketingContentType[]> = {
+   727→      'social-media': ['social-post', 'video-script', 'infographic'],
+   728→      email: ['email'],
+   729→      content: ['blog-post', 'whitepaper', 'case-study'],
+   730→      ppc: ['ad-copy', 'landing-page'],
+   731→      seo: ['blog-post', 'infographic'],
+   732→      influencer: ['social-post', 'video-script'],
+   733→      events: ['press-release', 'blog-post'],
+   734→      pr: ['press-release', 'case-study'],
+   735→    };
+   736→
+   737→    for (const channel of channels) {
+   738→      const types = channelToTypes[channel] ?? ['blog-post'];
+   739→      for (const type of types) {
+   740→        content.push(this.createContentPiece(type, channel, strategy, content.length));
+   741→      }
+   742→    }
+   743→
+   744→    return content;
+   745→  }
+   746→
+   747→  private createContentPiece(
+   748→    type: MarketingContentType,
+   749→    channel: string,
+   750→    strategy: MarketingStrategy,
+   751→    index: number,
+   752→  ): MarketingContent {
+   753→    const templates: Record<MarketingContentType, { titlePrefix: string; headlineTemplate: string; bodyTemplate: string; ctaTemplate: string }> = {
+   754→      'blog-post': {
+   755→        titlePrefix: 'Article',
+   756→        headlineTemplate: `How ${strategy.differentiators[0]?.split(' — ')[0] ?? 'Our Solution'} Transforms Your Strategy`,
+   757→        bodyTemplate: `Discover how addressing your biggest challenges can unlock unprecedented growth. In this comprehensive guide, we explore the strategies that top performers use to stay ahead.\n\nKey Takeaways:\n- Understanding the landscape and identifying opportunities\n- Actionable steps to implement immediately\n- Measuring success with clear KPIs\n\n${strategy.messaging}`,
+   758→        ctaTemplate: 'Read the Full Article',
+   759→      },
+   760→      'social-post': {
+   761→        titlePrefix: 'Social Post',
+   762→        headlineTemplate: `Ready to level up? Here's what ${channel} can do for you 🚀`,
+   763→        bodyTemplate: `${strategy.messaging}\n\n#${channel} #growth #strategy`,
+   764→        ctaTemplate: 'Learn More',
+   765→      },
+   766→      'ad-copy': {
+   767→        titlePrefix: 'Ad Copy',
+   768→        headlineTemplate: `Stop Losing Out — ${strategy.differentiators[0]?.split(' that ')[0] ?? 'Your Competitors Are Moving Faster'}`,
+   769→        bodyTemplate: `${strategy.messaging} Join thousands who already made the switch. Limited-time offer: get started today.`,
+   770→        ctaTemplate: 'Start Free Trial',
+   771→      },
+   772→      'landing-page': {
+   773→        titlePrefix: 'Landing Page',
+   774→        headlineTemplate: `${strategy.positioning}`,
+   775→        bodyTemplate: `${strategy.messaging}\n\n✅ Proven results\n✅ Easy implementation\n✅ Expert support\n\nJoin 1,000+ businesses already growing with us.`,
+   776→        ctaTemplate: 'Get Started Now',
+   777→      },
+   778→      email: {
+   779→        titlePrefix: 'Email',
+   780→        headlineTemplate: `Your ${channel} strategy is waiting`,
+   781→        bodyTemplate: `Hi [First Name],\n\n${strategy.messaging}\n\nHere's what you can do right now:\n1. Download our free guide\n2. Try our platform free for 14 days\n3. Book a strategy call with our team\n\nBest,\nThe Team`,
+   782→        ctaTemplate: 'Claim Your Free Trial',
+   783→      },
+   784→      'video-script': {
+   785→        titlePrefix: 'Video Script',
+   786→        headlineTemplate: `[HOOK] What if you could solve your biggest ${channel} challenge in 30 seconds?`,
+   787→        bodyTemplate: `[INTRO - 5s]\nDid you know 73% of businesses struggle with this exact problem?\n\n[PROBLEM - 10s]\n${strategy.messaging.split('.')[0]}.\n\n[SOLUTION - 10s]\nHere's how it works — [demonstrate key benefit]\n\n[CTA - 5s]\nClick the link to get started today.`,
+   788→        ctaTemplate: 'Watch Now',
+   789→      },
+   790→      infographic: {
+   791→        titlePrefix: 'Infographic',
+   792→        headlineTemplate: `The State of ${channel.charAt(0).toUpperCase() + channel.slice(1)}: Key Trends & Insights`,
+   793→        bodyTemplate: `Visual breakdown of industry statistics, trends, and actionable insights for ${channel} professionals.\n\nSections:\n- Market Overview\n- Key Statistics\n- Strategy Framework\n- Expected Outcomes`,
+   794→        ctaTemplate: 'Download Infographic',
+   795→      },
+   796→      whitepaper: {
+   797→        titlePrefix: 'Whitepaper',
+   798→        headlineTemplate: `The Definitive Guide to ${strategy.positioning.split(' ')[0] ?? 'Modern'} ${channel.charAt(0).toUpperCase() + channel.slice(1)} Strategy`,
+   799→        bodyTemplate: `An in-depth analysis of current market dynamics, emerging trends, and proven frameworks for ${channel} excellence.\n\nAbstract:\n${strategy.messaging}\n\nChapters:\n1. Executive Summary\n2. Market Landscape\n3. Strategic Framework\n4. Implementation Roadmap\n5. Measuring Success`,
+   800→        ctaTemplate: 'Download Whitepaper',
+   801→      },
+   802→      'case-study': {
+   803→        titlePrefix: 'Case Study',
+   804→        headlineTemplate: `How [Company] Achieved 3x Growth with ${strategy.differentiators[0]?.split(' ')[0] ?? 'Our'} Approach`,
+   805→        bodyTemplate: `Challenge: [Company] was struggling with ${strategy.funnel[0]?.metrics[0] ?? 'key metrics'} and needed a new approach.\n\nSolution: Implemented a multi-channel strategy focusing on ${channel}.\n\nResults:\n- 300% increase in conversions\n- 45% reduction in cost per acquisition\n- 2.5x improvement in ROI\n\n"${strategy.messaging.split('.')[0]}." — VP of Marketing, [Company]`,
+   806→        ctaTemplate: 'Read Case Study',
+   807→      },
+   808→      'press-release': {
+   809→        titlePrefix: 'Press Release',
+   810→        headlineTemplate: `FOR IMMEDIATE RELEASE: ${strategy.positioning}`,
+   811→        bodyTemplate: `[City, Date] — Announcing a new approach to ${channel} that addresses the challenges faced by today's businesses. ${strategy.messaging}\n\nAbout the Initiative:\nThis campaign represents a strategic investment in ${channel} excellence, targeting measurable growth across key performance indicators.\n\nContact:\nmedia@company.com\n(555) 123-4567`,
+   812→        ctaTemplate: 'View Press Kit',
+   813→      },
+   814→    };
+   815→
+   816→    const template = templates[type];
+   817→    const id = uuidv4();
+   818→
+   819→    return {
+   820→      id,
+   821→      type,
+   822→      title: `${template.titlePrefix} ${index + 1}: ${template.headlineTemplate}`,
+   823→      channel,
+   824→      headline: template.headlineTemplate,
+   825→      body: template.bodyTemplate,
+   826→      cta: template.ctaTemplate,
+   827→      seoKeywords: type === 'blog-post' || type === 'landing-page'
+   828→        ? [channel, strategy.positioning.split(' ').slice(0, 3).join(' '), 'marketing strategy']
+   829→        : undefined,
+   830→    };
+   831→  }
+   832→
+   833→  // ─── Helper: Calendar Creation ──────────────────────────
+   834→
+   835→  private createCalendar(content: MarketingContent[], durationWeeks: number): CalendarEntry[] {
+   836→    const calendar: CalendarEntry[] = [];
+   837→    const startDate = new Date();
+   838→    startDate.setDate(startDate.getDate() + 7); // Start next week
+   839→
+   840→    // Distribute content across weeks
+   841→    const contentPerWeek = Math.ceil(content.length / durationWeeks);
+   842→    let contentIndex = 0;
+   843→
+   844→    for (let week = 1; week <= durationWeeks; week++) {
+   845→      const items: CalendarItem[] = [];
+   846→      const weekStart = new Date(startDate);
+   847→      weekStart.setDate(weekStart.getDate() + (week - 1) * 7);
+   848→
+   849→      const weekContent = content.slice(contentIndex, contentIndex + contentPerWeek);
+   850→      contentIndex += contentPerWeek;
+   851→
+   852→      for (let i = 0; i < weekContent.length; i++) {
+   853→        const item = weekContent[i]!;
+   854→        const dayOffset = Math.min(i, 4); // Spread across weekdays (0=Mon, 4=Fri)
+   855→        const scheduledDate = new Date(weekStart);
+   856→        scheduledDate.setDate(scheduledDate.getDate() + dayOffset);
+   857→
+   858→        items.push({
+   859→          contentId: item.id,
+   860→          date: scheduledDate.toISOString().split('T')[0]!,
+   861→          channel: item.channel,
+   862→          action: this.inferAction(item.type),
+   863→        });
+   864→      }
+   865→
+   866→      calendar.push({ week, items });
+   867→    }
+   868→
+   869→    return calendar;
+   870→  }
+   871→
+   872→  private inferAction(contentType: MarketingContentType): string {
+   873→    const actions: Record<MarketingContentType, string> = {
+   874→      'blog-post': 'Publish article',
+   875→      'social-post': 'Post to social channels',
+   876→      'ad-copy': 'Launch ad campaign',
+   877→      'landing-page': 'Deploy landing page',
+   878→      email: 'Send email campaign',
+   879→      'video-script': 'Produce and publish video',
+   880→      infographic: 'Design and distribute',
+   881→      whitepaper: 'Publish and gate content',
+   882→      'case-study': 'Publish and promote',
+   883→      'press-release': 'Distribute to media',
+   884→    };
+   885→    return actions[contentType] ?? 'Publish content';
+   886→  }
+   887→
+   888→  // ─── Helper: KPI Definition ─────────────────────────────
+   889→
+   890→  private defineKPIs(objective: string, channels: string[]): KPIDefinition[] {
+   891→    const kpis: KPIDefinition[] = [];
+   892→
+   893→    // Core KPIs based on objective
+   894→    if (/awareness|brand|visibility/i.test(objective)) {
+   895→      kpis.push(
+   896→        { name: 'Brand Awareness Lift', target: 25, unit: '%', trackingMethod: 'Brand recall survey & social listening' },
+   897→        { name: 'Impressions', target: 500000, unit: 'count', trackingMethod: 'Ad platform analytics' },
+   898→        { name: 'Share of Voice', target: 15, unit: '%', trackingMethod: 'Social listening tools' },
+   899→      );
+   900→    }
+   901→
+   902→    if (/lead|conversion|sign/i.test(objective)) {
+   903→      kpis.push(
+   904→        { name: 'Marketing Qualified Leads', target: 500, unit: 'count', trackingMethod: 'CRM & marketing automation' },
+   905→        { name: 'Cost per Lead', target: 25, unit: '$', trackingMethod: 'Ad spend / lead count' },
+   906→        { name: 'Lead-to-Customer Rate', target: 12, unit: '%', trackingMethod: 'CRM funnel analytics' },
+   907→      );
+   908→    }
+   909→
+   910→    if (/revenue|sales|growth/i.test(objective)) {
+   911→      kpis.push(
+   912→        { name: 'Revenue Attribution', target: 150000, unit: '$', trackingMethod: 'Multi-touch attribution model' },
+   913→        { name: 'Customer Acquisition Cost', target: 85, unit: '$', trackingMethod: 'Total spend / new customers' },
+   914→        { name: 'Return on Ad Spend', target: 4.0, unit: 'ratio', trackingMethod: 'Revenue / ad spend' },
+   915→      );
+   916→    }
+   917→
+   918→    if (/engagement|interact|communit/i.test(objective)) {
+   919→      kpis.push(
+   920→        { name: 'Engagement Rate', target: 5.5, unit: '%', trackingMethod: 'Social analytics platforms' },
+   921→        { name: 'Email Click-Through Rate', target: 3.5, unit: '%', trackingMethod: 'Email platform analytics' },
+   922→        { name: 'Community Growth Rate', target: 15, unit: '% MoM', trackingMethod: 'Platform analytics' },
+   923→      );
+   924→    }
+   925→
+   926→    if (/retention|loyalt|churn/i.test(objective)) {
+   927→      kpis.push(
+   928→        { name: 'Customer Retention Rate', target: 90, unit: '%', trackingMethod: 'Cohort analysis in CRM' },
+   929→        { name: 'Net Promoter Score', target: 45, unit: 'score', trackingMethod: 'NPS survey tool' },
+   930→        { name: 'Churn Rate', target: 5, unit: '%', trackingMethod: 'Subscription analytics' },
+   931→      );
+   932→    }
+   933→
+   934→    // Channel-specific KPIs
+   935→    if (channels.includes('social-media')) {
+   936→      kpis.push({ name: 'Social Media Followers', target: 10000, unit: 'count', trackingMethod: 'Platform analytics' });
+   937→    }
+   938→    if (channels.includes('email')) {
+   939→      kpis.push({ name: 'Email Open Rate', target: 22, unit: '%', trackingMethod: 'Email platform analytics' });
+   940→    }
+   941→    if (channels.includes('seo')) {
+   942→      kpis.push({ name: 'Organic Traffic Growth', target: 40, unit: '%', trackingMethod: 'Google Analytics' });
+   943→    }
+   944→    if (channels.includes('ppc')) {
+   945→      kpis.push({ name: 'Click-Through Rate (PPC)', target: 3.5, unit: '%', trackingMethod: 'Ad platform analytics' });
+   946→    }
+   947→
+   948→    // Ensure minimum KPIs
+   949→    if (kpis.length < 3) {
+   950→      kpis.push(
+   951→        { name: 'Website Traffic', target: 50000, unit: 'sessions', trackingMethod: 'Google Analytics' },
+   952→        { name: 'Conversion Rate', target: 3.0, unit: '%', trackingMethod: 'Analytics & CRM' },
+   953→      );
+   954→    }
+   955→
+   956→    return kpis;
+   957→  }
+   958→
+   959→  // ─── Helper: Competitive Analysis ───────────────────────
+   960→
+   961→  private analyzeCompetition(industry: string, product: string): CompetitiveInsight[] {
+   962→    const competitorPools: Record<string, CompetitiveInsight[]> = {
+   963→      saas: [
+   964→        { competitor: 'Market Leader A', strength: 'Brand recognition and enterprise footprint', weakness: 'Complex onboarding and high pricing', opportunity: 'Simplified UX and transparent pricing' },
+   965→        { competitor: 'Niche Player B', strength: 'Deep feature set for vertical markets', weakness: 'Limited integrations and scalability', opportunity: 'Open API and ecosystem partnerships' },
+   966→        { competitor: 'New Entrant C', strength: 'Modern UI and fast deployment', weakness: 'Feature gaps and no enterprise track record', opportunity: 'Enterprise-grade features with modern UX' },
+   967→      ],
+   968→      'e-commerce': [
+   969→        { competitor: 'Category Giant A', strength: 'Massive selection and fast shipping', weakness: 'Impersonal experience and counterfeit issues', opportunity: 'Curated quality and personalized service' },
+   970→        { competitor: 'DTC Brand B', strength: 'Strong brand narrative and community', weakness: 'Limited product range and higher prices', opportunity: 'Broader catalog with brand storytelling' },
+   971→        { competitor: 'Marketplace C', strength: 'Low prices and vast inventory', weakness: 'Poor customer service and quality control', opportunity: 'Premium experience at competitive prices' },
+   972→      ],
+   973→      technology: [
+   974→        { competitor: 'Incumbent A', strength: 'Enterprise relationships and deep integrations', weakness: 'Slow innovation and legacy architecture', opportunity: 'Next-gen architecture with rapid iteration' },
+   975→        { competitor: 'Startup B', strength: 'Cutting-edge AI and modern stack', weakness: 'Unproven at scale and limited support', opportunity: 'AI-powered with enterprise reliability' },
+   976→        { competitor: 'Open Source C', strength: 'Free and community-driven', weakness: 'No SLA and fragmented development', opportunity: 'Managed offering with SLA guarantees' },
+   977→      ],
+   978→    };
+   979→
+   980→    const insights = competitorPools[industry.toLowerCase()] ?? competitorPools['technology']!;
+   981→
+   982→    // Personalize with product name
+   983→    return insights.map(insight => ({
+   984→      ...insight,
+   985→      opportunity: insight.opportunity.replace(/solution|platform|offering/gi, product),
+   986→    }));
+   987→  }
+   988→
+   989→  // ─── Helper: Budget Allocation ──────────────────────────
+   990→
+   991→  private allocateBudget(channels: ChannelStrategy[], totalBudget: number): BudgetAllocation {
+   992→    const breakdown: BudgetBreakdown[] = channels.map(ch => ({
+   993→      channel: ch.channel,
+   994→      amount: Math.round(totalBudget * (ch.budget / 100)),
+   995→      percentage: ch.budget,
+   996→    }));
+   997→
+   998→    return {
+   999→      total: totalBudget,
+  1000→      breakdown,
+  1001→    };
+  1002→  }
+  1003→
+  1004→  // ─── Helper: ROI Projection ─────────────────────────────
+  1005→
+  1006→  private projectROI(strategy: MarketingStrategy, budget: BudgetAllocation): number {
+  1007→    if (budget.total === 0) return 0;
+  1008→
+  1009→    const weightedROI = strategy.channels.reduce((sum, ch) => {
+  1010→      const allocation = budget.breakdown.find(b => b.channel === ch.channel);
+  1011→      const share = allocation ? allocation.amount / budget.total : 0;
+  1012→      return sum + ch.expectedROI * share;
+  1013→    }, 0);
+  1014→
+  1015→    return Math.round(weightedROI * 100) / 100;
+  1016→  }
+  1017→
+  1018→  private estimateReach(audience: AudienceProfile, strategy: MarketingStrategy, durationWeeks: number): number {
+  1019→    // Base reach from segment size, modulated by channel mix and duration
+  1020→    const channelMultipliers: Record<string, number> = {
+  1021→      'social-media': 0.15,
+  1022→      email: 0.08,
+  1023→      content: 0.10,
+  1024→      ppc: 0.12,
+  1025→      seo: 0.06,
+  1026→      influencer: 0.09,
+  1027→      events: 0.03,
+  1028→      pr: 0.05,
+  1029→    };
+  1030→
+  1031→    const totalMultiplier = strategy.channels.reduce(
+  1032→      (sum, ch) => sum + (channelMultipliers[ch.channel] ?? 0.05),
+  1033→      0,
+  1034→    );
+  1035→
+  1036→    const durationFactor = Math.min(durationWeeks / 8, 1.5);
+  1037→    return Math.round(audience.segmentSize * totalMultiplier * durationFactor);
+  1038→  }
+  1039→
+  1040→  // ─── Helper: Campaign Name Generator ────────────────────
+  1041→
+  1042→  private generateCampaignName(brief: CampaignBrief): string {
+  1043→    const prefixes = ['Project', 'Operation', 'Initiative', 'Campaign', 'Drive'];
+  1044→    const prefix = prefixes[Math.floor(Math.random() * prefixes.length)];
+  1045→    const suffix = brief.product
+  1046→      .split(' ')
+  1047→      .map(w => w.charAt(0).toUpperCase() + w.slice(1))
+  1048→      .join('');
+  1049→    return `${prefix} ${suffix}`;
+  1050→  }
+  1051→
+  1052→  // ─── Quality Scoring Helpers ────────────────────────────
+  1053→
+  1054→  private scoreStrategyQuality(output: MarketingOutput, suggestions: string[]): number {
+  1055→    let score = 0;
+  1056→
+  1057→    // Positioning is present and substantive (> 20 chars)
+  1058→    if (output.strategy.positioning.length > 20) score += 0.2;
+  1059→    else suggestions.push('Positioning statement is too brief — provide more depth');
+  1060→
+  1061→    // Messaging is present and substantive (> 20 chars)
+  1062→    if (output.strategy.messaging.length > 20) score += 0.2;
+  1063→    else suggestions.push('Messaging is too brief — elaborate on value proposition');
+  1064→
+  1065→    // At least 3 channels with tactics
+  1066→    if (output.strategy.channels.length >= 3) score += 0.2;
+  1067→    else suggestions.push('Strategy should include at least 3 channels with tactics');
+  1068→
+  1069→    // Funnel stages present (at least 4)
+  1070→    if (output.strategy.funnel.length >= 4) score += 0.2;
+  1071→    else suggestions.push('Include at least 4 funnel stages for a complete marketing funnel');
+  1072→
+  1073→    // Differentiators present (at least 2)
+  1074→    if (output.strategy.differentiators.length >= 2) score += 0.2;
+  1075→    else suggestions.push('Define at least 2 competitive differentiators');
+  1076→
+  1077→    return Math.min(score, 1);
+  1078→  }
+  1079→
+  1080→  private scoreContentQuality(output: MarketingOutput, suggestions: string[]): number {
+  1081→    let score = 0;
+  1082→
+  1083→    // Minimum 5 content pieces
+  1084→    if (output.content.length >= 5) score += 0.25;
+  1085→    else if (output.content.length >= 3) score += 0.15;
+  1086→    else suggestions.push('Generate more content pieces — at least 5 recommended');
+  1087→
+  1088→    // Content variety (at least 3 different types)
+  1089→    const uniqueTypes = new Set(output.content.map(c => c.type));
+  1090→    if (uniqueTypes.size >= 3) score += 0.25;
+  1091→    else suggestions.push('Diversify content types — use at least 3 different formats');
+  1092→
+  1093→    // All content has CTAs
+  1094→    const allHaveCta = output.content.every(c => c.cta && c.cta.length > 0);
+  1095→    if (allHaveCta) score += 0.25;
+  1096→    else suggestions.push('Ensure all content pieces have clear calls-to-action');
+  1097→
+  1098→    // Headlines are substantive
+  1099→    const substantiveHeadlines = output.content.filter(c => c.headline.length > 10);
+  1100→    if (substantiveHeadlines.length >= output.content.length * 0.7) score += 0.25;
+  1101→    else suggestions.push('Strengthen headlines — make them more compelling and specific');
+  1102→
+  1103→    return Math.min(score, 1);
+  1104→  }
+  1105→
+  1106→  private scoreMarketFit(output: MarketingOutput, suggestions: string[]): number {
+  1107→    let score = 0;
+  1108→
+  1109→    // Audience demographics are complete
+  1110→    const demo = output.targetAudience.demographics;
+  1111→    const filledDemoFields = [demo.ageRange, demo.gender, demo.location, demo.income, demo.education]
+  1112→      .filter(v => v && v.length > 0).length;
+  1113→    score += (filledDemoFields / 5) * 0.25;
+  1114→
+  1115→    // Psychographics present (at least 3)
+  1116→    if (output.targetAudience.psychographics.length >= 3) score += 0.25;
+  1117→    else suggestions.push('Add more psychographic traits to better define the audience');
+  1118→
+  1119→    // Pain points present (at least 2)
+  1120→    if (output.targetAudience.painPoints.length >= 2) score += 0.25;
+  1121→    else suggestions.push('Define more pain points to improve targeting');
+  1122→
+  1123→    // Channels align with audience preferences
+  1124→    const audienceChannels = new Set(output.targetAudience.preferredChannels);
+  1125→    const strategyChannels = output.strategy.channels.map(c => c.channel);
+  1126→    const alignment = strategyChannels.filter(c => audienceChannels.has(c)).length;
+  1127→    const alignmentRatio = strategyChannels.length > 0 ? alignment / strategyChannels.length : 0;
+  1128→    score += alignmentRatio * 0.25;
+  1129→    if (alignmentRatio < 0.5) {
+  1130→      suggestions.push('Strategy channels should better align with audience preferred channels');
+  1131→    }
+  1132→
+  1133→    return Math.min(score, 1);
+  1134→  }
+  1135→
+  1136→  private scoreActionability(output: MarketingOutput, suggestions: string[]): number {
+  1137→    let score = 0;
+  1138→
+  1139→    // Calendar has entries
+  1140→    if (output.calendar.length >= 4) score += 0.25;
+  1141→    else if (output.calendar.length > 0) score += 0.1;
+  1142→    else suggestions.push('Create a campaign calendar with weekly entries');
+  1143→
+  1144→    // Calendar items have scheduled dates
+  1145→    const totalItems = output.calendar.reduce((sum, w) => sum + w.items.length, 0);
+  1146→    const itemsWithDates = output.calendar.flatMap(w => w.items).filter(i => i.date && i.date.length > 0).length;
+  1147→    if (totalItems > 0 && itemsWithDates === totalItems) score += 0.25;
+  1148→    else suggestions.push('Ensure all calendar items have scheduled dates');
+  1149→
+  1150→    // KPIs are defined (at least 3)
+  1151→    if (output.kpis.length >= 3) score += 0.25;
+  1152→    else suggestions.push('Define at least 3 KPIs with targets and tracking methods');
+  1153→
+  1154→    // Budget is allocated across channels
+  1155→    if (output.budget.breakdown.length >= 2 && output.budget.total > 0) score += 0.25;
+  1156→    else suggestions.push('Allocate budget across at least 2 channels');
+  1157→
+  1158→    return Math.min(score, 1);
+  1159→  }
+  1160→
+  1161→  private scoreROIPotential(output: MarketingOutput, suggestions: string[]): number {
+  1162→    let score = 0;
+  1163→
+  1164→    // Budget percentages sum to approximately 100
+  1165→    const totalPct = output.budget.breakdown.reduce((sum, b) => sum + b.percentage, 0);
+  1166→    if (totalPct >= 95 && totalPct <= 105) score += 0.25;
+  1167→    else suggestions.push('Budget percentages should sum to approximately 100%');
+  1168→
+  1169→    // ROI projection is positive
+  1170→    if (output.metadata.roiProjection > 0) score += 0.25;
+  1171→    else suggestions.push('ROI projection should be positive');
+  1172→
+  1173→    // ROI projection is reasonable (between 1.5 and 8)
+  1174→    if (output.metadata.roiProjection >= 1.5 && output.metadata.roiProjection <= 8) score += 0.25;
+  1175→    else if (output.metadata.roiProjection > 8) suggestions.push('ROI projection seems unrealistically high — temper expectations');
+  1176→
+  1177→    // Channels have expected ROI values
+  1178→    const channelsWithROI = output.strategy.channels.filter(c => c.expectedROI > 0);
+  1179→    if (channelsWithROI.length === output.strategy.channels.length && output.strategy.channels.length > 0) {
+  1180→      score += 0.25;
+  1181→    } else {
+  1182→      suggestions.push('Each channel should include an expected ROI estimate');
+  1183→    }
+  1184→
+  1185→    return Math.min(score, 1);
+  1186→  }
+  1187→
+  1188→  // ─── Helper: Markdown Rendering ─────────────────────────
+  1189→
+  1190→  private renderMarkdown(output: MarketingOutput): string {
+  1191→    const lines: string[] = [];
+  1192→
+  1193→    lines.push(`# ${output.campaignName}`);
+  1194→    lines.push('');
+  1195→    lines.push(`**Objective:** ${output.objective}`);
+  1196→    lines.push('');
+  1197→
+  1198→    // Target Audience
+  1199→    lines.push('## Target Audience');
+  1200→    lines.push('');
+  1201→    lines.push('### Demographics');
+  1202→    const d = output.targetAudience.demographics;
+  1203→    lines.push(`- **Age Range:** ${d.ageRange}`);
+  1204→    lines.push(`- **Gender:** ${d.gender}`);
+  1205→    lines.push(`- **Location:** ${d.location}`);
+  1206→    lines.push(`- **Income:** ${d.income}`);
+  1207→    lines.push(`- **Education:** ${d.education}`);
+  1208→    lines.push(`- **Segment Size:** ${output.targetAudience.segmentSize.toLocaleString()}`);
+  1209→    lines.push('');
+  1210→    lines.push('### Psychographics');
+  1211→    output.targetAudience.psychographics.forEach(p => lines.push(`- ${p}`));
+  1212→    lines.push('');
+  1213→    lines.push('### Pain Points');
+  1214→    output.targetAudience.painPoints.forEach(p => lines.push(`- ${p}`));
+  1215→    lines.push('');
+  1216→    lines.push('### Preferred Channels');
+  1217→    output.targetAudience.preferredChannels.forEach(c => lines.push(`- ${c}`));
+  1218→    lines.push('');
+  1219→
+  1220→    // Strategy
+  1221→    lines.push('## Marketing Strategy');
+  1222→    lines.push('');
+  1223→    lines.push(`**Positioning:** ${output.strategy.positioning}`);
+  1224→    lines.push('');
+  1225→    lines.push(`**Messaging:** ${output.strategy.messaging}`);
+  1226→    lines.push('');
+  1227→
+  1228→    lines.push('### Channel Strategy');
+  1229→    output.strategy.channels.forEach(ch => {
+  1230→      lines.push(`#### ${ch.channel}`);
+  1231→      lines.push(`- **Budget:** ${ch.budget}%`);
+  1232→      lines.push(`- **Expected ROI:** ${ch.expectedROI}x`);
+  1233→      lines.push('- **Tactics:**');
+  1234→      ch.tactics.forEach(t => lines.push(`  - ${t}`));
+  1235→      lines.push('');
+  1236→    });
+  1237→
+  1238→    lines.push('### Marketing Funnel');
+  1239→    output.strategy.funnel.forEach(stage => {
+  1240→      lines.push(`#### ${stage.stage.charAt(0).toUpperCase() + stage.stage.slice(1)}`);
+  1241→      lines.push(`- **Content Types:** ${stage.contentTypes.join(', ')}`);
+  1242→      lines.push(`- **Metrics:** ${stage.metrics.join(', ')}`);
+  1243→      lines.push('- **Tactics:**');
+  1244→      stage.tactics.forEach(t => lines.push(`  - ${t}`));
+  1245→      lines.push('');
+  1246→    });
+  1247→
+  1248→    lines.push('### Differentiators');
+  1249→    output.strategy.differentiators.forEach(d => lines.push(`- ${d}`));
+  1250→    lines.push('');
+  1251→
+  1252→    // Content
+  1253→    lines.push('## Content Pieces');
+  1254→    lines.push('');
+  1255→    output.content.forEach((c, i) => {
+  1256→      lines.push(`### ${i + 1}. [${c.type}] ${c.title}`);
+  1257→      lines.push(`**Channel:** ${c.channel}`);
+  1258→      lines.push('');
+  1259→      lines.push(`**Headline:** ${c.headline}`);
+  1260→      lines.push('');
+  1261→      lines.push(c.body);
+  1262→      lines.push('');
+  1263→      lines.push(`**CTA:** ${c.cta}`);
+  1264→      if (c.seoKeywords) {
+  1265→        lines.push(`**SEO Keywords:** ${c.seoKeywords.join(', ')}`);
+  1266→      }
+  1267→      lines.push('');
+  1268→    });
+  1269→
+  1270→    // Calendar
+  1271→    lines.push('## Campaign Calendar');
+  1272→    lines.push('');
+  1273→    output.calendar.forEach(week => {
+  1274→      lines.push(`### Week ${week.week}`);
+  1275→      lines.push('');
+  1276→      lines.push('| Date | Channel | Action | Content ID |');
+  1277→      lines.push('|------|---------|--------|------------|');
+  1278→      week.items.forEach(item => {
+  1279→        lines.push(`| ${item.date} | ${item.channel} | ${item.action} | ${item.contentId.slice(0, 8)}… |`);
+  1280→      });
+  1281→      lines.push('');
+  1282→    });
+  1283→
+  1284→    // KPIs
+  1285→    lines.push('## KPIs & Success Metrics');
+  1286→    lines.push('');
+  1287→    lines.push('| KPI | Target | Unit | Tracking Method |');
+  1288→    lines.push('|-----|--------|------|-----------------|');
+  1289→    output.kpis.forEach(kpi => {
+  1290→      lines.push(`| ${kpi.name} | ${kpi.target} | ${kpi.unit} | ${kpi.trackingMethod} |`);
+  1291→    });
+  1292→    lines.push('');
+  1293→
+  1294→    // Competitive Analysis
+  1295→    lines.push('## Competitive Analysis');
+  1296→    lines.push('');
+  1297→    output.competitiveAnalysis.forEach(comp => {
+  1298→      lines.push(`### ${comp.competitor}`);
+  1299→      lines.push(`- **Strength:** ${comp.strength}`);
+  1300→      lines.push(`- **Weakness:** ${comp.weakness}`);
+  1301→      lines.push(`- **Opportunity:** ${comp.opportunity}`);
+  1302→      lines.push('');
+  1303→    });
+  1304→
+  1305→    // Budget
+  1306→    lines.push('## Budget Allocation');
+  1307→    lines.push('');
+  1308→    lines.push(`**Total Budget:** $${output.budget.total.toLocaleString()}`);
+  1309→    lines.push('');
+  1310→    lines.push('| Channel | Amount | Percentage |');
+  1311→    lines.push('|---------|--------|------------|');
+  1312→    output.budget.breakdown.forEach(b => {
+  1313→      lines.push(`| ${b.channel} | $${b.amount.toLocaleString()} | ${b.percentage}% |`);
+  1314→    });
+  1315→    lines.push('');
+  1316→
+  1317→    // Metadata
+  1318→    lines.push('## Campaign Summary');
+  1319→    lines.push('');
+  1320→    lines.push(`- **Duration:** ${output.metadata.duration} weeks`);
+  1321→    lines.push(`- **Channels:** ${output.metadata.channels.join(', ')}`);
+  1322→    lines.push(`- **Estimated Reach:** ${output.metadata.estimatedReach.toLocaleString()}`);
+  1323→    lines.push(`- **ROI Projection:** ${output.metadata.roiProjection}x`);
+  1324→
+  1325→    return lines.join('\n');
+  1326→  }
+  1327→}
+  1328→

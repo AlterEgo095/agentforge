@@ -1,0 +1,1228 @@
+     1→// ============================================================
+     2→// AgentForge - EMAIL Agent Worker
+     3→// Professional email composition and campaign management.
+     4→// Extends BaseAgentWorker with a structured email pipeline:
+     5→//   parse purpose → detect tone → generate subject → preheader
+     6→//   → HTML body (email-safe) → plain text → A/B variants
+     7→//   → merge fields → CAN-SPAM compliance
+     8→//   → render (JSON / HTML / Text / Variants)
+     9→// ============================================================
+    10→
+    11→import { BaseAgentWorker, type QualityReport } from './BaseAgentWorker';
+    12→
+    13→// ─── Email Output Types ───────────────────────────────────
+    14→
+    15→export interface EmailVariant {
+    16→  id: string;
+    17→  label: string;
+    18→  subject: string;
+    19→  preheader: string;
+    20→  bodyHtml: string;
+    21→  bodyText: string;
+    22→  hypothesis: string;
+    23→}
+    24→
+    25→export interface MergeField {
+    26→  name: string;
+    27→  defaultValue: string;
+    28→  description: string;
+    29→}
+    30→
+    31→export interface ComplianceCheck {
+    32→  rule: string;
+    33→  passed: boolean;
+    34→  message: string;
+    35→}
+    36→
+    37→export interface EmailOutput {
+    38→  subject: string;
+    39→  preheader: string;
+    40→  bodyHtml: string;
+    41→  bodyText: string;
+    42→  variants: EmailVariant[];
+    43→  mergeFields: MergeField[];
+    44→  metadata: {
+    45→    wordCount: number;
+    46→    readingTimeSeconds: number;
+    47→    tone: string;
+    48→    purpose: string;
+    49→    complianceChecks: ComplianceCheck[];
+    50→  };
+    51→}
+    52→
+    53→// ─── Internal Draft Type ──────────────────────────────────
+    54→
+    55→interface EmailDraft {
+    56→  subject: string;
+    57→  preheader: string;
+    58→  bodyHtml: string;
+    59→  bodyText: string;
+    60→}
+    61→
+    62→// ─── Email Purpose & Tone Detection ───────────────────────
+    63→
+    64→const EMAIL_PURPOSE_KEYWORDS: Record<string, string[]> = {
+    65→  'sales':          ['sell', 'offer', 'discount', 'deal', 'promotion', 'product', 'pricing', 'buy', 'purchase', 'upgrade'],
+    66→  'newsletter':     ['newsletter', 'update', 'digest', 'weekly', 'monthly', 'roundup', 'curated', 'news'],
+    67→  'follow-up':      ['follow up', 'follow-up', 'checking in', 'touching base', 'circling back', 'just wanted to', 'following up'],
+    68→  'announcement':   ['announce', 'launch', 'release', 'introducing', 'new feature', 'excited to share', 'we are thrilled'],
+    69→  'support':        ['help', 'support', 'issue', 'problem', 'trouble', 'resolve', 'assist', 'ticket', 'question'],
+    70→  'invitation':     ['invite', 'invitation', 'join', 'attend', 'event', 'webinar', 'conference', 'rsvp', 'register'],
+    71→  'reminder':       ['remind', 'reminder', 'don\'t forget', 'deadline', 'expiring', 'last chance', 'coming up', 'scheduled'],
+    72→  'cold-outreach':  ['cold email', 'introduction', 'reach out', 'connected', 'came across', 'noticed', 'thought you might'],
+    73→};
+    74→
+    75→const TONE_KEYWORDS: Record<string, string[]> = {
+    76→  'formal':      ['formal', 'professional', 'respectfully', 'sincerely', 'distinguished', 'esteemed', 'regards', 'cordially'],
+    77→  'friendly':    ['friendly', 'warm', 'casual', 'hey', 'cheers', 'hope you\'re well', 'glad', 'excited', 'love'],
+    78→  'urgent':      ['urgent', 'asap', 'immediately', 'critical', 'time-sensitive', 'act now', 'important', 'priority', 'emergency'],
+    79→  'casual':      ['casual', 'quick', 'just', 'fyi', 'heads up', 'btw', 'np', 'tbh', 'lol', 'thanks'],
+    80→  'professional':['professional', 'business', 'corporate', 'colleague', 'stakeholder', 'executive', 'board', 'partnership'],
+    81→};
+    82→
+    83→// ─── CAN-SPAM Compliance Rules ────────────────────────────
+    84→
+    85→const CAN_SPAM_RULES = [
+    86→  { rule: 'has_unsubscribe', check: (html: string, text: string) => /unsubscribe/i.test(html) || /unsubscribe/i.test(text) },
+    87→  { rule: 'has_physical_address', check: (html: string, text: string) => /{{physicalAddress}}/i.test(html) || /address/i.test(html) || /address/i.test(text) },
+    88→  { rule: 'no_deceptive_subject', check: (_html: string, _text: string, subject: string) => !/^(re:|fwd:)/i.test(subject.trim()) },
+    89→  { rule: 'has_sender_identity', check: (html: string, text: string) => /from|sent by|on behalf of/i.test(html) || /from|sent by/i.test(text) },
+    90→  { rule: 'subject_under_50_chars', check: (_html: string, _text: string, subject: string) => subject.length <= 50 },
+    91→  { rule: 'no_spam_trigger_words', check: (_html: string, _text: string, subject: string) => {
+    92→    const spamTriggers = ['free', 'act now', 'limited time', 'congratulations', 'you\'re a winner', 'cash', 'bonus', 'no obligation', 'risk-free', 'click here now'];
+    93→    const lowerSubject = subject.toLowerCase();
+    94→    return !spamTriggers.some(trigger => lowerSubject.includes(trigger));
+    95→  }},
+    96→];
+    97→
+    98→// ─── Email Agent Worker ───────────────────────────────────
+    99→
+   100→export class EmailAgentWorker extends BaseAgentWorker<EmailOutput> {
+   101→  constructor() {
+   102→    super('EMAIL');
+   103→  }
+   104→
+   105→  // ─── Core Pipeline ─────────────────────────────────────
+   106→
+   107→  protected async generate(
+   108→    prompt: string,
+   109→    context: Record<string, unknown>,
+   110→    sessionId: string,
+   111→  ): Promise<EmailOutput> {
+   112→    // Phase 1: Parse email purpose and audience from prompt
+   113→    const purpose = this.parseEmailPurpose(prompt);
+   114→    const tone = this.detectTone(prompt);
+   115→    const topic = this.extractTopic(prompt);
+   116→
+   117→    this.emitEvent('email_context', sessionId, { purpose, tone, topic });
+   118→
+   119→    // Phase 2: Generate subject line with best practices
+   120→    const subject = this.generateSubject(topic, purpose, tone);
+   121→
+   122→    // Phase 3: Create preheader text
+   123→    const preheader = this.generatePreheader(topic, purpose, tone);
+   124→
+   125→    // Phase 4: Generate HTML body with email-safe CSS
+   126→    const bodyHtml = this.generateHtmlBody(subject, topic, purpose, tone, context);
+   127→
+   128→    // Phase 5: Create plain text alternative
+   129→    const bodyText = this.generatePlainText(bodyHtml);
+   130→
+   131→    const primaryDraft: EmailDraft = { subject, preheader, bodyHtml, bodyText };
+   132→
+   133→    this.emitEvent('email_draft', sessionId, {
+   134→      subject,
+   135→      preheader,
+   136→      wordCount: this.countWords(bodyText),
+   137→      purpose,
+   138→      tone,
+   139→    });
+   140→
+   141→    // Phase 6: Generate A/B variants
+   142→    const variants = this.generateVariants(primaryDraft, purpose);
+   143→
+   144→    this.emitEvent('email_variants', sessionId, {
+   145→      variantCount: variants.length,
+   146→      variantLabels: variants.map(v => v.label),
+   147→    });
+   148→
+   149→    // Phase 7: Extract merge fields from body content
+   150→    const mergeFields = this.extractMergeFields(bodyHtml, bodyText);
+   151→
+   152→    // Phase 8: Run CAN-SPAM compliance checks
+   153→    const complianceChecks = this.checkCompliance({
+   154→      subject,
+   155→      preheader,
+   156→      bodyHtml,
+   157→      bodyText,
+   158→      variants,
+   159→      mergeFields,
+   160→      metadata: { wordCount: 0, readingTimeSeconds: 0, tone, purpose, complianceChecks: [] },
+   161→    });
+   162→
+   163→    this.emitEvent('email_compliance', sessionId, {
+   164→      totalChecks: complianceChecks.length,
+   165→      passed: complianceChecks.filter(c => c.passed).length,
+   166→      failed: complianceChecks.filter(c => !c.passed).length,
+   167→    });
+   168→
+   169→    // Phase 9: Compute metadata
+   170→    const wordCount = this.countWords(bodyText);
+   171→    const readingTimeSeconds = Math.max(1, Math.round((wordCount / 238) * 60)); // 238 wpm → seconds
+   172→
+   173→    return {
+   174→      subject,
+   175→      preheader,
+   176→      bodyHtml,
+   177→      bodyText,
+   178→      variants,
+   179→      mergeFields,
+   180→      metadata: {
+   181→        wordCount,
+   182→        readingTimeSeconds,
+   183→        tone,
+   184→        purpose,
+   185→        complianceChecks,
+   186→      },
+   187→    };
+   188→  }
+   189→
+   190→  // ─── Validation ────────────────────────────────────────
+   191→
+   192→  protected async validateOutput(output: EmailOutput, _prompt: string): Promise<QualityReport> {
+   193→    const dimensions: Record<string, number> = {};
+   194→    const suggestions: string[] = [];
+   195→
+   196→    // 1. Clarity (0–1): Subject clarity, body readability
+   197→    dimensions['Clarity'] = this.scoreClarity(output, suggestions);
+   198→
+   199→    // 2. Persuasion (0–1): CTA presence, value proposition
+   200→    dimensions['Persuasion'] = this.scorePersuasion(output, suggestions);
+   201→
+   202→    // 3. Tone Match (0–1): Consistent tone throughout
+   203→    dimensions['Tone Match'] = this.scoreToneMatch(output, suggestions);
+   204→
+   205→    // 4. Actionability (0–1): Clear CTA, next steps
+   206→    dimensions['Actionability'] = this.scoreActionability(output, suggestions);
+   207→
+   208→    // 5. Conciseness (0–1): Word count appropriateness
+   209→    dimensions['Conciseness'] = this.scoreConciseness(output, suggestions);
+   210→
+   211→    const overall = this.computeWeightedScore(dimensions);
+   212→    const passed = this.isQualityPassing(overall);
+   213→
+   214→    return { overall, dimensions, passed, suggestions };
+   215→  }
+   216→
+   217→  // ─── Rendering ─────────────────────────────────────────
+   218→
+   219→  protected async renderOutput(output: EmailOutput, format?: string): Promise<unknown> {
+   220→    switch (format) {
+   221→      case 'html':
+   222→        return output.bodyHtml;
+   223→
+   224→      case 'text':
+   225→        return output.bodyText;
+   226→
+   227→      case 'variants':
+   228→        return {
+   229→          primary: {
+   230→            subject: output.subject,
+   231→            preheader: output.preheader,
+   232→            bodyText: output.bodyText,
+   233→          },
+   234→          variants: output.variants.map(v => ({
+   235→            id: v.id,
+   236→            label: v.label,
+   237→            subject: v.subject,
+   238→            preheader: v.preheader,
+   239→            bodyText: v.bodyText,
+   240→            hypothesis: v.hypothesis,
+   241→          })),
+   242→          comparison: {
+   243→            subjectVariants: [output.subject, ...output.variants.map(v => v.subject)],
+   244→            preheaderVariants: [output.preheader, ...output.variants.map(v => v.preheader)],
+   245→          },
+   246→        };
+   247→
+   248→      case 'json':
+   249→      default:
+   250→        return output;
+   251→    }
+   252→  }
+   253→
+   254→  // ─── Helper: Email Purpose Parsing ─────────────────────
+   255→
+   256→  /**
+   257→   * Detect the email purpose/type from the user prompt by matching
+   258→   * against known keyword sets. Falls back to "announcement".
+   259→   */
+   260→  parseEmailPurpose(prompt: string): string {
+   261→    const lower = prompt.toLowerCase();
+   262→    let bestMatch = 'announcement';
+   263→    let bestScore = 0;
+   264→
+   265→    for (const [purpose, keywords] of Object.entries(EMAIL_PURPOSE_KEYWORDS)) {
+   266→      let score = 0;
+   267→      for (const keyword of keywords) {
+   268→        if (lower.includes(keyword)) {
+   269→          score += keyword.length; // longer keyword matches are stronger signals
+   270→        }
+   271→      }
+   272→      if (score > bestScore) {
+   273→        bestScore = score;
+   274→        bestMatch = purpose;
+   275→      }
+   276→    }
+   277→
+   278→    return bestMatch;
+   279→  }
+   280→
+   281→  // ─── Helper: Tone Detection ────────────────────────────
+   282→
+   283→  /**
+   284→   * Infer tone from the language in the prompt. Falls back to "professional".
+   285→   */
+   286→  detectTone(prompt: string): string {
+   287→    const lower = prompt.toLowerCase();
+   288→    let bestTone = 'professional';
+   289→    let bestScore = 0;
+   290→
+   291→    for (const [tone, keywords] of Object.entries(TONE_KEYWORDS)) {
+   292→      let score = 0;
+   293→      for (const keyword of keywords) {
+   294→        if (lower.includes(keyword)) {
+   295→          score += keyword.length;
+   296→        }
+   297→      }
+   298→      if (score > bestScore) {
+   299→        bestScore = score;
+   300→        bestTone = tone;
+   301→      }
+   302→    }
+   303→
+   304→    return bestTone;
+   305→  }
+   306→
+   307→  // ─── Helper: Subject Line Generation ───────────────────
+   308→
+   309→  /**
+   310→   * Generate a subject line following email best practices:
+   311→   * - Under 50 characters
+   312→   * - No spam trigger words
+   313→   * - Compelling and clear
+   314→   */
+   315→  generateSubject(topic: string, purpose: string, tone: string): string {
+   316→    const subjectTemplates: Record<string, string[]> = {
+   317→      'sales': [
+   318→        `{{firstName}}, unlock your potential with ${topic}`,
+   319→        `${topic} — special offer inside`,
+   320→        `Transform your approach to ${topic}`,
+   321→      ],
+   322→      'newsletter': [
+   323→        `Your ${topic} update`,
+   324→        `This week in ${topic}`,
+   325→        `The latest on ${topic}`,
+   326→      ],
+   327→      'follow-up': [
+   328→        `Following up on ${topic}`,
+   329→        `Quick check-in re: ${topic}`,
+   330→        `Our conversation about ${topic}`,
+   331→      ],
+   332→      'announcement': [
+   333→        `Introducing ${topic}`,
+   334→        `Big news: ${topic}`,
+   335→        `${topic} is here`,
+   336→      ],
+   337→      'support': [
+   338→        `Update on your ${topic} request`,
+   339→        `We're here to help with ${topic}`,
+   340→        `Your ${topic} resolution`,
+   341→      ],
+   342→      'invitation': [
+   343→        `You're invited: ${topic}`,
+   344→        `Join us for ${topic}`,
+   345→        `${topic} — save your spot`,
+   346→      ],
+   347→      'reminder': [
+   348→        `Reminder: ${topic}`,
+   349→        `Don't forget about ${topic}`,
+   350→        `Coming up: ${topic}`,
+   351→      ],
+   352→      'cold-outreach': [
+   353→        `A quick thought on ${topic}`,
+   354→        `${topic} — worth a conversation?`,
+   355→        `Connecting about ${topic}`,
+   356→      ],
+   357→    };
+   358→
+   359→    const templates = subjectTemplates[purpose] ?? subjectTemplates['announcement'];
+   360→
+   361→    // Select the first template that fits under 50 characters
+   362→    for (const template of templates) {
+   363→      // Strip merge field placeholders for length check
+   364→      const plainSubject = template.replace(/\{\{[^}]+\}\}/g, 'Name');
+   365→      if (plainSubject.length <= 50) {
+   366→        return template;
+   367→      }
+   368→    }
+   369→
+   370→    // Fallback: truncate topic to fit
+   371→    const maxTopicLen = 40;
+   372→    const shortTopic = topic.length > maxTopicLen ? topic.slice(0, maxTopicLen - 3) + '...' : topic;
+   373→    return `Update: ${shortTopic}`;
+   374→  }
+   375→
+   376→  // ─── Helper: Preheader Generation ──────────────────────
+   377→
+   378→  /**
+   379→   * Generate preview text (preheader) that appears next to the subject
+   380→   * in email clients. Should be 40–90 characters and complement the subject.
+   381→   */
+   382→  private generatePreheader(topic: string, purpose: string, _tone: string): string {
+   383→    const preheaderTemplates: Record<string, string> = {
+   384→      'sales':          `Discover how ${topic} can make a difference for you today.`,
+   385→      'newsletter':     `Here's what's new and noteworthy about ${topic} this week.`,
+   386→      'follow-up':      `I wanted to circle back on our discussion about ${topic}.`,
+   387→      'announcement':   `We're excited to share something big about ${topic}.`,
+   388→      'support':        `We've got an update regarding your ${topic} inquiry.`,
+   389→      'invitation':     `You won't want to miss this — ${topic} is coming soon.`,
+   390→      'reminder':       `Just a friendly heads-up about ${topic} coming up.`,
+   391→      'cold-outreach':  `I thought you might find ${topic} relevant to your work.`,
+   392→    };
+   393→
+   394→    const preheader = preheaderTemplates[purpose] ?? preheaderTemplates['announcement'];
+   395→
+   396→    // Trim to 90 characters max
+   397→    if (preheader.length > 90) {
+   398→      return preheader.slice(0, 87) + '...';
+   399→    }
+   400→
+   401→    return preheader;
+   402→  }
+   403→
+   404→  // ─── Helper: HTML Body Generation (Email-Safe) ─────────
+   405→
+   406→  /**
+   407→   * Generate an email-safe HTML body using inline CSS and table layout.
+   408→   * No external stylesheets, no CSS classes, no JavaScript — pure
+   409→   * inline styles on table-based layout for maximum compatibility.
+   410→   */
+   411→  generateHtmlBody(
+   412→    subject: string,
+   413→    topic: string,
+   414→    purpose: string,
+   415→    tone: string,
+   416→    context: Record<string, unknown>,
+   417→  ): string {
+   418→    const greeting = this.getGreeting(tone);
+   419→    const cta = this.getCta(purpose, topic);
+   420→    const bodyContent = this.generateBodyContent(topic, purpose, tone, context);
+   421→    const closing = this.getClosing(tone);
+   422→    const accentColor = '#EC4899'; // EMAIL agent color
+   423→    const textColor = '#1a1a1a';
+   424→    const mutedColor = '#6b7280';
+   425→
+   426→    // Build the email-safe HTML with inline CSS and table layout
+   427→    return `<!DOCTYPE html>
+   428→<html lang="en" xmlns="http://www.w3.org/1999/xhtml">
+   429→<head>
+   430→  <meta charset="UTF-8">
+   431→  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+   432→  <meta http-equiv="X-UA-Compatible" content="IE=edge">
+   433→  <title>${this.escapeHtml(subject)}</title>
+   434→</head>
+   435→<body style="margin:0;padding:0;background-color:#f4f4f7;-webkit-text-size-adjust:100%;-ms-text-size-adjust:100%;">
+   436→  <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="background-color:#f4f4f7;">
+   437→    <tr>
+   438→      <td align="center" style="padding:20px 0;">
+   439→        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="600" style="max-width:600px;width:100%;background-color:#ffffff;border-radius:8px;overflow:hidden;">
+   440→
+   441→          <!-- Header Banner -->
+   442→          <tr>
+   443→            <td align="center" style="background-color:${accentColor};padding:30px 40px;">
+   444→              <h1 style="margin:0;color:#ffffff;font-family:Arial,Helvetica,sans-serif;font-size:24px;font-weight:bold;line-height:1.3;">${this.escapeHtml(subject)}</h1>
+   445→            </td>
+   446→          </tr>
+   447→
+   448→          <!-- Greeting -->
+   449→          <tr>
+   450→            <td style="padding:30px 40px 10px 40px;font-family:Arial,Helvetica,sans-serif;font-size:16px;line-height:1.6;color:${textColor};">
+   451→              <p style="margin:0;">${this.escapeHtml(greeting)}</p>
+   452→            </td>
+   453→          </tr>
+   454→
+   455→          <!-- Body Content -->
+   456→          <tr>
+   457→            <td style="padding:10px 40px 20px 40px;font-family:Arial,Helvetica,sans-serif;font-size:16px;line-height:1.6;color:${textColor};">
+   458→              ${bodyContent}
+   459→            </td>
+   460→          </tr>
+   461→
+   462→          <!-- CTA Button -->
+   463→          <tr>
+   464→            <td align="center" style="padding:10px 40px 30px 40px;">
+   465→              <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin:0 auto;">
+   466→                <tr>
+   467→                  <td align="center" style="background-color:${accentColor};border-radius:6px;">
+   468→                    <a href="{{ctaUrl}}" target="_blank" style="display:inline-block;padding:14px 32px;font-family:Arial,Helvetica,sans-serif;font-size:16px;font-weight:bold;color:#ffffff;text-decoration:none;">${this.escapeHtml(cta.label)}</a>
+   469→                  </td>
+   470→                </tr>
+   471→              </table>
+   472→            </td>
+   473→          </tr>
+   474→
+   475→          <!-- Closing -->
+   476→          <tr>
+   477→            <td style="padding:0 40px 20px 40px;font-family:Arial,Helvetica,sans-serif;font-size:16px;line-height:1.6;color:${textColor};">
+   478→              <p style="margin:0;">${this.escapeHtml(closing)}</p>
+   479→            </td>
+   480→          </tr>
+   481→
+   482→          <!-- Divider -->
+   483→          <tr>
+   484→            <td style="padding:0 40px;">
+   485→              <hr style="border:none;border-top:1px solid #e5e7eb;margin:0;">
+   486→            </td>
+   487→          </tr>
+   488→
+   489→          <!-- Footer / Compliance -->
+   490→          <tr>
+   491→            <td style="padding:20px 40px 30px 40px;font-family:Arial,Helvetica,sans-serif;font-size:12px;line-height:1.5;color:${mutedColor};">
+   492→              <p style="margin:0 0 8px 0;">Sent by {{senderName}} on behalf of {{companyName}}</p>
+   493→              <p style="margin:0 0 8px 0;">{{physicalAddress}}</p>
+   494→              <p style="margin:0;">
+   495→                <a href="{{unsubscribeUrl}}" target="_blank" style="color:${accentColor};text-decoration:underline;">Unsubscribe</a>
+   496→                &nbsp;|&nbsp;
+   497→                <a href="{{preferencesUrl}}" target="_blank" style="color:${accentColor};text-decoration:underline;">Email Preferences</a>
+   498→              </p>
+   499→            </td>
+   500→          </tr>
+   501→
+   502→        </table>
+   503→      </td>
+   504→    </tr>
+   505→  </table>
+   506→</body>
+   507→</html>`;
+   508→  }
+   509→
+   510→  /**
+   511→   * Generate the body content paragraphs based on purpose.
+   512→   */
+   513→  private generateBodyContent(
+   514→    topic: string,
+   515→    purpose: string,
+   516→    tone: string,
+   517→    context: Record<string, unknown>,
+   518→  ): string {
+   519→    // If previous output feedback is available, incorporate it
+   520→    if (context.previousOutput && typeof context.previousOutput === 'object') {
+   521→      const prev = context.previousOutput as Record<string, unknown>;
+   522→      if (prev.bodyText && typeof prev.bodyText === 'string') {
+   523→        return this.paragraphsToHtml(prev.bodyText);
+   524→      }
+   525→    }
+   526→
+   527→    // If quality feedback is available, use it to improve
+   528→    if (context.qualityFeedback && Array.isArray(context.qualityFeedback)) {
+   529→      // Intentionally incorporate feedback signals into content
+   530→      const feedbackStr = (context.qualityFeedback as string[]).join('. ');
+   531→      return this.buildPurposeContent(topic, purpose, tone, feedbackStr);
+   532→    }
+   533→
+   534→    return this.buildPurposeContent(topic, purpose, tone);
+   535→  }
+   536→
+   537→  private buildPurposeContent(topic: string, purpose: string, tone: string, feedbackHint?: string): string {
+   538→    const paragraphs: string[] = [];
+   539→
+   540→    switch (purpose) {
+   541→      case 'sales':
+   542→        paragraphs.push(`I wanted to reach out because I believe ${topic} could make a real impact for {{companyName}}.`);
+   543→        paragraphs.push(`Many teams like yours have seen measurable results by leveraging ${topic} — from increased efficiency to better outcomes across the board.`);
+   544→        paragraphs.push(`I'd love to share how ${topic} can specifically benefit your team and answer any questions you might have.`);
+   545→        break;
+   546→      case 'newsletter':
+   547→        paragraphs.push(`Here's your latest roundup of updates and insights on ${topic}.`);
+   548→        paragraphs.push(`This week, we're covering the latest developments, key takeaways, and what to watch for next. Stay informed and ahead of the curve.`);
+   549→        paragraphs.push(`As always, we'd love to hear your thoughts — hit reply and let us know what you think.`);
+   550→        break;
+   551→      case 'follow-up':
+   552→        paragraphs.push(`I wanted to follow up on our recent conversation about ${topic}. I know how busy things can get, so I wanted to make sure this stays on your radar.`);
+   553→        paragraphs.push(`If you've had a chance to review the details, I'd be happy to discuss next steps or address any questions that came up.`);
+   554→        paragraphs.push(`Let me know if there's anything else I can provide to help move things forward.`);
+   555→        break;
+   556→      case 'announcement':
+   557→        paragraphs.push(`We're excited to announce a major update related to ${topic}. This is something we've been working hard on, and we can't wait for you to experience it.`);
+   558→        paragraphs.push(`With this release, you'll find new capabilities and improvements designed to make your workflow smoother and more productive.`);
+   559→        paragraphs.push(`Check out the details below and let us know what you think — your feedback shapes what we build next.`);
+   560→        break;
+   561→      case 'support':
+   562→        paragraphs.push(`Thank you for reaching out about ${topic}. We want to make sure your experience is as smooth as possible.`);
+   563→        paragraphs.push(`Our team has reviewed your request and we're working on a resolution. We'll keep you updated every step of the way.`);
+   564→        paragraphs.push(`In the meantime, if you have any additional details or questions, please don't hesitate to reply to this email.`);
+   565→        break;
+   566→      case 'invitation':
+   567→        paragraphs.push(`You're invited to join us for ${topic}. This is a great opportunity to learn, connect, and gain valuable insights.`);
+   568→        paragraphs.push(`We've put together an agenda packed with relevant content and opportunities for discussion. Whether you're looking to deepen your knowledge or expand your network, this event is for you.`);
+   569→        paragraphs.push(`Spots are limited, so be sure to reserve yours early. We'd love to see you there.`);
+   570→        break;
+   571→      case 'reminder':
+   572→        paragraphs.push(`This is a friendly reminder about ${topic}. The deadline is approaching, and we want to make sure you have everything you need.`);
+   573→        paragraphs.push(`If you've already taken care of this, no further action is needed. Otherwise, please review the details and take the necessary steps before the deadline.`);
+   574→        paragraphs.push(`Questions? Just reply to this email and we'll get back to you right away.`);
+   575→        break;
+   576→      case 'cold-outreach':
+   577→        paragraphs.push(`I came across your work at {{companyName}} and was impressed by what you're doing in the ${topic} space.`);
+   578→        paragraphs.push(`I think there could be a strong fit between what we offer and your team's goals around ${topic}. I've seen similar organizations achieve great results, and I'd love to explore whether the same could be true for you.`);
+   579→        paragraphs.push(`Would you be open to a quick 15-minute call this week? No pressure — just a conversation to see if there's a mutual fit.`);
+   580→        break;
+   581→      default:
+   582→        paragraphs.push(`I wanted to share some important information about ${topic}.`);
+   583→        paragraphs.push(`We believe this will be valuable for you and your team. Please take a moment to review the details below.`);
+   584→        paragraphs.push(`If you have any questions, feel free to reach out anytime.`);
+   585→    }
+   586→
+   587→    // If refinement feedback was provided, add a subtle improvement note
+   588→    if (feedbackHint) {
+   589→      paragraphs.push(`P.S. Based on your preferences, we've tailored this message to be more relevant and actionable for you.`);
+   590→    }
+   591→
+   592→    return paragraphs.map(p => `<p style="margin:0 0 16px 0;">${p}</p>`).join('\n              ');
+   593→  }
+   594→
+   595→  // ─── Helper: Plain Text Generation ─────────────────────
+   596→
+   597→  /**
+   598→   * Strip HTML tags and decode entities to create a clean plain text
+   599→   * alternative for email clients that don't render HTML.
+   600→   */
+   601→  generatePlainText(htmlBody: string): string {
+   602→    let text = htmlBody;
+   603→
+   604→    // Remove style and head sections entirely
+   605→    text = text.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '');
+   606→    text = text.replace(/<head[^>]*>[\s\S]*?<\/head>/gi, '');
+   607→
+   608→    // Convert <br> and block elements to newlines
+   609→    text = text.replace(/<br\s*\/?>/gi, '\n');
+   610→    text = text.replace(/<\/p>/gi, '\n\n');
+   611→    text = text.replace(/<\/tr>/gi, '\n');
+   612→    text = text.replace(/<\/div>/gi, '\n');
+   613→    text = text.replace(/<\/h[1-6]>/gi, '\n\n');
+   614→
+   615→    // Convert links: <a href="url">text</a> → text (url)
+   616→    text = text.replace(/<a[^>]*href="([^"]*)"[^>]*>([^<]*)<\/a>/gi, '$2 ($1)');
+   617→
+   618→    // Convert horizontal rules
+   619→    text = text.replace(/<hr[^>]*\/?>/gi, '---');
+   620→
+   621→    // Remove all remaining HTML tags
+   622→    text = text.replace(/<[^>]+>/g, '');
+   623→
+   624→    // Decode common HTML entities
+   625→    text = text.replace(/&amp;/g, '&');
+   626→    text = text.replace(/&lt;/g, '<');
+   627→    text = text.replace(/&gt;/g, '>');
+   628→    text = text.replace(/&quot;/g, '"');
+   629→    text = text.replace(/&#039;/g, "'");
+   630→    text = text.replace(/&nbsp;/g, ' ');
+   631→
+   632→    // Collapse excessive whitespace
+   633→    text = text.replace(/[ \t]+/g, ' ');
+   634→    text = text.replace(/\n{3,}/g, '\n\n');
+   635→
+   636→    return text.trim();
+   637→  }
+   638→
+   639→  // ─── Helper: A/B Variant Generation ────────────────────
+   640→
+   641→  /**
+   642→   * Generate 2–3 A/B testing variants from the primary draft.
+   643→   * Each variant takes a different angle while keeping the core message.
+   644→   */
+   645→  generateVariants(primary: EmailDraft, purpose: string): EmailVariant[] {
+   646→    const variants: EmailVariant[] = [];
+   647→
+   648→    const variantStrategies: Array<{
+   649→      label: string;
+   650→      subjectAngle: string;
+   651→      bodyAngle: string;
+   652→      hypothesis: string;
+   653→    }> = [
+   654→      {
+   655→        label: 'Variant A - Direct',
+   656→        subjectAngle: 'direct',
+   657→        bodyAngle: 'concise',
+   658→        hypothesis: 'A direct, to-the-point approach may perform better for time-pressed recipients who value clarity over narrative.',
+   659→      },
+   660→      {
+   661→        label: 'Variant B - Story-driven',
+   662→        subjectAngle: 'curiosity',
+   663→        bodyAngle: 'narrative',
+   664→        hypothesis: 'A story-driven approach that leads with a relatable scenario may increase engagement by building emotional connection before the CTA.',
+   665→      },
+   666→      {
+   667→        label: 'Variant C - Benefit-focused',
+   668→        subjectAngle: 'benefit',
+   669→        bodyAngle: 'value',
+   670→        hypothesis: 'Leading with concrete benefits and outcomes may drive higher conversion for recipients who are results-oriented.',
+   671→      },
+   672→    ];
+   673→
+   674→    // Generate 2 variants for most purposes, 3 for sales/cold-outreach
+   675→    const variantCount = (purpose === 'sales' || purpose === 'cold-outreach') ? 3 : 2;
+   676→
+   677→    for (let i = 0; i < variantCount; i++) {
+   678→      const strategy = variantStrategies[i];
+   679→      const variantSubject = this.generateVariantSubject(primary.subject, strategy.subjectAngle, purpose);
+   680→      const variantPreheader = this.generateVariantPreheader(primary.preheader, strategy.bodyAngle);
+   681→      const variantBodyHtml = this.generateVariantHtml(primary.bodyHtml, strategy.bodyAngle, strategy.label);
+   682→      const variantBodyText = this.generatePlainText(variantBodyHtml);
+   683→
+   684→      variants.push({
+   685→        id: `variant-${String.fromCharCode(97 + i)}`, // 'a', 'b', 'c'
+   686→        label: strategy.label,
+   687→        subject: variantSubject,
+   688→        preheader: variantPreheader,
+   689→        bodyHtml: variantBodyHtml,
+   690→        bodyText: variantBodyText,
+   691→        hypothesis: strategy.hypothesis,
+   692→      });
+   693→    }
+   694→
+   695→    return variants;
+   696→  }
+   697→
+   698→  private generateVariantSubject(originalSubject: string, angle: string, purpose: string): string {
+   699→    // Extract the core topic from the original subject by stripping merge fields
+   700→    const core = originalSubject.replace(/\{\{[^}]+\}\}/g, '').replace(/\s+/g, ' ').trim();
+   701→
+   702→    switch (angle) {
+   703→      case 'direct':
+   704→        return core.length <= 40 ? core : core.slice(0, 37) + '...';
+   705→      case 'curiosity': {
+   706→        const curiosityPrefixes: Record<string, string> = {
+   707→          'sales': 'Why leading teams choose',
+   708→          'newsletter': 'What everyone\'s saying about',
+   709→          'follow-up': 'Still thinking about',
+   710→          'announcement': 'Something big is coming for',
+   711→          'invitation': 'You won\'t want to miss',
+   712→          'cold-outreach': 'Could this work for',
+   713→          'reminder': 'Last call for',
+   714→          'support': 'We heard you about',
+   715→        };
+   716→        const prefix = curiosityPrefixes[purpose] ?? 'Have you seen';
+   717→        const subject = `${prefix} ${core.toLowerCase().replace(/^(update|re:|following up on|reminder:?)\s*/i, '')}`.trim();
+   718→        return subject.length <= 50 ? subject : subject.slice(0, 47) + '...';
+   719→      }
+   720→      case 'benefit': {
+   721→        const benefitPrefixes: Record<string, string> = {
+   722→          'sales': 'Get results with',
+   723→          'newsletter': 'Stay ahead with',
+   724→          'follow-up': 'Next steps for',
+   725→          'announcement': 'Unlock new potential with',
+   726→          'invitation': 'Accelerate your goals at',
+   727→          'cold-outreach': 'Proven results for',
+   728→          'reminder': 'Don\'t miss out on',
+   729→          'support': 'Your solution for',
+   730→        };
+   731→        const prefix = benefitPrefixes[purpose] ?? 'Discover';
+   732→        const subject = `${prefix} ${core.toLowerCase().replace(/^(update|re:|following up on|reminder:?)\s*/i, '')}`.trim();
+   733→        return subject.length <= 50 ? subject : subject.slice(0, 47) + '...';
+   734→      }
+   735→      default:
+   736→        return originalSubject;
+   737→    }
+   738→  }
+   739→
+   740→  private generateVariantPreheader(originalPreheader: string, angle: string): string {
+   741→    const base = originalPreheader.replace(/\.\.\.$/, '').trim();
+   742→
+   743→    switch (angle) {
+   744→      case 'concise':
+   745→        return base.length > 60 ? base.slice(0, 57) + '...' : base;
+   746→      case 'narrative':
+   747→        return `Here's a story about ${base.charAt(0).toLowerCase() + base.slice(1)}`.slice(0, 90);
+   748→      case 'value':
+   749→        return `See the measurable impact — ${base.charAt(0).toLowerCase() + base.slice(1)}`.slice(0, 90);
+   750→      default:
+   751→        return originalPreheader;
+   752→    }
+   753→  }
+   754→
+   755→  private generateVariantHtml(originalHtml: string, angle: string, label: string): string {
+   756→    // Inject a variant badge into the HTML body for identification
+   757→    const badgeStyle = 'display:inline-block;padding:4px 12px;font-family:Arial,Helvetica,sans-serif;font-size:11px;font-weight:bold;color:#EC4899;background-color:#FDF2F8;border-radius:4px;margin-bottom:16px;';
+   758→    const badge = `<div style="${badgeStyle}">${this.escapeHtml(label)}</div>`;
+   759→
+   760→    // Insert the badge right after the greeting paragraph
+   761→    let modified = originalHtml;
+   762→
+   763→    switch (angle) {
+   764→      case 'concise': {
+   765→        // For the concise variant, add badge and shorten content hint
+   766→        modified = modified.replace(
+   767→          /(<td style="padding:30px 40px 10px 40px[^"]*"[^>]*>)/,
+   768→          `$1\n              ${badge}\n              `,
+   769→        );
+   770→        break;
+   771→      }
+   772→      case 'narrative': {
+   773→        // For the narrative variant, add badge and a storytelling note
+   774→        const storyNote = `<p style="margin:0 0 8px 0;font-style:italic;color:#6b7280;font-family:Arial,Helvetica,sans-serif;font-size:14px;">This version tells a story — because people connect with narratives, not just information.</p>`;
+   775→        modified = modified.replace(
+   776→          /(<td style="padding:30px 40px 10px 40px[^"]*"[^>]*>)/,
+   777→          `$1\n              ${badge}\n              ${storyNote}\n              `,
+   778→        );
+   779→        break;
+   780→      }
+   781→      case 'value': {
+   782→        // For the value-focused variant, add badge and a benefits framing
+   783→        const valueNote = `<p style="margin:0 0 8px 0;font-weight:bold;color:#EC4899;font-family:Arial,Helvetica,sans-serif;font-size:14px;">Key benefits at a glance:</p>`;
+   784→        modified = modified.replace(
+   785→          /(<td style="padding:30px 40px 10px 40px[^"]*"[^>]*>)/,
+   786→          `$1\n              ${badge}\n              ${valueNote}\n              `,
+   787→        );
+   788→        break;
+   789→      }
+   790→    }
+   791→
+   792→    return modified;
+   793→  }
+   794→
+   795→  // ─── Helper: Compliance Checks ─────────────────────────
+   796→
+   797→  /**
+   798→   * Run CAN-SPAM compliance checks on the email output.
+   799→   * Returns an array of check results with pass/fail status.
+   800→   */
+   801→  checkCompliance(output: EmailOutput): ComplianceCheck[] {
+   802→    const checks: ComplianceCheck[] = [];
+   803→
+   804→    for (const rule of CAN_SPAM_RULES) {
+   805→      const passed = rule.check(output.bodyHtml, output.bodyText, output.subject);
+   806→      checks.push({
+   807→        rule: rule.rule,
+   808→        passed,
+   809→        message: passed
+   810→          ? this.getCompliancePassMessage(rule.rule)
+   811→          : this.getComplianceFailMessage(rule.rule),
+   812→      });
+   813→    }
+   814→
+   815→    // Also check all variants
+   816→    for (const variant of output.variants) {
+   817→      for (const rule of CAN_SPAM_RULES) {
+   818→        const passed = rule.check(variant.bodyHtml, variant.bodyText, variant.subject);
+   819→        if (!passed) {
+   820→          checks.push({
+   821→            rule: `${rule.rule}_variant_${variant.id}`,
+   822→            passed: false,
+   823→            message: `Variant ${variant.id} (${variant.label}) fails: ${this.getComplianceFailMessage(rule.rule)}`,
+   824→          });
+   825→        }
+   826→      }
+   827→    }
+   828→
+   829→    return checks;
+   830→  }
+   831→
+   832→  private getCompliancePassMessage(rule: string): string {
+   833→    const messages: Record<string, string> = {
+   834→      'has_unsubscribe': 'Unsubscribe link is present.',
+   835→      'has_physical_address': 'Physical address placeholder is included.',
+   836→      'no_deceptive_subject': 'Subject line is not deceptive (no fake Re:/Fwd:).',
+   837→      'has_sender_identity': 'Sender identity is clearly stated.',
+   838→      'subject_under_50_chars': 'Subject line is under 50 characters for optimal display.',
+   839→      'no_spam_trigger_words': 'No common spam trigger words detected in subject.',
+   840→    };
+   841→    return messages[rule] ?? 'Check passed.';
+   842→  }
+   843→
+   844→  private getComplianceFailMessage(rule: string): string {
+   845→    const messages: Record<string, string> = {
+   846→      'has_unsubscribe': 'Missing unsubscribe link. CAN-SPAM requires a clear way to opt out.',
+   847→      'has_physical_address': 'Missing physical address. CAN-SPAM requires a valid physical postal address.',
+   848→      'no_deceptive_subject': 'Subject line appears deceptive (fake Re: or Fwd:). This violates CAN-SPAM.',
+   849→      'has_sender_identity': 'Missing sender identity. Recipients should know who the email is from.',
+   850→      'subject_under_50_chars': 'Subject line exceeds 50 characters. May be truncated in email clients.',
+   851→      'no_spam_trigger_words': 'Spam trigger words detected in subject line. This may affect deliverability.',
+   852→    };
+   853→    return messages[rule] ?? 'Check failed.';
+   854→  }
+   855→
+   856→  // ─── Helper: Merge Field Extraction ────────────────────
+   857→
+   858→  /**
+   859→   * Find all {{field}} placeholders in the HTML and text bodies
+   860→   * and return them as MergeField definitions with defaults.
+   861→   */
+   862→  extractMergeFields(bodyHtml: string, bodyText: string): MergeField[] {
+   863→    const fieldPattern = /\{\{(\w+)\}\}/g;
+   864→    const foundFields = new Set<string>();
+   865→    let match: RegExpExecArray | null;
+   866→
+   867→    // Scan HTML body
+   868→    while ((match = fieldPattern.exec(bodyHtml)) !== null) {
+   869→      foundFields.add(match[1]);
+   870→    }
+   871→
+   872→    // Scan plain text body
+   873→    fieldPattern.lastIndex = 0;
+   874→    while ((match = fieldPattern.exec(bodyText)) !== null) {
+   875→      foundFields.add(match[1]);
+   876→    }
+   877→
+   878→    // Map to MergeField with defaults and descriptions
+   879→    const knownFields: Record<string, { defaultValue: string; description: string }> = {
+   880→      'firstName':        { defaultValue: 'Friend', description: 'Recipient\'s first name' },
+   881→      'lastName':         { defaultValue: '', description: 'Recipient\'s last name' },
+   882→      'companyName':      { defaultValue: 'your company', description: 'Recipient\'s company name' },
+   883→      'senderName':       { defaultValue: 'Our Team', description: 'Name of the email sender' },
+   884→      'physicalAddress':  { defaultValue: '123 Main St, City, State 00000', description: 'Physical mailing address (CAN-SPAM requirement)' },
+   885→      'unsubscribeUrl':   { defaultValue: '#unsubscribe', description: 'URL for unsubscribe action' },
+   886→      'preferencesUrl':   { defaultValue: '#preferences', description: 'URL for email preferences center' },
+   887→      'ctaUrl':           { defaultValue: '#cta', description: 'URL for the primary call-to-action button' },
+   888→      'lastPurchase':     { defaultValue: 'your recent order', description: 'Name or description of last purchase' },
+   889→      'productName':      { defaultValue: 'our product', description: 'Name of the product being referenced' },
+   890→      'eventDate':        { defaultValue: 'TBD', description: 'Date of the referenced event' },
+   891→      'eventLocation':    { defaultValue: 'Online', description: 'Location of the referenced event' },
+   892→      'discountCode':     { defaultValue: 'SAVE20', description: 'Promotional discount code' },
+   893→      'expirationDate':   { defaultValue: 'soon', description: 'Offer expiration date' },
+   894→    };
+   895→
+   896→    const mergeFields: MergeField[] = [];
+   897→
+   898→    const fieldList = Array.from(foundFields);
+   899→    for (const field of fieldList) {
+   900→      const known = knownFields[field];
+   901→      mergeFields.push({
+   902→        name: field,
+   903→        defaultValue: known?.defaultValue ?? `[${field}]`,
+   904→        description: known?.description ?? `Custom merge field: ${field}`,
+   905→      });
+   906→    }
+   907→
+   908→    // Ensure required compliance fields are always present
+   909→    const requiredFields = ['unsubscribeUrl', 'preferencesUrl', 'physicalAddress', 'senderName', 'companyName'];
+   910→    for (const required of requiredFields) {
+   911→      if (!foundFields.has(required)) {
+   912→        const known = knownFields[required];
+   913→        mergeFields.push({
+   914→          name: required,
+   915→          defaultValue: known?.defaultValue ?? `[${required}]`,
+   916→          description: known?.description ?? `Required field: ${required}`,
+   917→        });
+   918→      }
+   919→    }
+   920→
+   921→    return mergeFields;
+   922→  }
+   923→
+   924→  // ─── Helper: Greeting & Closing ────────────────────────
+   925→
+   926→  private getGreeting(tone: string): string {
+   927→    const greetings: Record<string, string> = {
+   928→      'formal':       'Dear {{firstName}},',
+   929→      'friendly':     'Hey {{firstName}}!',
+   930→      'urgent':       '{{firstName}} — important update:',
+   931→      'casual':       'Hi {{firstName}},',
+   932→      'professional': 'Hello {{firstName}},',
+   933→    };
+   934→    return greetings[tone] ?? greetings['professional'];
+   935→  }
+   936→
+   937→  private getClosing(tone: string): string {
+   938→    const closings: Record<string, string> = {
+   939→      'formal':       'Respectfully,\n{{senderName}}',
+   940→      'friendly':     'Cheers,\n{{senderName}}',
+   941→      'urgent':       'Act now,\n{{senderName}}',
+   942→      'casual':       'Thanks,\n{{senderName}}',
+   943→      'professional': 'Best regards,\n{{senderName}}',
+   944→    };
+   945→    return closings[tone] ?? closings['professional'];
+   946→  }
+   947→
+   948→  private getCta(purpose: string, _topic: string): { label: string } {
+   949→    const ctas: Record<string, { label: string }> = {
+   950→      'sales':          { label: 'Learn More' },
+   951→      'newsletter':     { label: 'Read Full Update' },
+   952→      'follow-up':      { label: 'Reply Now' },
+   953→      'announcement':   { label: 'See What\'s New' },
+   954→      'support':        { label: 'View Details' },
+   955→      'invitation':     { label: 'RSVP Now' },
+   956→      'reminder':       { label: 'Take Action' },
+   957→      'cold-outreach':  { label: 'Book a Call' },
+   958→    };
+   959→    return ctas[purpose] ?? ctas['announcement'];
+   960→  }
+   961→
+   962→  // ─── Helper: Topic Extraction ──────────────────────────
+   963→
+   964→  private extractTopic(prompt: string): string {
+   965→    const prefixes = [
+   966→      /^(?:write|compose|draft|create|generate|send)\s+(?:a\s+)?(?:sales|newsletter|follow[\s-]?up|announcement|support|invitation|reminder|cold[\s-]?outreach)?\s*(?:email|message|campaign)?\s*(?:about|for|to|regarding|on)\s+/i,
+   967→      /^(?:write|compose|draft|create|generate|send)\s+(?:a\s+)?/i,
+   968→    ];
+   969→
+   970→    let topic = prompt.trim();
+   971→    for (const prefix of prefixes) {
+   972→      topic = topic.replace(prefix, '');
+   973→    }
+   974→
+   975→    // Truncate to first sentence or 100 characters whichever is shorter
+   976→    const firstSentence = topic.match(/^[^.!?\n]+/);
+   977→    if (firstSentence) {
+   978→      topic = firstSentence[0].trim();
+   979→    }
+   980→
+   981→    return topic.length > 100 ? topic.slice(0, 97) + '...' : topic;
+   982→  }
+   983→
+   984→  // ─── Helper: Word Counting ─────────────────────────────
+   985→
+   986→  private countWords(text: string): number {
+   987→    return text.split(/\s+/).filter(w => w.length > 0).length;
+   988→  }
+   989→
+   990→  // ─── Quality Scoring Helpers ───────────────────────────
+   991→
+   992→  private scoreClarity(output: EmailOutput, suggestions: string[]): number {
+   993→    let score = 1.0;
+   994→
+   995→    // Subject should be present and clear
+   996→    if (!output.subject || output.subject.trim().length === 0) {
+   997→      score -= 0.4;
+   998→      suggestions.push('Email subject line is empty. A clear subject is essential.');
+   999→    }
+  1000→
+  1001→    // Subject should not be too long (over 50 chars risks truncation)
+  1002→    if (output.subject.length > 50) {
+  1003→      score -= 0.15;
+  1004→      suggestions.push(`Subject line is ${output.subject.length} characters. Keep it under 50 for optimal display.`);
+  1005→    }
+  1006→
+  1007→    // Preheader should be present
+  1008→    if (!output.preheader || output.preheader.trim().length === 0) {
+  1009→      score -= 0.2;
+  1010→      suggestions.push('Preheader text is empty. This preview text impacts open rates.');
+  1011→    }
+  1012→
+  1013→    // Body should have sufficient content (at least 20 words)
+  1014→    const wordCount = this.countWords(output.bodyText);
+  1015→    if (wordCount < 20) {
+  1016→      score -= 0.3;
+  1017→      suggestions.push(`Email body has only ${wordCount} words. Consider adding more content.`);
+  1018→    }
+  1019→
+  1020→    // Body should not be excessively long (over 500 words for most emails)
+  1021→    if (wordCount > 500) {
+  1022→      score -= 0.1;
+  1023→      suggestions.push(`Email body has ${wordCount} words. Consider shortening for better engagement.`);
+  1024→    }
+  1025→
+  1026→    return Math.max(0, Math.min(1, score));
+  1027→  }
+  1028→
+  1029→  private scorePersuasion(output: EmailOutput, suggestions: string[]): number {
+  1030→    let score = 0.4; // Base score for having a structured email
+  1031→
+  1032→    const bodyLower = output.bodyHtml.toLowerCase();
+  1033→
+  1034→    // Check for CTA presence
+  1035→    const ctaPatterns = [
+  1036→      /click\s+here/i, /learn\s+more/i, /get\s+started/i, /sign\s+up/i,
+  1037→      /register/i, /rsvp/i, /book\s+a\s+call/i, /reply/i,
+  1038→      /take\s+action/i, /shop\s+now/i, /claim\s+your/i, /discover/i,
+  1039→    ];
+  1040→    const hasCta = ctaPatterns.some(pattern => pattern.test(bodyLower));
+  1041→    if (hasCta) {
+  1042→      score += 0.3;
+  1043→    } else {
+  1044→      suggestions.push('No clear call-to-action detected. Add a CTA button or link to drive action.');
+  1045→    }
+  1046→
+  1047→    // Check for value proposition language
+  1048→    const valuePatterns = [
+  1049→      /benefit/i, /result/i, /improve/i, /save/i, /increase/i,
+  1050→      /grow/i, /transform/i, /discover/i, /unlock/i, /achieve/i,
+  1051→    ];
+  1052→    const hasValueProp = valuePatterns.some(pattern => pattern.test(bodyLower));
+  1053→    if (hasValueProp) {
+  1054→      score += 0.2;
+  1055→    } else {
+  1056→      suggestions.push('No clear value proposition detected. Explain what the recipient gains.');
+  1057→    }
+  1058→
+  1059→    // Check for urgency or relevance signals
+  1060→    const urgencyPatterns = [
+  1061→      /today/i, /now/i, /limited/i, /deadline/i, /don'?t\s+miss/i, /exclusive/i,
+  1062→    ];
+  1063→    const hasUrgency = urgencyPatterns.some(pattern => pattern.test(bodyLower));
+  1064→    if (hasUrgency) {
+  1065→      score += 0.1;
+  1066→    }
+  1067→
+  1068→    return Math.max(0, Math.min(1, score));
+  1069→  }
+  1070→
+  1071→  private scoreToneMatch(output: EmailOutput, suggestions: string[]): number {
+  1072→    let score = 1.0;
+  1073→    const declaredTone = output.metadata.tone;
+  1074→
+  1075→    const toneSignals: Record<string, { present: RegExp[]; absent: RegExp[] }> = {
+  1076→      'formal': {
+  1077→        present: [/dear\s+/i, /respectfully/i, /sincerely/i, /regards/i],
+  1078→        absent: [/hey/i, /cheers/i, /lol/i, /btw/i],
+  1079→      },
+  1080→      'friendly': {
+  1081→        present: [/hey/i, /hi/i, /cheers/i, /hope\s+you/i, /excited/i],
+  1082→        absent: [/pursuant/i, /hereby/i, /notwithstanding/i],
+  1083→      },
+  1084→      'urgent': {
+  1085→        present: [/urgent/i, /immediately/i, /asap/i, /act\s+now/i, /time[\s-]sensitive/i],
+  1086→        absent: [/whenever/i, /at\s+your\s+convenience/i, /no\s+rush/i],
+  1087→      },
+  1088→      'casual': {
+  1089→        present: [/hi\s+/i, /hey/i, /thanks/i, /btw/i, /quick/i],
+  1090→        absent: [/dear\s+/i, /pursuant/i, /hereby/i, /regards/i],
+  1091→      },
+  1092→      'professional': {
+  1093→        present: [/hello/i, /best\s+regards/i, /please/i, /thank\s+you/i],
+  1094→        absent: [/hey/i, /lol/i, /omg/i, /btw/i],
+  1095→      },
+  1096→    };
+  1097→
+  1098→    const signals = toneSignals[declaredTone];
+  1099→    if (!signals) {
+  1100→      // Unknown tone — give a moderate score
+  1101→      return 0.6;
+  1102→    }
+  1103→
+  1104→    const bodyText = output.bodyText;
+  1105→
+  1106→    // Check for expected tone signals
+  1107→    let presentCount = 0;
+  1108→    for (const pattern of signals.present) {
+  1109→      if (pattern.test(bodyText)) presentCount++;
+  1110→    }
+  1111→    const presenceRatio = signals.present.length > 0 ? presentCount / signals.present.length : 0;
+  1112→    if (presenceRatio < 0.25) {
+  1113→      score -= 0.2;
+  1114→      suggestions.push(`Email tone is declared as "${declaredTone}" but few ${declaredTone} language signals are present.`);
+  1115→    }
+  1116→
+  1117→    // Check for tone-inappropriate signals
+  1118→    let absentViolations = 0;
+  1119→    for (const pattern of signals.absent) {
+  1120→      if (pattern.test(bodyText)) absentViolations++;
+  1121→    }
+  1122→    if (absentViolations > 0) {
+  1123→      score -= 0.15 * absentViolations;
+  1124→      suggestions.push(`Some language in the email conflicts with the "${declaredTone}" tone.`);
+  1125→    }
+  1126→
+  1127→    // Check consistency between subject and body
+  1128→    const subjectTone = this.detectTone(output.subject);
+  1129→    if (subjectTone !== declaredTone && declaredTone !== 'professional') {
+  1130→      score -= 0.1;
+  1131→      suggestions.push(`Subject tone (${subjectTone}) doesn't match the declared body tone (${declaredTone}).`);
+  1132→    }
+  1133→
+  1134→    return Math.max(0, Math.min(1, score));
+  1135→  }
+  1136→
+  1137→  private scoreActionability(output: EmailOutput, suggestions: string[]): number {
+  1138→    let score = 0.3; // Base score
+  1139→
+  1140→    const bodyLower = output.bodyHtml.toLowerCase();
+  1141→
+  1142→    // Check for explicit CTA button/link
+  1143→    const hasCtaButton = /href=.*cta/i.test(output.bodyHtml) || /background-color.*>.*<\/a>/i.test(output.bodyHtml);
+  1144→    if (hasCtaButton) {
+  1145→      score += 0.3;
+  1146→    } else {
+  1147→      suggestions.push('No visible CTA button found. A prominent CTA drives action.');
+  1148→    }
+  1149→
+  1150→    // Check for specific next steps language
+  1151→    const nextStepsPatterns = [
+  1152→      /click\s+(here|the\s+button|below)/i,
+  1153→      /reply\s+to\s+this/i,
+  1154→      /book\s+a\s+call/i,
+  1155→      /schedule/i,
+  1156→      /register/i,
+  1157→      /sign\s+up/i,
+  1158→      /reserve/i,
+  1159→      /claim/i,
+  1160→      /download/i,
+  1161→    ];
+  1162→    const hasNextSteps = nextStepsPatterns.some(pattern => pattern.test(bodyLower));
+  1163→    if (hasNextSteps) {
+  1164→      score += 0.25;
+  1165→    } else {
+  1166→      suggestions.push('No clear next steps for the recipient. Add specific instructions on what to do.');
+  1167→    }
+  1168→
+  1169→    // Check for deadline or urgency
+  1170→    const hasDeadline = /by\s+\w+\s+\d/i.test(bodyLower) || /deadline/i.test(bodyLower) || /expires/i.test(bodyLower) || /until/i.test(bodyLower);
+  1171→    if (hasDeadline) {
+  1172→      score += 0.15;
+  1173→    }
+  1174→
+  1175→    return Math.max(0, Math.min(1, score));
+  1176→  }
+  1177→
+  1178→  private scoreConciseness(output: EmailOutput, suggestions: string[]): number {
+  1179→    const wordCount = this.countWords(output.bodyText);
+  1180→
+  1181→    // Ideal email length: 50–200 words (sweet spot for engagement)
+  1182→    // Acceptable: 30–300
+  1183→    if (wordCount < 30) {
+  1184→      suggestions.push(`Email is very short (${wordCount} words). May lack sufficient context.`);
+  1185→      return 0.4;
+  1186→    }
+  1187→
+  1188→    if (wordCount >= 50 && wordCount <= 200) {
+  1189→      return 1.0; // Ideal range
+  1190→    }
+  1191→
+  1192→    if (wordCount >= 30 && wordCount < 50) {
+  1193→      const score = 0.6 + 0.4 * ((wordCount - 30) / 20);
+  1194→      suggestions.push('Email is slightly short. Consider adding a bit more detail.');
+  1195→      return Math.min(1, score);
+  1196→    }
+  1197→
+  1198→    if (wordCount > 200 && wordCount <= 300) {
+  1199→      const score = 0.6 + 0.4 * ((300 - wordCount) / 100);
+  1200→      suggestions.push('Email is on the longer side. Consider trimming for better engagement.');
+  1201→      return Math.max(0, score);
+  1202→    }
+  1203→
+  1204→    if (wordCount > 300) {
+  1205→      suggestions.push(`Email is very long (${wordCount} words). Most effective emails are 50–200 words.`);
+  1206→      return Math.max(0, 0.5 - (wordCount - 300) / 1000);
+  1207→    }
+  1208→
+  1209→    return 0.5;
+  1210→  }
+  1211→
+  1212→  // ─── Utility ───────────────────────────────────────────
+  1213→
+  1214→  private paragraphsToHtml(plainText: string): string {
+  1215→    const paragraphs = plainText.split(/\n\n+/).filter(p => p.trim().length > 0);
+  1216→    return paragraphs.map(p => `<p style="margin:0 0 16px 0;">${this.escapeHtml(p.trim())}</p>`).join('\n              ');
+  1217→  }
+  1218→
+  1219→  private escapeHtml(text: string): string {
+  1220→    return text
+  1221→      .replace(/&/g, '&amp;')
+  1222→      .replace(/</g, '&lt;')
+  1223→      .replace(/>/g, '&gt;')
+  1224→      .replace(/"/g, '&quot;')
+  1225→      .replace(/'/g, '&#039;');
+  1226→  }
+  1227→}
+  1228→

@@ -1,0 +1,902 @@
+     1→// ============================================================
+     2→// AgentForge - API Client
+     3→// REST + SSE streaming for real-time execution updates
+     4→// Complete API coverage for all backend endpoints
+     5→// ============================================================
+     6→
+     7→import { useAuthStore } from './authStore';
+     8→
+     9→const API_BASE = '/api/v1';
+    10→
+    11→// ============================================================
+    12→// Token Refresh Interceptor
+    13→// ============================================================
+    14→
+    15→let refreshPromise: Promise<boolean> | null = null;
+    16→
+    17→async function refreshTokenIfNeeded(): Promise<boolean> {
+    18→  if (refreshPromise) return refreshPromise;
+    19→
+    20→  refreshPromise = (async () => {
+    21→    try {
+    22→      const { refreshToken } = useAuthStore.getState();
+    23→      if (!refreshToken) return false;
+    24→
+    25→      // Use a direct fetch (not the request() function) to avoid infinite loop
+    26→      const response = await fetch(`${API_BASE}/auth/refresh`, {
+    27→        method: 'POST',
+    28→        headers: { 'Content-Type': 'application/json' },
+    29→        body: JSON.stringify({ refreshToken }),
+    30→      });
+    31→
+    32→      if (!response.ok) return false;
+    33→
+    34→      const result = await response.json();
+    35→      useAuthStore.getState().setTokens(result.data.accessToken, result.data.refreshToken);
+    36→      return true;
+    37→    } catch {
+    38→      return false;
+    39→    } finally {
+    40→      refreshPromise = null;
+    41→    }
+    42→  })();
+    43→
+    44→  return refreshPromise;
+    45→}
+    46→
+    47→async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
+    48→  const token = useAuthStore.getState().token;
+    49→
+    50→  const headers: Record<string, string> = {
+    51→    'Content-Type': 'application/json',
+    52→    ...(options.headers as Record<string, string>),
+    53→  };
+    54→
+    55→  if (token) {
+    56→    headers['Authorization'] = `Bearer ${token}`;
+    57→  }
+    58→
+    59→  const response = await fetch(`${API_BASE}${path}`, {
+    60→    ...options,
+    61→    headers,
+    62→  });
+    63→
+    64→  if (!response.ok) {
+    65→    if (response.status === 401) {
+    66→      const refreshed = await refreshTokenIfNeeded();
+    67→      if (refreshed) {
+    68→        // Retry with new token
+    69→        const newToken = useAuthStore.getState().token;
+    70→        headers['Authorization'] = `Bearer ${newToken}`;
+    71→        const retryResponse = await fetch(`${API_BASE}${path}`, { ...options, headers });
+    72→        if (retryResponse.ok) return retryResponse.json();
+    73→      }
+    74→      // Refresh failed — logout
+    75→      useAuthStore.getState().logout();
+    76→      window.location.href = '/login';
+    77→      throw new Error('Session expired');
+    78→    }
+    79→
+    80→    const error = await response.json().catch(() => ({ error: 'Request failed' }));
+    81→    throw new Error(error.error || `HTTP ${response.status}`);
+    82→  }
+    83→
+    84→  return response.json();
+    85→}
+    86→
+    87→// ============================================================
+    88→// Type Definitions
+    89→// ============================================================
+    90→
+    91→// --- Auth Types ---
+    92→export interface MFASetupResponse {
+    93→  success: boolean;
+    94→  data: { secret: string; qrCodeUrl: string };
+    95→}
+    96→
+    97→export interface MFAVerifyBody {
+    98→  code: string;
+    99→}
+   100→
+   101→export interface TokenRefreshBody {
+   102→  refreshToken: string;
+   103→}
+   104→
+   105→export interface TokenRefreshResponse {
+   106→  success: boolean;
+   107→  data: { accessToken: string; refreshToken: string };
+   108→}
+   109→
+   110→// --- Tenant Types ---
+   111→export interface Tenant {
+   112→  id: string;
+   113→  name: string;
+   114→  slug: string;
+   115→  plan: 'free' | 'starter' | 'pro' | 'enterprise';
+   116→  status: 'active' | 'inactive' | 'suspended';
+   117→  branding?: Record<string, any>;
+   118→  quotas?: Record<string, number>;
+   119→  memberCount?: number;
+   120→  createdAt: string;
+   121→  updatedAt: string;
+   122→}
+   123→
+   124→export interface CreateTenantBody {
+   125→  name: string;
+   126→  slug: string;
+   127→  plan?: 'free' | 'starter' | 'pro' | 'enterprise';
+   128→}
+   129→
+   130→export interface UpdateTenantBody {
+   131→  name?: string;
+   132→  plan?: 'free' | 'starter' | 'pro' | 'enterprise';
+   133→  status?: 'active' | 'inactive' | 'suspended';
+   134→  branding?: Record<string, any>;
+   135→  quotas?: Record<string, number>;
+   136→}
+   137→
+   138→export interface TenantMember {
+   139→  userId: string;
+   140→  name: string;
+   141→  email: string;
+   142→  role: 'owner' | 'admin' | 'member' | 'viewer';
+   143→  joinedAt: string;
+   144→}
+   145→
+   146→export interface AddMemberBody {
+   147→  userId: string;
+   148→  role: 'owner' | 'admin' | 'member' | 'viewer';
+   149→}
+   150→
+   151→export interface UpdateMemberRoleBody {
+   152→  role: 'owner' | 'admin' | 'member' | 'viewer';
+   153→}
+   154→
+   155→export interface TenantBilling {
+   156→  plan: string;
+   157→  currentPeriodStart: string;
+   158→  currentPeriodEnd: string;
+   159→  usage: Record<string, number>;
+   160→  costs: Record<string, number>;
+   161→  totalCost: number;
+   162→}
+   163→
+   164→export interface TenantQuotas {
+   165→  limits: Record<string, number>;
+   166→  usage: Record<string, number>;
+   167→}
+   168→
+   169→export interface CheckQuotaBody {
+   170→  resource: string;
+   171→  amount: number;
+   172→}
+   173→
+   174→export interface CheckQuotaResponse {
+   175→  allowed: boolean;
+   176→  remaining: number;
+   177→  limit: number;
+   178→}
+   179→
+   180→// --- Deployment Types ---
+   181→export interface Deployment {
+   182→  id: string;
+   183→  projectId: string;
+   184→  projectName?: string;
+   185→  strategy: 'blue-green' | 'canary' | 'rolling';
+   186→  status: 'pending' | 'deploying' | 'active' | 'failed' | 'rolled_back';
+   187→  config: Record<string, any>;
+   188→  createdAt: string;
+   189→  updatedAt: string;
+   190→}
+   191→
+   192→export interface CreateDeploymentBody {
+   193→  projectId: string;
+   194→  strategy: 'blue-green' | 'canary' | 'rolling';
+   195→  config: Record<string, any>;
+   196→}
+   197→
+   198→export interface PromoteDeploymentBody {
+   199→  target: string;
+   200→}
+   201→
+   202→export interface DeploymentStatus {
+   203→  id: string;
+   204→  status: string;
+   205→  progress: number;
+   206→  stages: DeploymentStage[];
+   207→}
+   208→
+   209→export interface DeploymentStage {
+   210→  name: string;
+   211→  status: 'pending' | 'running' | 'completed' | 'failed';
+   212→  startedAt?: string;
+   213→  completedAt?: string;
+   214→}
+   215→
+   216→export interface DeploymentHistoryEntry {
+   217→  id: string;
+   218→  action: string;
+   219→  timestamp: string;
+   220→  userId: string;
+   221→  details: Record<string, any>;
+   222→}
+   223→
+   224→// --- Admin Types ---
+   225→export interface AdminStats {
+   226→  users: { total: number; active: number; new: number };
+   227→  executions: { total: number; today: number; successRate: number };
+   228→  costs: { total: number; today: number; byProvider: Record<string, number> };
+   229→  uptime: number;
+   230→  agentCount: number;
+   231→  projectCount: number;
+   232→}
+   233→
+   234→export interface AdminUser {
+   235→  id: string;
+   236→  name: string;
+   237→  email: string;
+   238→  tier: 'free' | 'starter' | 'pro' | 'enterprise';
+   239→  role: 'user' | 'admin' | 'superadmin';
+   240→  status: 'active' | 'inactive' | 'suspended';
+   241→  createdAt: string;
+   242→  lastLogin?: string;
+   243→}
+   244→
+   245→export interface UpdateUserBody {
+   246→  tier?: 'free' | 'starter' | 'pro' | 'enterprise';
+   247→  role?: 'user' | 'admin' | 'superadmin';
+   248→  status?: 'active' | 'inactive' | 'suspended';
+   249→}
+   250→
+   251→export interface ProviderInfo {
+   252→  id: string;
+   253→  name: string;
+   254→  type: string;
+   255→  status: 'healthy' | 'degraded' | 'down';
+   256→  latency: number;
+   257→  models: string[];
+   258→}
+   259→
+   260→export interface ProviderHealth {
+   261→  id: string;
+   262→  name: string;
+   263→  status: 'healthy' | 'degraded' | 'down';
+   264→  latency: number;
+   265→  uptime: number;
+   266→  errorRate: number;
+   267→  lastChecked: string;
+   268→}
+   269→
+   270→export interface OrchestrationStatus {
+   271→  pipelines: PipelineInfo[];
+   272→  queueLength: number;
+   273→  activeExecutions: number;
+   274→  completedToday: number;
+   275→}
+   276→
+   277→export interface PipelineInfo {
+   278→  id: string;
+   279→  name: string;
+   280→  status: 'running' | 'paused' | 'error';
+   281→  stages: number;
+   282→  currentStage: number;
+   283→}
+   284→
+   285→export interface FinanceData {
+   286→  totalRevenue: number;
+   287→  totalCost: number;
+   288→  profit: number;
+   289→  costByProvider: Record<string, number>;
+   290→  costByDay: Array<{ date: string; cost: number }>;
+   291→  predictions: Array<{ date: string; predicted: number }>;
+   292→}
+   293→
+   294→export interface SecurityEvent {
+   295→  id: string;
+   296→  type: string;
+   297→  severity: 'low' | 'medium' | 'high' | 'critical';
+   298→  description: string;
+   299→  userId?: string;
+   300→  ip?: string;
+   301→  timestamp: string;
+   302→  resolved: boolean;
+   303→}
+   304→
+   305→export interface InfrastructureData {
+   306→  redis: { status: string; memory: number; connections: number; hitRate: number };
+   307→  database: { status: string; connections: number; queries: number; latency: number };
+   308→  cache: { hitRate: number; missRate: number; size: number };
+   309→  jobQueue: { pending: number; active: number; completed: number; failed: number };
+   310→}
+   311→
+   312→export interface MonitoringData {
+   313→  alerts: MonitorAlert[];
+   314→  metrics: Record<string, number>;
+   315→  traces: TraceEntry[];
+   316→}
+   317→
+   318→export interface MonitorAlert {
+   319→  id: string;
+   320→  level: 'info' | 'warning' | 'error' | 'critical';
+   321→  message: string;
+   322→  timestamp: string;
+   323→  acknowledged: boolean;
+   324→}
+   325→
+   326→export interface TraceEntry {
+   327→  id: string;
+   328→  operation: string;
+   329→  duration: number;
+   330→  status: string;
+   331→  timestamp: string;
+   332→}
+   333→
+   334→// --- Writer Types ---
+   335→export interface WriteContentBody {
+   336→  templateId: string;
+   337→  data: Record<string, any>;
+   338→  options?: {
+   339→    enhanceWithLLM?: boolean;
+   340→    qualityScoring?: boolean;
+   341→    refinement?: boolean;
+   342→    maxTokens?: number;
+   343→  };
+   344→}
+   345→
+   346→export interface WriterResult {
+   347→  content: string;
+   348→  qualityScore: number;
+   349→  qualityDimensions: QualityDimensions;
+   350→  suggestions: string[];
+   351→  tokensUsed: number;
+   352→}
+   353→
+   354→export interface QualityDimensions {
+   355→  coherence: number;
+   356→  clarity: number;
+   357→  completeness: number;
+   358→  accuracy: number;
+   359→  relevance: number;
+   360→  readability: number;
+   361→  engagement: number;
+   362→  originality: number;
+   363→}
+   364→
+   365→export interface ScoreQualityBody {
+   366→  content: string;
+   367→  dimensions?: string[];
+   368→}
+   369→
+   370→export interface WriterSession {
+   371→  id: string;
+   372→  templateId: string;
+   373→  status: string;
+   374→  createdAt: string;
+   375→  result?: WriterResult;
+   376→}
+   377→
+   378→export interface ResearchWriteBody {
+   379→  query: string;
+   380→  researchConfig?: { depth?: number; sources?: string[] };
+   381→  writerConfig?: { templateId?: string; enhanceWithLLM?: boolean; qualityScoring?: boolean };
+   382→}
+   383→
+   384→export interface ResearchWriteResult {
+   385→  research: any;
+   386→  content: string;
+   387→  qualityScore: number;
+   388→  qualityDimensions: QualityDimensions;
+   389→}
+   390→
+   391→// --- Research Types ---
+   392→export interface SearchBody {
+   393→  query: string;
+   394→  maxResults?: number;
+   395→}
+   396→
+   397→export interface SearchResult {
+   398→  title: string;
+   399→  snippet: string;
+   400→  source: string;
+   401→  url: string;
+   402→  relevanceScore: number;
+   403→}
+   404→
+   405→export interface StartResearchBody {
+   406→  query: string;
+   407→  depth?: number;
+   408→  sources?: string[];
+   409→}
+   410→
+   411→export interface ResearchSession {
+   412→  id: string;
+   413→  query: string;
+   414→  depth: number;
+   415→  status: 'pending' | 'researching' | 'completed' | 'failed';
+   416→  findings: string[];
+   417→  keyInsights: string[];
+   418→  references: Array<{ title: string; url: string; relevance: number }>;
+   419→  createdAt: string;
+   420→  completedAt?: string;
+   421→}
+   422→
+   423→// --- Analytics & RL Types ---
+   424→export interface RoutingMetrics {
+   425→  totalDecisions: number;
+   426→  byModel: Record<string, number>;
+   427→  byStrategy: Record<string, number>;
+   428→  avgQuality: number;
+   429→  avgLatency: number;
+   430→}
+   431→
+   432→export interface FeedbackStats {
+   433→  totalFeedback: number;
+   434→  avgRating: number;
+   435→  byAgent: Record<string, { count: number; avgRating: number }>;
+   436→}
+   437→
+   438→export interface LearningStatus {
+   439→  isTraining: boolean;
+   440→  lastTrainedAt?: string;
+   441→  dataPoints: number;
+   442→  modelVersion: string;
+   443→  accuracy: number;
+   444→}
+   445→
+   446→export interface Predictions {
+   447→  costPrediction: { next7Days: number; next30Days: number };
+   448→  qualityPrediction: { expectedQuality: number; confidence: number };
+   449→  byAgent: Record<string, { cost: number; quality: number }>;
+   450→}
+   451→
+   452→export interface CostForecast {
+   453→  agentId: string;
+   454→  currentCost: number;
+   455→  projectedCost: number;
+   456→  trend: 'increasing' | 'stable' | 'decreasing';
+   457→  dailyBreakdown: Array<{ date: string; cost: number; predicted: boolean }>;
+   458→}
+   459→
+   460→export interface CostAnomaly {
+   461→  id: string;
+   462→  agentId: string;
+   463→  type: string;
+   464→  severity: 'low' | 'medium' | 'high';
+   465→  expectedCost: number;
+   466→  actualCost: number;
+   467→  deviation: number;
+   468→  detectedAt: string;
+   469→}
+   470→
+   471→// --- Execution Event Types ---
+   472→export interface ExecutionEvent {
+   473→  type: string;
+   474→  executionId: string;
+   475→  agentId: string;
+   476→  data?: any;
+   477→  timestamp: number;
+   478→}
+   479→
+   480→// --- Generic API Response ---
+   481→export interface ApiResponse<T> {
+   482→  success: boolean;
+   483→  data: T;
+   484→}
+   485→
+   486→// ============================================================
+   487→// SSE Streaming
+   488→// ============================================================
+   489→
+   490→/**
+   491→ * Execute an agent with SSE streaming.
+   492→ * Returns an EventSource-like experience with structured events.
+   493→ */
+   494→export function executeAgentStream(
+   495→  agentId: string,
+   496→  prompt: string,
+   497→  projectId?: string,
+   498→  onEvent?: (event: ExecutionEvent) => void,
+   499→  onError?: (error: Error) => void,
+   500→  onComplete?: (result: any) => void
+   501→): { cancel: () => void } {
+   502→  const token = useAuthStore.getState().token;
+   503→  const controller = new AbortController();
+   504→
+   505→  fetch(`${API_BASE}/agents/${agentId}/execute`, {
+   506→    method: 'POST',
+   507→    headers: {
+   508→      'Content-Type': 'application/json',
+   509→      'Authorization': `Bearer ${token}`,
+   510→    },
+   511→    body: JSON.stringify({ prompt, projectId }),
+   512→    signal: controller.signal,
+   513→  })
+   514→    .then(async (response) => {
+   515→      if (!response.ok) {
+   516→        throw new Error(`HTTP ${response.status}`);
+   517→      }
+   518→
+   519→      const reader = response.body?.getReader();
+   520→      if (!reader) throw new Error('No response body');
+   521→
+   522→      const decoder = new TextDecoder();
+   523→      let buffer = '';
+   524→
+   525→      while (true) {
+   526→        const { done, value } = await reader.read();
+   527→        if (done) break;
+   528→
+   529→        buffer += decoder.decode(value, { stream: true });
+   530→
+   531→        const lines = buffer.split('\n');
+   532→        buffer = lines.pop() || '';
+   533→
+   534→        for (const line of lines) {
+   535→          if (line.startsWith('data: ')) {
+   536→            try {
+   537→              const event = JSON.parse(line.substring(6)) as ExecutionEvent;
+   538→              onEvent?.(event);
+   539→
+   540→              if (event.type === 'execution_complete') {
+   541→                onComplete?.(event.data);
+   542→              }
+   543→            } catch {
+   544→              // Skip malformed events
+   545→            }
+   546→          }
+   547→        }
+   548→      }
+   549→    })
+   550→    .catch((error) => {
+   551→      if (error.name !== 'AbortError') {
+   552→        onError?.(error);
+   553→      }
+   554→    });
+   555→
+   556→  return {
+   557→    cancel: () => controller.abort(),
+   558→  };
+   559→}
+   560→
+   561→// ============================================================
+   562→// REST API Client
+   563→// ============================================================
+   564→
+   565→export const api = {
+   566→  // ── Auth ───────────────────────────────────────────────
+   567→  login: (email: string, password: string) =>
+   568→    request<ApiResponse<{ user: any; tokens: any }>>('/auth/login', {
+   569→      method: 'POST',
+   570→      body: JSON.stringify({ email, password }),
+   571→    }),
+   572→
+   573→  register: (name: string, email: string, password: string) =>
+   574→    request<ApiResponse<{ user: any; tokens: any }>>('/auth/register', {
+   575→      method: 'POST',
+   576→      body: JSON.stringify({ name, email, password }),
+   577→    }),
+   578→
+   579→  logout: (refreshToken?: string) =>
+   580→    request<ApiResponse<null>>('/auth/logout', {
+   581→      method: 'POST',
+   582→      body: JSON.stringify({ refreshToken }),
+   583→    }),
+   584→
+   585→  mfaSetup: () =>
+   586→    request<MFASetupResponse>('/auth/mfa/setup', {
+   587→      method: 'POST',
+   588→    }),
+   589→
+   590→  mfaVerify: (code: string) =>
+   591→    request<ApiResponse<null>>('/auth/mfa/verify', {
+   592→      method: 'POST',
+   593→      body: JSON.stringify({ code }),
+   594→    }),
+   595→
+   596→  mfaDisable: (code: string) =>
+   597→    request<ApiResponse<null>>('/auth/mfa/disable', {
+   598→      method: 'POST',
+   599→      body: JSON.stringify({ code }),
+   600→    }),
+   601→
+   602→  refreshToken: (refreshToken: string) =>
+   603→    request<TokenRefreshResponse>('/auth/refresh', {
+   604→      method: 'POST',
+   605→      body: JSON.stringify({ refreshToken }),
+   606→    }),
+   607→
+   608→  // ── Agents ─────────────────────────────────────────────
+   609→  getAgents: () => request<ApiResponse<any[]>>('/agents'),
+   610→  getAgent: (id: string) => request<ApiResponse<any>>(`/agents/${id}`),
+   611→
+   612→  executeAgent: (id: string, prompt: string, projectId?: string) =>
+   613→    request<ApiResponse<any>>(`/agents/${id}/execute-sync`, {
+   614→      method: 'POST',
+   615→      body: JSON.stringify({ prompt, projectId }),
+   616→    }),
+   617→
+   618→  getExecutions: (agentId: string, limit?: number) =>
+   619→    request<ApiResponse<any[]>>(`/agents/${agentId}/executions?limit=${limit || 50}`),
+   620→
+   621→  cancelExecution: (agentId: string, executionId: string) =>
+   622→    request<ApiResponse<null>>(`/agents/${agentId}/cancel/${executionId}`, {
+   623→      method: 'POST',
+   624→    }),
+   625→
+   626→  // ── Projects ───────────────────────────────────────────
+   627→  getProjects: () => request<ApiResponse<any[]>>('/projects'),
+   628→  createProject: (data: any) =>
+   629→    request<ApiResponse<any>>('/projects', {
+   630→      method: 'POST',
+   631→      body: JSON.stringify(data),
+   632→    }),
+   633→  getProject: (id: string) => request<ApiResponse<any>>(`/projects/${id}`),
+   634→  deleteProject: (id: string) =>
+   635→    request<ApiResponse<null>>(`/projects/${id}`, { method: 'DELETE' }),
+   636→
+   637→  // ── Tenants ────────────────────────────────────────────
+   638→  listTenants: () =>
+   639→    request<ApiResponse<Tenant[]>>('/tenants'),
+   640→
+   641→  createTenant: (body: CreateTenantBody) =>
+   642→    request<ApiResponse<Tenant>>('/tenants', {
+   643→      method: 'POST',
+   644→      body: JSON.stringify(body),
+   645→    }),
+   646→
+   647→  getTenant: (id: string) =>
+   648→    request<ApiResponse<Tenant>>(`/tenants/${id}`),
+   649→
+   650→  updateTenant: (id: string, body: UpdateTenantBody) =>
+   651→    request<ApiResponse<Tenant>>(`/tenants/${id}`, {
+   652→      method: 'PUT',
+   653→      body: JSON.stringify(body),
+   654→    }),
+   655→
+   656→  deleteTenant: (id: string) =>
+   657→    request<ApiResponse<null>>(`/tenants/${id}`, { method: 'DELETE' }),
+   658→
+   659→  getMembers: (tenantId: string) =>
+   660→    request<ApiResponse<TenantMember[]>>(`/tenants/${tenantId}/members`),
+   661→
+   662→  addMember: (tenantId: string, body: AddMemberBody) =>
+   663→    request<ApiResponse<TenantMember>>(`/tenants/${tenantId}/members`, {
+   664→      method: 'POST',
+   665→      body: JSON.stringify(body),
+   666→    }),
+   667→
+   668→  removeMember: (tenantId: string, userId: string) =>
+   669→    request<ApiResponse<null>>(`/tenants/${tenantId}/members/${userId}`, {
+   670→      method: 'DELETE',
+   671→    }),
+   672→
+   673→  updateMemberRole: (tenantId: string, userId: string, body: UpdateMemberRoleBody) =>
+   674→    request<ApiResponse<TenantMember>>(`/tenants/${tenantId}/members/${userId}`, {
+   675→      method: 'PUT',
+   676→      body: JSON.stringify(body),
+   677→    }),
+   678→
+   679→  getBilling: (tenantId: string) =>
+   680→    request<ApiResponse<TenantBilling>>(`/tenants/${tenantId}/billing`),
+   681→
+   682→  getQuotas: (tenantId: string) =>
+   683→    request<ApiResponse<TenantQuotas>>(`/tenants/${tenantId}/quotas`),
+   684→
+   685→  checkQuota: (tenantId: string, body: CheckQuotaBody) =>
+   686→    request<ApiResponse<CheckQuotaResponse>>(`/tenants/${tenantId}/quotas/check`, {
+   687→      method: 'POST',
+   688→      body: JSON.stringify(body),
+   689→    }),
+   690→
+   691→  // ── Deployments ────────────────────────────────────────
+   692→  listDeployments: () =>
+   693→    request<ApiResponse<Deployment[]>>('/deployments'),
+   694→
+   695→  createDeployment: (body: CreateDeploymentBody) =>
+   696→    request<ApiResponse<Deployment>>('/deployments', {
+   697→      method: 'POST',
+   698→      body: JSON.stringify(body),
+   699→    }),
+   700→
+   701→  getDeployment: (id: string) =>
+   702→    request<ApiResponse<Deployment>>(`/deployments/${id}`),
+   703→
+   704→  promoteDeployment: (id: string, body: PromoteDeploymentBody) =>
+   705→    request<ApiResponse<Deployment>>(`/deployments/${id}/promote`, {
+   706→      method: 'POST',
+   707→      body: JSON.stringify(body),
+   708→    }),
+   709→
+   710→  rollbackDeployment: (id: string) =>
+   711→    request<ApiResponse<Deployment>>(`/deployments/${id}/rollback`, {
+   712→      method: 'POST',
+   713→    }),
+   714→
+   715→  getDeploymentStatus: (id: string) =>
+   716→    request<ApiResponse<DeploymentStatus>>(`/deployments/${id}/status`),
+   717→
+   718→  getDeploymentHistory: (id: string) =>
+   719→    request<ApiResponse<DeploymentHistoryEntry[]>>(`/deployments/${id}/history`),
+   720→
+   721→  cancelDeployment: (id: string) =>
+   722→    request<ApiResponse<null>>(`/deployments/${id}/cancel`, {
+   723→      method: 'POST',
+   724→    }),
+   725→
+   726→  // ── Admin ──────────────────────────────────────────────
+   727→  getAdminStats: () =>
+   728→    request<ApiResponse<AdminStats>>('/admin/stats'),
+   729→
+   730→  listUsers: () =>
+   731→    request<ApiResponse<AdminUser[]>>('/admin/users'),
+   732→
+   733→  getUser: (id: string) =>
+   734→    request<ApiResponse<AdminUser>>(`/admin/users/${id}`),
+   735→
+   736→  updateUser: (id: string, body: UpdateUserBody) =>
+   737→    request<ApiResponse<AdminUser>>(`/admin/users/${id}`, {
+   738→      method: 'PUT',
+   739→      body: JSON.stringify(body),
+   740→    }),
+   741→
+   742→  deleteUser: (id: string) =>
+   743→    request<ApiResponse<null>>(`/admin/users/${id}`, { method: 'DELETE' }),
+   744→
+   745→  getProviders: () =>
+   746→    request<ApiResponse<ProviderInfo[]>>('/admin/providers'),
+   747→
+   748→  getProviderHealth: (id: string) =>
+   749→    request<ApiResponse<ProviderHealth>>(`/admin/providers/${id}/health`),
+   750→
+   751→  getOrchestration: () =>
+   752→    request<ApiResponse<OrchestrationStatus>>('/admin/orchestration'),
+   753→
+   754→  getFinances: () =>
+   755→    request<ApiResponse<FinanceData>>('/admin/finances'),
+   756→
+   757→  getSecurityEvents: () =>
+   758→    request<ApiResponse<SecurityEvent[]>>('/admin/security'),
+   759→
+   760→  getInfrastructure: () =>
+   761→    request<ApiResponse<InfrastructureData>>('/admin/infrastructure'),
+   762→
+   763→  getMonitoring: () =>
+   764→    request<ApiResponse<MonitoringData>>('/admin/monitoring'),
+   765→
+   766→  // ── Writer ─────────────────────────────────────────────
+   767→  writeContent: (body: WriteContentBody) =>
+   768→    request<ApiResponse<WriterResult>>('/writer/write', {
+   769→      method: 'POST',
+   770→      body: JSON.stringify(body),
+   771→    }),
+   772→
+   773→  listWriterSessions: () =>
+   774→    request<ApiResponse<WriterSession[]>>('/writer/sessions'),
+   775→
+   776→  getWriterSession: (id: string) =>
+   777→    request<ApiResponse<WriterSession>>(`/writer/sessions/${id}`),
+   778→
+   779→  scoreQuality: (body: ScoreQualityBody) =>
+   780→    request<ApiResponse<QualityDimensions>>('/writer/quality', {
+   781→      method: 'POST',
+   782→      body: JSON.stringify(body),
+   783→    }),
+   784→
+   785→  researchWrite: (body: ResearchWriteBody) =>
+   786→    request<ApiResponse<ResearchWriteResult>>('/writer/research-write', {
+   787→      method: 'POST',
+   788→      body: JSON.stringify(body),
+   789→    }),
+   790→
+   791→  getWriterHealth: () =>
+   792→    request<ApiResponse<{ status: string }>>('/writer/health'),
+   793→
+   794→  // ── Research ───────────────────────────────────────────
+   795→  search: (body: SearchBody) =>
+   796→    request<ApiResponse<SearchResult[]>>('/research/search', {
+   797→      method: 'POST',
+   798→      body: JSON.stringify(body),
+   799→    }),
+   800→
+   801→  startResearch: (body: StartResearchBody) =>
+   802→    request<ApiResponse<ResearchSession>>('/research/research', {
+   803→      method: 'POST',
+   804→      body: JSON.stringify(body),
+   805→    }),
+   806→
+   807→  listResearchSessions: () =>
+   808→    request<ApiResponse<ResearchSession[]>>('/research/sessions'),
+   809→
+   810→  getResearchSession: (id: string) =>
+   811→    request<ApiResponse<ResearchSession>>(`/research/sessions/${id}`),
+   812→
+   813→  getResearchHealth: () =>
+   814→    request<ApiResponse<{ status: string }>>('/research/health'),
+   815→
+   816→  // ── Product Agents (Sprint 7) ──────────────────────────
+   817→  executeProductAgent: (agentId: string, prompt: string, options?: { maxIterations?: number; format?: string; context?: Record<string, unknown> }) =>
+   818→    request<ApiResponse<ProductAgentSession>>(`/products/${agentId}/execute`, {
+   819→      method: 'POST',
+   820→      body: JSON.stringify({ prompt, ...options }),
+   821→    }),
+   822→
+   823→  listProductAgentSessions: (agentId: string, limit?: number) =>
+   824→    request<ApiResponse<ProductAgentSessionListItem[]>>(`/products/${agentId}/sessions?limit=${limit || 20}`),
+   825→
+   826→  getProductAgentSession: (agentId: string, sessionId: string) =>
+   827→    request<ApiResponse<ProductAgentSession>>(`/products/${agentId}/sessions/${sessionId}`),
+   828→
+   829→  cancelProductAgentSession: (agentId: string, sessionId: string) =>
+   830→    request<ApiResponse<null>>(`/products/${agentId}/sessions/${sessionId}/cancel`, {
+   831→      method: 'POST',
+   832→    }),
+   833→
+   834→  getProductAgentHealth: (agentId: string) =>
+   835→    request<ApiResponse<{ agentId: string; healthy: boolean; activeSessions: number; totalSessions: number }>>(`/products/${agentId}/health`),
+   836→
+   837→  getAllProductAgentsHealth: () =>
+   838→    request<ApiResponse<Record<string, { healthy: boolean; activeSessions: number; totalSessions: number }>>>('/products/health'),
+   839→
+   840→  listProductAgentWorkers: () =>
+   841→    request<ApiResponse<{ agentId: string; available: boolean }[]>>('/products/workers'),
+   842→
+   843→  // ── Analytics & RL ──────────────────────────────────────
+   844→  getRoutingMetrics: () =>
+   845→    request<ApiResponse<RoutingMetrics>>('/agents/routing-metrics'),
+   846→
+   847→  submitFeedback: (body: { agentId: string; executionId?: string; rating: number; comment?: string }) =>
+   848→    request<ApiResponse<null>>('/agents/feedback', {
+   849→      method: 'POST',
+   850→      body: JSON.stringify(body),
+   851→    }),
+   852→
+   853→  getFeedbackStats: () =>
+   854→    request<ApiResponse<FeedbackStats>>('/agents/feedback/stats'),
+   855→
+   856→  getLearningStatus: () =>
+   857→    request<ApiResponse<LearningStatus>>('/agents/learning/status'),
+   858→
+   859→  triggerRetrain: () =>
+   860→    request<ApiResponse<{ started: boolean }>>('/agents/learning/retrain', {
+   861→      method: 'POST',
+   862→    }),
+   863→
+   864→  getPredictions: (agentId?: string) =>
+   865→    request<ApiResponse<Predictions>>(`/agents/predictions${agentId ? `?agentId=${agentId}` : ''}`),
+   866→
+   867→  getCostForecast: (agentId: string, days?: number) =>
+   868→    request<ApiResponse<CostForecast>>(`/agents/cost-forecast?agentId=${agentId}${days ? `&days=${days}` : ''}`),
+   869→
+   870→  getCostAnomaly: () =>
+   871→    request<ApiResponse<CostAnomaly[]>>('/agents/cost-anomaly'),
+   872→};
+   873→
+   874→// ── Product Agent Types (Sprint 7) ────────────────────────
+   875→
+   876→export interface ProductAgentSession {
+   877→  id: string;
+   878→  agentId: string;
+   879→  status: string;
+   880→  output?: unknown;
+   881→  qualityScore?: number;
+   882→  qualityDimensions?: Record<string, number>;
+   883→  qualitySuggestions?: string[];
+   884→  iterations: number;
+   885→  tokensUsed: number;
+   886→  cost: number;
+   887→  error?: string;
+   888→  createdAt: string;
+   889→  completedAt?: string;
+   890→}
+   891→
+   892→export interface ProductAgentSessionListItem {
+   893→  id: string;
+   894→  agentId: string;
+   895→  prompt: string;
+   896→  status: string;
+   897→  qualityScore?: number;
+   898→  iterations: number;
+   899→  createdAt: string;
+   900→  completedAt?: string;
+   901→}
+   902→

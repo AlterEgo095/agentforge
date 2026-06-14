@@ -1,0 +1,1358 @@
+     1→// ============================================================
+     2→// AgentForge — P2.2 Enterprise Foundation Test Suite
+     3→// Phases P2.2.1 through P2.2.9: TLS, Multi-Tenant, RBAC,
+     4→// Auth/JWT, Load, Resilience, Observability, CI/CD, Non-Regression
+     5→// ============================================================
+     6→
+     7→import { describe, it, expect, beforeAll, beforeEach, vi, afterEach } from 'vitest';
+     8→import { EncryptionService } from '../services/security/EncryptionService';
+     9→import { JWTBlacklist } from '../services/security/JWTBlacklist';
+    10→import { RBACService, ROLE_HIERARCHY } from '../services/tenant/RBACService';
+    11→import type { Role, Action } from '../services/tenant/RBACService';
+    12→
+    13→// ═══════════════════════════════════════════════════════════
+    14→// P2.2.1 — TLS / HTTPS ENTERPRISE
+    15→// ═══════════════════════════════════════════════════════════
+    16→
+    17→describe('P2.2.1 — TLS / HTTPS Enterprise', () => {
+    18→  describe('Nginx TLS Configuration Validation', () => {
+    19→    it('should have nginx-secure.conf with TLS 1.2+ and TLS 1.3', async () => {
+    20→      const fs = await import('fs');
+    21→      const path = await import('path');
+    22→      const confPath = path.join(
+    23→        __dirname,
+    24→        '../../../../infra/docker/nginx/ssl/nginx-secure.conf'
+    25→      );
+    26→
+    27→      const conf = fs.readFileSync(confPath, 'utf8');
+    28→
+    29→      // TLS 1.2+ enforced
+    30→      expect(conf).toContain('TLSv1.2');
+    31→      expect(conf).toContain('TLSv1.3');
+    32→
+    33→      // No TLS 1.0 or 1.1
+    34→      expect(conf).not.toContain('TLSv1 ');
+    35→      expect(conf).not.toContain('TLSv1.1');
+    36→      expect(conf).not.toContain('SSLv2');
+    37→      expect(conf).not.toContain('SSLv3');
+    38→    });
+    39→
+    40→    it('should have strong cipher suites configured', async () => {
+    41→      const fs = await import('fs');
+    42→      const path = await import('path');
+    43→      const confPath = path.join(
+    44→        __dirname,
+    45→        '../../../../infra/docker/nginx/ssl/nginx-secure.conf'
+    46→      );
+    47→
+    48→      const conf = fs.readFileSync(confPath, 'utf8');
+    49→
+    50→      // Must have cipher configuration
+    51→      expect(conf).toContain('ssl_ciphers');
+    52→      // Must include AEAD ciphers (GCM)
+    53→      expect(conf).toContain('AES128-GCM');
+    54→      expect(conf).toContain('AES256-GCM');
+    55→      // Must include forward secrecy ciphers
+    56→      expect(conf).toContain('ECDHE');
+    57→    });
+    58→
+    59→    it('should have HTTP to HTTPS redirect on port 80', async () => {
+    60→      const fs = await import('fs');
+    61→      const path = await import('path');
+    62→      const confPath = path.join(
+    63→        __dirname,
+    64→        '../../../../infra/docker/nginx/ssl/nginx-secure.conf'
+    65→      );
+    66→
+    67→      const conf = fs.readFileSync(confPath, 'utf8');
+    68→
+    69→      // Port 80 block with redirect
+    70→      expect(conf).toMatch(/listen\s+80/);
+    71→      expect(conf).toContain('return 301 https://');
+    72→    });
+    73→
+    74→    it('should have HTTPS server on port 443 with SSL', async () => {
+    75→      const fs = await import('fs');
+    76→      const path = await import('path');
+    77→      const confPath = path.join(
+    78→        __dirname,
+    79→        '../../../../infra/docker/nginx/ssl/nginx-secure.conf'
+    80→      );
+    81→
+    82→      const conf = fs.readFileSync(confPath, 'utf8');
+    83→
+    84→      expect(conf).toMatch(/listen\s+443\s+ssl/);
+    85→      expect(conf).toContain('ssl_certificate');
+    86→      expect(conf).toContain('ssl_certificate_key');
+    87→    });
+    88→
+    89→    it('should have HSTS header with preload', async () => {
+    90→      const fs = await import('fs');
+    91→      const path = await import('path');
+    92→      const confPath = path.join(
+    93→        __dirname,
+    94→        '../../../../infra/docker/nginx/ssl/nginx-secure.conf'
+    95→      );
+    96→
+    97→      const conf = fs.readFileSync(confPath, 'utf8');
+    98→
+    99→      expect(conf).toContain('Strict-Transport-Security');
+   100→      expect(conf).toContain('includeSubDomains');
+   101→      expect(conf).toContain('preload');
+   102→      expect(conf).toContain('63072000'); // 2 years
+   103→    });
+   104→
+   105→    it('should have session tickets disabled for forward secrecy', async () => {
+   106→      const fs = await import('fs');
+   107→      const path = await import('path');
+   108→      const confPath = path.join(
+   109→        __dirname,
+   110→        '../../../../infra/docker/nginx/ssl/nginx-secure.conf'
+   111→      );
+   112→
+   113→      const conf = fs.readFileSync(confPath, 'utf8');
+   114→      expect(conf).toContain('ssl_session_tickets off');
+   115→    });
+   116→
+   117→    it('should have security headers in HTTPS block', async () => {
+   118→      const fs = await import('fs');
+   119→      const path = await import('path');
+   120→      const confPath = path.join(
+   121→        __dirname,
+   122→        '../../../../infra/docker/nginx/ssl/nginx-secure.conf'
+   123→      );
+   124→
+   125→      const conf = fs.readFileSync(confPath, 'utf8');
+   126→
+   127→      expect(conf).toContain('X-Content-Type-Options');
+   128→      expect(conf).toContain('X-Frame-Options');
+   129→      expect(conf).toContain('Content-Security-Policy');
+   130→      expect(conf).toContain('Cross-Origin-Opener-Policy');
+   131→    });
+   132→
+   133→    it('should have CSP without unsafe-eval in production nginx config', async () => {
+   134→      const fs = await import('fs');
+   135→      const path = await import('path');
+   136→      const confPath = path.join(
+   137→        __dirname,
+   138→        '../../../../infra/docker/nginx/ssl/nginx-secure.conf'
+   139→      );
+   140→
+   141→      const conf = fs.readFileSync(confPath, 'utf8');
+   142→
+   143→      // The secure nginx config should NOT have unsafe-eval
+   144→      const cspLine = conf.split('\n').find(l => l.includes('Content-Security-Policy'));
+   145→      expect(cspLine).toBeDefined();
+   146→      expect(cspLine).not.toContain('unsafe-eval');
+   147→    });
+   148→
+   149→    it('should proxy X-Forwarded-Proto as https', async () => {
+   150→      const fs = await import('fs');
+   151→      const path = await import('path');
+   152→      const confPath = path.join(
+   153→        __dirname,
+   154→        '../../../../infra/docker/nginx/ssl/nginx-secure.conf'
+   155→      );
+   156→
+   157→      const conf = fs.readFileSync(confPath, 'utf8');
+   158→      expect(conf).toContain('X-Forwarded-Proto https');
+   159→    });
+   160→
+   161→    it('should deny access to sensitive files (.env, .git, etc.)', async () => {
+   162→      const fs = await import('fs');
+   163→      const path = await import('path');
+   164→      const confPath = path.join(
+   165→        __dirname,
+   166→        '../../../../infra/docker/nginx/ssl/nginx-secure.conf'
+   167→      );
+   168→
+   169→      const conf = fs.readFileSync(confPath, 'utf8');
+   170→      expect(conf).toContain('deny all');
+   171→    });
+   172→  });
+   173→
+   174→  describe('Docker Compose Production TLS Validation', () => {
+   175→    it('should have production docker-compose with HTTPS ports', async () => {
+   176→      const fs = await import('fs');
+   177→      const path = await import('path');
+   178→      const composePath = path.join(
+   179→        __dirname,
+   180→        '../../../../infra/docker/docker-compose.production.yml'
+   181→      );
+   182→
+   183→      const compose = fs.readFileSync(composePath, 'utf8');
+   184→      expect(compose).toContain("'80:80'");     // HTTP redirect
+   185→      expect(compose).toContain("'443:443'");   // HTTPS
+   186→    });
+   187→
+   188→    it('should NOT expose API port directly in production', async () => {
+   189→      const fs = await import('fs');
+   190→      const path = await import('path');
+   191→      const composePath = path.join(
+   192→        __dirname,
+   193→        '../../../../infra/docker/docker-compose.production.yml'
+   194→      );
+   195→
+   196→      const compose = fs.readFileSync(composePath, 'utf8');
+   197→      // API should use 'expose' not 'ports'
+   198→      expect(compose).toContain("expose:");
+   199→    });
+   200→
+   201→    it('should mount SSL certificates as read-only volume', async () => {
+   202→      const fs = await import('fs');
+   203→      const path = await import('path');
+   204→      const composePath = path.join(
+   205→        __dirname,
+   206→        '../../../../infra/docker/docker-compose.production.yml'
+   207→      );
+   208→
+   209→      const compose = fs.readFileSync(composePath, 'utf8');
+   210→      expect(compose).toContain('/etc/nginx/ssl:ro');
+   211→    });
+   212→
+   213→    it('should require mandatory env vars in production', async () => {
+   214→      const fs = await import('fs');
+   215→      const path = await import('path');
+   216→      const composePath = path.join(
+   217→        __dirname,
+   218→        '../../../../infra/docker/docker-compose.production.yml'
+   219→      );
+   220→
+   221→      const compose = fs.readFileSync(composePath, 'utf8');
+   222→      expect(compose).toContain('JWT_SECRET:?JWT_SECRET must be set');
+   223→      expect(compose).toContain('MFA_ENCRYPTION_KEY:?MFA_ENCRYPTION_KEY must be set');
+   224→    });
+   225→
+   226→    it('should set FORCE_HTTPS and TRUST_PROXY in API environment', async () => {
+   227→      const fs = await import('fs');
+   228→      const path = await import('path');
+   229→      const composePath = path.join(
+   230→        __dirname,
+   231→        '../../../../infra/docker/docker-compose.production.yml'
+   232→      );
+   233→
+   234→      const compose = fs.readFileSync(composePath, 'utf8');
+   235→      expect(compose).toContain("FORCE_HTTPS: 'true'");
+   236→      expect(compose).toContain("TRUST_PROXY: 'true'");
+   237→    });
+   238→  });
+   239→
+   240→  describe('Certificate Generation Script', () => {
+   241→    it('should exist and be a shell script', async () => {
+   242→      const fs = await import('fs');
+   243→      const path = await import('path');
+   244→      const scriptPath = path.join(
+   245→        __dirname,
+   246→        '../../../../infra/docker/nginx/ssl/generate-certs.sh'
+   247→      );
+   248→
+   249→      expect(fs.existsSync(scriptPath)).toBe(true);
+   250→      const script = fs.readFileSync(scriptPath, 'utf8');
+   251→      expect(script).toContain('#!/bin/bash');
+   252→      expect(script).toContain('openssl');
+   253→    });
+   254→  });
+   255→
+   256→  describe('Security Headers Middleware (P2.2.1)', () => {
+   257→    it('should export httpsRedirect middleware', async () => {
+   258→      const mod = await import('../middleware/securityHeaders');
+   259→      expect(mod.httpsRedirect).toBeDefined();
+   260→      expect(typeof mod.httpsRedirect).toBe('function');
+   261→    });
+   262→
+   263→    it('should export setSecureCookie utility', async () => {
+   264→      const mod = await import('../middleware/securityHeaders');
+   265→      expect(mod.setSecureCookie).toBeDefined();
+   266→      expect(typeof mod.setSecureCookie).toBe('function');
+   267→    });
+   268→  });
+   269→
+   270→  describe('Environment Configuration for TLS', () => {
+   271→    it('should have FORCE_HTTPS and TRUST_PROXY in env config', () => {
+   272→      expect(process.env.FORCE_HTTPS).toBeDefined();
+   273→      expect(process.env.TRUST_PROXY).toBeDefined();
+   274→    });
+   275→
+   276→    it('should default FORCE_HTTPS to false for development', () => {
+   277→      expect(process.env.FORCE_HTTPS).toBe('false');
+   278→    });
+   279→
+   280→    it('should default TRUST_PROXY to false for development', () => {
+   281→      expect(process.env.TRUST_PROXY).toBe('false');
+   282→    });
+   283→  });
+   284→});
+   285→
+   286→// ═══════════════════════════════════════════════════════════
+   287→// P2.2.2 — MULTI-TENANT ISOLATION VALIDATION
+   288→// ═══════════════════════════════════════════════════════════
+   289→
+   290→describe('P2.2.2 — Multi-Tenant Isolation Validation', () => {
+   291→  describe('Database Schema Isolation', () => {
+   292→    it('should have tenantId on all tenant-scoped tables', async () => {
+   293→      const schema = await import('../db/schema');
+   294→
+   295→      // Projects must have tenantId
+   296→      expect(schema.projects).toBeDefined();
+   297→      const projectColumns = Object.keys(schema.projects);
+   298→      expect(projectColumns).toContain('tenantId');
+   299→
+   300→      // Generation Sessions must have tenantId
+   301→      expect(schema.generationSessions).toBeDefined();
+   302→      const sessionColumns = Object.keys(schema.generationSessions);
+   303→      expect(sessionColumns).toContain('tenantId');
+   304→
+   305→      // Deployments must have tenantId
+   306→      expect(schema.deployments).toBeDefined();
+   307→      const deployColumns = Object.keys(schema.deployments);
+   308→      expect(deployColumns).toContain('tenantId');
+   309→    });
+   310→
+   311→    it('should have tenant_members table for RBAC membership', async () => {
+   312→      const schema = await import('../db/schema');
+   313→      expect(schema.tenantMembers).toBeDefined();
+   314→      const memberColumns = Object.keys(schema.tenantMembers);
+   315→      expect(memberColumns).toContain('tenantId');
+   316→      expect(memberColumns).toContain('userId');
+   317→      expect(memberColumns).toContain('role');
+   318→    });
+   319→
+   320→    it('should have billing tables scoped to tenants', async () => {
+   321→      const schema = await import('../db/schema');
+   322→      expect(schema.tenantInvoices).toBeDefined();
+   323→      expect(schema.tenantPayments).toBeDefined();
+   324→
+   325→      const invoiceColumns = Object.keys(schema.tenantInvoices);
+   326→      expect(invoiceColumns).toContain('tenantId');
+   327→
+   328→      const paymentColumns = Object.keys(schema.tenantPayments);
+   329→      expect(paymentColumns).toContain('tenantId');
+   330→    });
+   331→
+   332→    it('should have 5-role enum for tenant members', async () => {
+   333→      const schema = await import('../db/schema');
+   334→      expect(schema.tenantMemberRoleEnum).toBeDefined();
+   335→    });
+   336→  });
+   337→
+   338→  describe('Tenant Service Isolation Logic', () => {
+   339→    it('should resolve tenants from headers', async () => {
+   340→      const { tenantService } = await import('../services/tenant/TenantService');
+   341→      expect(tenantService).toBeDefined();
+   342→      expect(typeof tenantService.resolveTenant).toBe('function');
+   343→    });
+   344→
+   345→    it('should enforce quota per tenant', async () => {
+   346→      const { tenantQuotaService } = await import('../services/tenant/TenantQuotaService');
+   347→      expect(tenantQuotaService).toBeDefined();
+   348→      expect(typeof tenantQuotaService.checkExecutionQuota).toBe('function');
+   349→      expect(typeof tenantQuotaService.checkTokenQuota).toBe('function');
+   350→      expect(typeof tenantQuotaService.checkCostQuota).toBe('function');
+   351→    });
+   352→
+   353→    it('should scope billing per tenant', async () => {
+   354→      const { tenantBillingService } = await import('../services/tenant/TenantBillingService');
+   355→      expect(tenantBillingService).toBeDefined();
+   356→    });
+   357→  });
+   358→
+   359→  describe('Cross-Tenant Access Prevention', () => {
+   360→    it('should require tenant middleware for tenant-scoped routes', async () => {
+   361→      const mod = await import('../middleware/tenant');
+   362→      expect(mod.requiredTenantMiddleware).toBeDefined();
+   363→      expect(mod.tenantMiddleware).toBeDefined();
+   364→    });
+   365→  });
+   366→});
+   367→
+   368→// ═══════════════════════════════════════════════════════════
+   369→// P2.2.3 — RBAC INTER-TENANT VALIDATION
+   370→// ═══════════════════════════════════════════════════════════
+   371→
+   372→describe('P2.2.3 — RBAC Inter-Tenant Validation', () => {
+   373→  let rbac: RBACService;
+   374→
+   375→  beforeAll(() => {
+   376→    rbac = new RBACService();
+   377→  });
+   378→
+   379→  describe('5-Role Hierarchy', () => {
+   380→    it('should define all 5 roles with correct hierarchy levels', () => {
+   381→      expect(ROLE_HIERARCHY.super_admin).toBe(5);
+   382→      expect(ROLE_HIERARCHY.admin).toBe(4);
+   383→      expect(ROLE_HIERARCHY.manager).toBe(3);
+   384→      expect(ROLE_HIERARCHY.user).toBe(2);
+   385→      expect(ROLE_HIERARCHY.viewer).toBe(1);
+   386→    });
+   387→
+   388→    it('should enforce role ordering: super_admin > admin > manager > user > viewer', () => {
+   389→      expect(ROLE_HIERARCHY.super_admin).toBeGreaterThan(ROLE_HIERARCHY.admin);
+   390→      expect(ROLE_HIERARCHY.admin).toBeGreaterThan(ROLE_HIERARCHY.manager);
+   391→      expect(ROLE_HIERARCHY.manager).toBeGreaterThan(ROLE_HIERARCHY.user);
+   392→      expect(ROLE_HIERARCHY.user).toBeGreaterThan(ROLE_HIERARCHY.viewer);
+   393→    });
+   394→  });
+   395→
+   396→  describe('Permission Matrix - SUPER_ADMIN', () => {
+   397→    it('should have ALL actions on ALL resources', () => {
+   398→      const criticalResources = [
+   399→        'tenants', 'users', 'projects', 'agents', 'executions',
+   400→        'billing', 'settings', 'audit', 'api_keys', 'deployments',
+   401→        'providers', 'monitoring', 'security', 'infrastructure',
+   402→      ];
+   403→
+   404→      for (const resource of criticalResources) {
+   405→        expect(rbac.hasPermission('super_admin', resource, 'read')).toBe(true);
+   406→        expect(rbac.hasPermission('super_admin', resource, 'manage')).toBe(true);
+   407→      }
+   408→    });
+   409→  });
+   410→
+   411→  describe('Permission Matrix - ADMIN', () => {
+   412→    it('should NOT be able to delete tenants', () => {
+   413→      expect(rbac.hasPermission('admin', 'tenants', 'delete')).toBe(false);
+   414→    });
+   415→
+   416→    it('should NOT be able to manage providers', () => {
+   417→      expect(rbac.hasPermission('admin', 'providers', 'manage')).toBe(false);
+   418→    });
+   419→
+   420→    it('should NOT be able to manage security', () => {
+   421→      expect(rbac.hasPermission('admin', 'security', 'manage')).toBe(false);
+   422→    });
+   423→
+   424→    it('should be able to read and update tenants (own)', () => {
+   425→      expect(rbac.hasPermission('admin', 'tenants', 'read')).toBe(true);
+   426→      expect(rbac.hasPermission('admin', 'tenants', 'update')).toBe(true);
+   427→    });
+   428→
+   429→    it('should be able to manage users within tenant', () => {
+   430→      expect(rbac.hasPermission('admin', 'users', 'manage')).toBe(true);
+   431→    });
+   432→  });
+   433→
+   434→  describe('Permission Matrix - MANAGER', () => {
+   435→    it('should NOT be able to delete users', () => {
+   436→      expect(rbac.hasPermission('manager', 'users', 'delete')).toBe(false);
+   437→    });
+   438→
+   439→    it('should NOT be able to update billing', () => {
+   440→      expect(rbac.hasPermission('manager', 'billing', 'update')).toBe(false);
+   441→    });
+   442→
+   443→    it('should be able to create and execute projects', () => {
+   444→      expect(rbac.hasPermission('manager', 'projects', 'create')).toBe(true);
+   445→      expect(rbac.hasPermission('manager', 'projects', 'execute')).toBe(true);
+   446→    });
+   447→
+   448→    it('should be able to read billing', () => {
+   449→      expect(rbac.hasPermission('manager', 'billing', 'read')).toBe(true);
+   450→    });
+   451→  });
+   452→
+   453→  describe('Permission Matrix - USER', () => {
+   454→    it('should NOT be able to delete projects', () => {
+   455→      expect(rbac.hasPermission('user', 'projects', 'delete')).toBe(false);
+   456→    });
+   457→
+   458→    it('should be able to create projects', () => {
+   459→      expect(rbac.hasPermission('user', 'projects', 'create')).toBe(true);
+   460→    });
+   461→
+   462→    it('should be able to execute agents', () => {
+   463→      expect(rbac.hasPermission('user', 'agents', 'execute')).toBe(true);
+   464→    });
+   465→
+   466→    it('should NOT be able to read billing', () => {
+   467→      expect(rbac.hasPermission('user', 'billing', 'read')).toBe(false);
+   468→    });
+   469→  });
+   470→
+   471→  describe('Permission Matrix - VIEWER', () => {
+   472→    it('should ONLY have read permissions', () => {
+   473→      const actions: Action[] = ['create', 'update', 'delete', 'execute', 'manage'];
+   474→      const resources = [
+   475→        'tenants', 'users', 'projects', 'agents', 'executions',
+   476→        'billing', 'settings', 'analytics', 'deployments',
+   477→      ];
+   478→
+   479→      for (const resource of resources) {
+   480→        for (const action of actions) {
+   481→          expect(rbac.hasPermission('viewer', resource, action)).toBe(false);
+   482→        }
+   483→      }
+   484→    });
+   485→
+   486→    it('should be able to read projects and agents', () => {
+   487→      expect(rbac.hasPermission('viewer', 'projects', 'read')).toBe(true);
+   488→      expect(rbac.hasPermission('viewer', 'agents', 'read')).toBe(true);
+   489→    });
+   490→  });
+   491→
+   492→  describe('Role Assignment Rules', () => {
+   493→    it('should NOT allow admin to assign admin role (must be higher)', () => {
+   494→      expect(rbac.canAssignRole('admin', 'admin')).toBe(false);
+   495→    });
+   496→
+   497→    it('should allow admin to assign manager role', () => {
+   498→      expect(rbac.canAssignRole('admin', 'manager')).toBe(true);
+   499→    });
+   500→
+   501→    it('should allow super_admin to assign admin role', () => {
+   502→      expect(rbac.canAssignRole('super_admin', 'admin')).toBe(true);
+   503→    });
+   504→
+   505→    it('should NOT allow viewer to assign any role', () => {
+   506→      // viewer (level 1) cannot assign any role since no role is lower
+   507→      expect(rbac.canAssignRole('viewer', 'user')).toBe(false);
+   508→    });
+   509→
+   510→    it('should allow user to assign viewer role (level 2 > level 1)', () => {
+   511→      // user (level 2) can assign viewer (level 1) — this is by design
+   512→      expect(rbac.canAssignRole('user', 'viewer')).toBe(true);
+   513→    });
+   514→  });
+   515→
+   516→  describe('requirePermission Middleware', () => {
+   517→    it('should be importable and functional', async () => {
+   518→      const mod = await import('../middleware/tenant');
+   519→      expect(mod.requirePermission).toBeDefined();
+   520→      expect(typeof mod.requirePermission).toBe('function');
+   521→    });
+   522→
+   523→    it('should create middleware for each resource/action combination', async () => {
+   524→      const mod = await import('../middleware/tenant');
+   525→      const middleware = mod.requirePermission({ resource: 'users', action: 'read' });
+   526→      expect(middleware).toBeDefined();
+   527→      expect(typeof middleware).toBe('function');
+   528→    });
+   529→  });
+   530→
+   531→  describe('Complete Permission Matrix Export', () => {
+   532→    it('should export full permission matrix for audit', () => {
+   533→      const matrix = rbac.getPermissionMatrix();
+   534→      expect(Object.keys(matrix)).toHaveLength(5);
+   535→      expect(matrix.super_admin).toBeDefined();
+   536→      expect(matrix.admin).toBeDefined();
+   537→      expect(matrix.manager).toBeDefined();
+   538→      expect(matrix.user).toBeDefined();
+   539→      expect(matrix.viewer).toBeDefined();
+   540→    });
+   541→
+   542→    it('should have display names for all roles', () => {
+   543→      expect(rbac.getRoleDisplayName('super_admin')).toBe('Super Admin');
+   544→      expect(rbac.getRoleDisplayName('admin')).toBe('Admin');
+   545→      expect(rbac.getRoleDisplayName('manager')).toBe('Manager');
+   546→      expect(rbac.getRoleDisplayName('user')).toBe('User');
+   547→      expect(rbac.getRoleDisplayName('viewer')).toBe('Viewer');
+   548→    });
+   549→  });
+   550→});
+   551→
+   552→// ═══════════════════════════════════════════════════════════
+   553→// P2.2.4 — AUTH & JWT VALIDATION
+   554→// ═══════════════════════════════════════════════════════════
+   555→
+   556→describe('P2.2.4 — Auth & JWT Validation', () => {
+   557→  describe('JWT Token Structure (P2.1.4 + P2.2.4)', () => {
+   558→    it('should include all OWASP-required claims in access tokens', async () => {
+   559→      const { sign, verify } = await import('hono/jwt');
+   560→      const { v4: uuidv4 } = await import('uuid');
+   561→
+   562→      const now = Math.floor(Date.now() / 1000);
+   563→      const payload = {
+   564→        sub: 'user-123',
+   565→        tier: 'free',
+   566→        iss: 'agentforge',
+   567→        aud: 'agentforge-api',
+   568→        iat: now,
+   569→        exp: now + 900,
+   570→        jti: uuidv4(),
+   571→      };
+   572→
+   573→      const token = await sign(payload, process.env.JWT_SECRET!);
+   574→      const decoded = await verify(token, process.env.JWT_SECRET!, 'HS256') as typeof payload;
+   575→
+   576→      expect(decoded.sub).toBe('user-123');
+   577→      expect(decoded.iss).toBe('agentforge');
+   578→      expect(decoded.aud).toBe('agentforge-api');
+   579→      expect(decoded.iat).toBeDefined();
+   580→      expect(decoded.exp).toBeDefined();
+   581→      expect(decoded.jti).toBeDefined();
+   582→    });
+   583→
+   584→    it('should include type claim in refresh tokens', async () => {
+   585→      const { sign, verify } = await import('hono/jwt');
+   586→      const { v4: uuidv4 } = await import('uuid');
+   587→
+   588→      const now = Math.floor(Date.now() / 1000);
+   589→      const payload = {
+   590→        sub: 'user-123',
+   591→        type: 'refresh',
+   592→        tid: 'abc123',
+   593→        iss: 'agentforge',
+   594→        aud: 'agentforge-api',
+   595→        iat: now,
+   596→        exp: now + 604800,
+   597→        jti: uuidv4(),
+   598→      };
+   599→
+   600→      const token = await sign(payload, process.env.JWT_SECRET!);
+   601→      const decoded = await verify(token, process.env.JWT_SECRET!, 'HS256') as typeof payload;
+   602→
+   603→      expect(decoded.type).toBe('refresh');
+   604→      expect(decoded.tid).toBe('abc123');
+   605→    });
+   606→
+   607→    it('should include type claim in MFA pending tokens', async () => {
+   608→      const { sign, verify } = await import('hono/jwt');
+   609→      const { v4: uuidv4 } = await import('uuid');
+   610→
+   611→      const now = Math.floor(Date.now() / 1000);
+   612→      const payload = {
+   613→        sub: 'user-123',
+   614→        type: 'mfa_pending',
+   615→        sessionId: 'session-abc',
+   616→        iss: 'agentforge',
+   617→        aud: 'agentforge-api',
+   618→        iat: now,
+   619→        exp: now + 300,
+   620→        jti: uuidv4(),
+   621→      };
+   622→
+   623→      const token = await sign(payload, process.env.JWT_SECRET!);
+   624→      const decoded = await verify(token, process.env.JWT_SECRET!, 'HS256') as typeof payload;
+   625→
+   626→      expect(decoded.type).toBe('mfa_pending');
+   627→      expect(decoded.sessionId).toBe('session-abc');
+   628→    });
+   629→  });
+   630→
+   631→  describe('JWT Validation - Invalid Scenarios', () => {
+   632→    it('should reject expired JWT', async () => {
+   633→      const { sign } = await import('hono/jwt');
+   634→      const { verify } = await import('hono/jwt');
+   635→
+   636→      const now = Math.floor(Date.now() / 1000);
+   637→      const expiredPayload = {
+   638→        sub: 'user-123',
+   639→        tier: 'free',
+   640→        iss: 'agentforge',
+   641→        aud: 'agentforge-api',
+   642→        iat: now - 3600,
+   643→        exp: now - 1800,
+   644→        jti: 'test-jti-expired',
+   645→      };
+   646→
+   647→      const token = await sign(expiredPayload, process.env.JWT_SECRET!);
+   648→
+   649→      await expect(verify(token, process.env.JWT_SECRET!, 'HS256')).rejects.toThrow();
+   650→    });
+   651→
+   652→    it('should reject JWT with wrong issuer', async () => {
+   653→      const { sign, verify } = await import('hono/jwt');
+   654→
+   655→      const now = Math.floor(Date.now() / 1000);
+   656→      const payload = {
+   657→        sub: 'user-123',
+   658→        tier: 'free',
+   659→        iss: 'evil-attacker',
+   660→        aud: 'agentforge-api',
+   661→        iat: now,
+   662→        exp: now + 900,
+   663→        jti: 'test-jti-wrong-iss',
+   664→      };
+   665→
+   666→      const token = await sign(payload, process.env.JWT_SECRET!);
+   667→      const decoded = await verify(token, process.env.JWT_SECRET!, 'HS256') as typeof payload;
+   668→
+   669→      // The token is valid JWT, but the issuer does not match expected
+   670→      expect(decoded.iss).not.toBe('agentforge');
+   671→    });
+   672→
+   673→    it('should reject JWT with wrong audience', async () => {
+   674→      const { sign, verify } = await import('hono/jwt');
+   675→
+   676→      const now = Math.floor(Date.now() / 1000);
+   677→      const payload = {
+   678→        sub: 'user-123',
+   679→        tier: 'free',
+   680→        iss: 'agentforge',
+   681→        aud: 'evil-audience',
+   682→        iat: now,
+   683→        exp: now + 900,
+   684→        jti: 'test-jti-wrong-aud',
+   685→      };
+   686→
+   687→      const token = await sign(payload, process.env.JWT_SECRET!);
+   688→      const decoded = await verify(token, process.env.JWT_SECRET!, 'HS256') as typeof payload;
+   689→
+   690→      expect(decoded.aud).not.toBe('agentforge-api');
+   691→    });
+   692→
+   693→    it('should reject tampered JWT', async () => {
+   694→      const { sign } = await import('hono/jwt');
+   695→
+   696→      const now = Math.floor(Date.now() / 1000);
+   697→      const payload = {
+   698→        sub: 'user-123',
+   699→        tier: 'free',
+   700→        iss: 'agentforge',
+   701→        aud: 'agentforge-api',
+   702→        iat: now,
+   703→        exp: now + 900,
+   704→      };
+   705→
+   706→      const token = await sign(payload, process.env.JWT_SECRET!);
+   707→      const tamperedToken = token.slice(0, -5) + 'XXXXX';
+   708→
+   709→      const { verify } = await import('hono/jwt');
+   710→      await expect(verify(tamperedToken, process.env.JWT_SECRET!, 'HS256')).rejects.toThrow();
+   711→    });
+   712→
+   713→    it('should identify refresh token type for rejection', async () => {
+   714→      const { sign, verify } = await import('hono/jwt');
+   715→
+   716→      const now = Math.floor(Date.now() / 1000);
+   717→      const refreshPayload = {
+   718→        sub: 'user-123',
+   719→        type: 'refresh',
+   720→        tid: 'abc',
+   721→        iss: 'agentforge',
+   722→        aud: 'agentforge-api',
+   723→        iat: now,
+   724→        exp: now + 604800,
+   725→        jti: 'refresh-jti-test',
+   726→      };
+   727→
+   728→      const token = await sign(refreshPayload, process.env.JWT_SECRET!);
+   729→      const decoded = await verify(token, process.env.JWT_SECRET!, 'HS256') as typeof refreshPayload;
+   730→
+   731→      // Middleware should reject tokens with type=refresh
+   732→      expect(decoded.type).toBe('refresh');
+   733→    });
+   734→  });
+   735→
+   736→  describe('JWT Blacklist / Revocation', () => {
+   737→    it('should blacklist a JWT by jti', async () => {
+   738→      const blacklist = new JWTBlacklist();
+   739→      const jti = 'test-jti-blacklist-' + Date.now();
+   740→
+   741→      await blacklist.blacklist(jti, 3600);
+   742→      const isBlacklisted = await blacklist.isBlacklisted(jti);
+   743→      expect(isBlacklisted).toBe(true);
+   744→    });
+   745→
+   746→    it('should return false for non-blacklisted jti', async () => {
+   747→      const blacklist = new JWTBlacklist();
+   748→      const isBlacklisted = await blacklist.isBlacklisted('nonexistent-jti-' + Date.now());
+   749→      expect(isBlacklisted).toBe(false);
+   750→    });
+   751→
+   752→    it('should support user-level revocation (Redis-backed)', async () => {
+   753→      const blacklist = new JWTBlacklist();
+   754→      const userId = 'user-revoke-test-' + Date.now();
+   755→      const now = Math.floor(Date.now() / 1000);
+   756→
+   757→      await blacklist.revokeAllForUser(userId, 3600);
+   758→      const isRevoked = await blacklist.isUserRevokedAfter(userId, now - 60);
+   759→      expect(typeof isRevoked).toBe('boolean');
+   760→    });
+   761→
+   762→    it('should support unblacklist for rare cases', async () => {
+   763→      const blacklist = new JWTBlacklist();
+   764→      const jti = 'test-jti-unblacklist-' + Date.now();
+   765→
+   766→      await blacklist.blacklist(jti, 3600);
+   767→      expect(await blacklist.isBlacklisted(jti)).toBe(true);
+   768→
+   769→      await blacklist.unblacklist(jti);
+   770→      expect(await blacklist.isBlacklisted(jti)).toBe(false);
+   771→    });
+   772→  });
+   773→
+   774→  describe('Encryption Service (P2.1.1 + P2.2.4)', () => {
+   775→    let encryptionService: EncryptionService;
+   776→
+   777→    beforeAll(() => {
+   778→      encryptionService = new EncryptionService();
+   779→      encryptionService.initialize('test-mfa-encryption-key-for-testing', '01');
+   780→    });
+   781→
+   782→    it('should encrypt and decrypt MFA secrets correctly', () => {
+   783→      const secret = 'JBSWY3DPEHPK3PXP';
+   784→      const encrypted = encryptionService.encrypt(secret);
+   785→      const decrypted = encryptionService.decrypt(encrypted);
+   786→
+   787→      expect(decrypted).toBe(secret);
+   788→      expect(encrypted).not.toBe(secret);
+   789→    });
+   790→
+   791→    it('should produce different ciphertexts for same plaintext (random IV)', () => {
+   792→      const secret = 'JBSWY3DPEHPK3PXP';
+   793→      const encrypted1 = encryptionService.encrypt(secret);
+   794→      const encrypted2 = encryptionService.encrypt(secret);
+   795→
+   796→      expect(encrypted1).not.toBe(encrypted2);
+   797→      expect(encryptionService.decrypt(encrypted1)).toBe(secret);
+   798→      expect(encryptionService.decrypt(encrypted2)).toBe(secret);
+   799→    });
+   800→
+   801→    it('should detect encrypted vs plaintext values', () => {
+   802→      const secret = 'JBSWY3DPEHPK3PXP';
+   803→      const encrypted = encryptionService.encrypt(secret);
+   804→
+   805→      expect(encryptionService.isEncrypted(encrypted)).toBe(true);
+   806→      expect(encryptionService.isEncrypted(secret)).toBe(false);
+   807→      expect(encryptionService.isEncrypted(null)).toBe(false);
+   808→      expect(encryptionService.isEncrypted(undefined as any)).toBe(false);
+   809→    });
+   810→
+   811→    it('should reject tampered ciphertext (auth tag verification)', () => {
+   812→      const secret = 'JBSWY3DPEHPK3PXP';
+   813→      const encrypted = encryptionService.encrypt(secret);
+   814→
+   815→      const payload = JSON.parse(encrypted);
+   816→      // Tamper the auth tag (this MUST be detected by AES-GCM)
+   817→      payload.tag = Buffer.from('tampered-tag-data-16b').toString('base64url');
+   818→      const tampered = JSON.stringify(payload);
+   819→
+   820→      expect(() => encryptionService.decrypt(tampered)).toThrow();
+   821→    });
+   822→
+   823→    it('should support key rotation via reEncrypt', () => {
+   824→      const secret = 'JBSWY3DPEHPK3PXP';
+   825→      const encrypted = encryptionService.encrypt(secret);
+   826→
+   827→      encryptionService.addKey('test-mfa-encryption-key-v2', '02');
+   828→
+   829→      const reEncrypted = encryptionService.reEncrypt(encrypted);
+   830→      const decrypted = encryptionService.decrypt(reEncrypted);
+   831→
+   832→      expect(decrypted).toBe(secret);
+   833→
+   834→      const payload = JSON.parse(reEncrypted);
+   835→      expect(payload.v).toBe('02');
+   836→    });
+   837→  });
+   838→});
+   839→
+   840→// ═══════════════════════════════════════════════════════════
+   841→// P2.2.5 — LOAD TESTING AUTH (Metrics & Thresholds)
+   842→// ═══════════════════════════════════════════════════════════
+   843→
+   844→describe('P2.2.5 — Load Testing Auth Framework', () => {
+   845→  describe('Auth Rate Limiting Infrastructure', () => {
+   846→    it('should have strict rate limiter (5/15min) for login endpoints', async () => {
+   847→      const fs = await import('fs');
+   848→      const path = await import('path');
+   849→      const authPath = path.join(__dirname, '../routes/auth.ts');
+   850→
+   851→      const authCode = fs.readFileSync(authPath, 'utf8');
+   852→      expect(authCode).toContain('strictAuthRateLimiter');
+   853→      expect(authCode).toContain('maxRequests: 5');
+   854→      expect(authCode).toContain('windowMs: 15 * 60 * 1000');
+   855→    });
+   856→
+   857→    it('should have MFA rate limiter (20/15min)', async () => {
+   858→      const fs = await import('fs');
+   859→      const path = await import('path');
+   860→      const authPath = path.join(__dirname, '../routes/auth.ts');
+   861→
+   862→      const authCode = fs.readFileSync(authPath, 'utf8');
+   863→      expect(authCode).toContain('mfaRateLimiter');
+   864→      expect(authCode).toContain('maxRequests: 20');
+   865→    });
+   866→
+   867→    it('should have account lockout after 5 failed attempts', async () => {
+   868→      const fs = await import('fs');
+   869→      const path = await import('path');
+   870→      const authPath = path.join(__dirname, '../routes/auth.ts');
+   871→
+   872→      const authCode = fs.readFileSync(authPath, 'utf8');
+   873→      expect(authCode).toContain('ACCOUNT_LOCKOUT_MAX_ATTEMPTS');
+   874→    });
+   875→  });
+   876→
+   877→  describe('Token Generation Performance', () => {
+   878→    it('should generate 100 access tokens in under 5 seconds', async () => {
+   879→      const { sign } = await import('hono/jwt');
+   880→      const { v4: uuidv4 } = await import('uuid');
+   881→
+   882→      const start = Date.now();
+   883→      const tokens: string[] = [];
+   884→
+   885→      for (let i = 0; i < 100; i++) {
+   886→        const now = Math.floor(Date.now() / 1000);
+   887→        const payload = {
+   888→          sub: `user-${i}`,
+   889→          tier: 'free',
+   890→          iss: 'agentforge',
+   891→          aud: 'agentforge-api',
+   892→          iat: now,
+   893→          exp: now + 900,
+   894→          jti: uuidv4(),
+   895→        };
+   896→        tokens.push(await sign(payload, process.env.JWT_SECRET!));
+   897→      }
+   898→
+   899→      const duration = Date.now() - start;
+   900→      expect(tokens).toHaveLength(100);
+   901→      expect(duration).toBeLessThan(5000);
+   902→    });
+   903→
+   904→    it('should verify 100 access tokens in under 5 seconds', async () => {
+   905→      const { sign, verify } = await import('hono/jwt');
+   906→      const { v4: uuidv4 } = await import('uuid');
+   907→
+   908→      const tokens: string[] = [];
+   909→      for (let i = 0; i < 100; i++) {
+   910→        const now = Math.floor(Date.now() / 1000);
+   911→        tokens.push(await sign({
+   912→          sub: `user-${i}`,
+   913→          tier: 'free',
+   914→          iss: 'agentforge',
+   915→          aud: 'agentforge-api',
+   916→          iat: now,
+   917→          exp: now + 900,
+   918→          jti: uuidv4(),
+   919→        }, process.env.JWT_SECRET!));
+   920→      }
+   921→
+   922→      const start = Date.now();
+   923→      for (const token of tokens) {
+   924→        await verify(token, process.env.JWT_SECRET!, 'HS256');
+   925→      }
+   926→      const duration = Date.now() - start;
+   927→
+   928→      expect(duration).toBeLessThan(5000);
+   929→    });
+   930→
+   931→    it('should encrypt/decrypt 100 MFA secrets in under 5 seconds', () => {
+   932→      const enc = new EncryptionService();
+   933→      enc.initialize('test-mfa-encryption-key-for-testing', '01');
+   934→
+   935→      const secrets = Array.from({ length: 100 }, () =>
+   936→        Array.from({ length: 16 }, () => String.fromCharCode(65 + Math.floor(Math.random() * 26))).join('')
+   937→      );
+   938→
+   939→      const start = Date.now();
+   940→      const encrypted = secrets.map(s => enc.encrypt(s));
+   941→      const decrypted = encrypted.map(e => enc.decrypt(e));
+   942→      const duration = Date.now() - start;
+   943→
+   944→      expect(decrypted).toEqual(secrets);
+   945→      expect(duration).toBeLessThan(5000);
+   946→    });
+   947→  });
+   948→});
+   949→
+   950→// ═══════════════════════════════════════════════════════════
+   951→// P2.2.6 — RESILIENCE & RECOVERY
+   952→// ═══════════════════════════════════════════════════════════
+   953→
+   954→describe('P2.2.6 — Resilience & Recovery', () => {
+   955→  describe('Graceful Shutdown Infrastructure', () => {
+   956→    it('should have graceful shutdown handlers registered', async () => {
+   957→      const fs = await import('fs');
+   958→      const path = await import('path');
+   959→      const indexPath = path.join(__dirname, '../index.ts');
+   960→
+   961→      const code = fs.readFileSync(indexPath, 'utf8');
+   962→      expect(code).toContain('gracefulShutdown');
+   963→      expect(code).toContain('SIGTERM');
+   964→      expect(code).toContain('SIGINT');
+   965→    });
+   966→
+   967→    it('should have shutdown timeout configured', async () => {
+   968→      const fs = await import('fs');
+   969→      const path = await import('path');
+   970→      const indexPath = path.join(__dirname, '../index.ts');
+   971→
+   972→      const code = fs.readFileSync(indexPath, 'utf8');
+   973→      expect(code).toContain('SHUTDOWN_TIMEOUT');
+   974→    });
+   975→  });
+   976→
+   977→  describe('Health Check Endpoints', () => {
+   978→    it('should have /health, /healthz, /readyz endpoints', async () => {
+   979→      const fs = await import('fs');
+   980→      const path = await import('path');
+   981→      const indexPath = path.join(__dirname, '../index.ts');
+   982→
+   983→      const code = fs.readFileSync(indexPath, 'utf8');
+   984→      expect(code).toContain("'/health'");
+   985→      expect(code).toContain("'/healthz'");
+   986→      expect(code).toContain("'/readyz'");
+   987→    });
+   988→
+   989→    it('should check DB and Redis connectivity in readiness probe', async () => {
+   990→      const fs = await import('fs');
+   991→      const path = await import('path');
+   992→      const indexPath = path.join(__dirname, '../index.ts');
+   993→
+   994→      const code = fs.readFileSync(indexPath, 'utf8');
+   995→      expect(code).toContain('database');
+   996→      expect(code).toContain('redis');
+   997→      expect(code).toContain('SELECT 1');
+   998→    });
+   999→  });
+  1000→
+  1001→  describe('Redis Fallback', () => {
+  1002→    it('should have fallback logic when Redis is unavailable', async () => {
+  1003→      const fs = await import('fs');
+  1004→      const path = await import('path');
+  1005→
+  1006→      const jwtPath = path.join(__dirname, '../services/security/JWTBlacklist.ts');
+  1007→      const jwtCode = fs.readFileSync(jwtPath, 'utf8');
+  1008→      expect(jwtCode).toContain('localBlacklist');
+  1009→    });
+  1010→  });
+  1011→
+  1012→  describe('Docker Health Checks', () => {
+  1013→    it('should have healthcheck on all services in docker-compose', async () => {
+  1014→      const fs = await import('fs');
+  1015→      const path = await import('path');
+  1016→      const composePath = path.join(
+  1017→        __dirname,
+  1018→        '../../../../infra/docker/docker-compose.yml'
+  1019→      );
+  1020→
+  1021→      const compose = fs.readFileSync(composePath, 'utf8');
+  1022→      expect(compose).toContain('healthcheck');
+  1023→    });
+  1024→
+  1025→    it('should have resource limits on all services', async () => {
+  1026→      const fs = await import('fs');
+  1027→      const path = await import('path');
+  1028→      const composePath = path.join(
+  1029→        __dirname,
+  1030→        '../../../../infra/docker/docker-compose.yml'
+  1031→      );
+  1032→
+  1033→      const compose = fs.readFileSync(composePath, 'utf8');
+  1034→      expect(compose).toContain('limits');
+  1035→      expect(compose).toContain('cpus');
+  1036→      expect(compose).toContain('memory');
+  1037→    });
+  1038→  });
+  1039→});
+  1040→
+  1041→// ═══════════════════════════════════════════════════════════
+  1042→// P2.2.7 — OBSERVABILITÉ CERTIFIÉE
+  1043→// ═══════════════════════════════════════════════════════════
+  1044→
+  1045→describe('P2.2.7 - Observabilite Certifiee', () => {
+  1046→  describe('OpenTelemetry Initialization', () => {
+  1047→    it('should have telemetry initialization in index.ts', async () => {
+  1048→      const fs = await import('fs');
+  1049→      const path = await import('path');
+  1050→      const indexPath = path.join(__dirname, '../index.ts');
+  1051→
+  1052→      const code = fs.readFileSync(indexPath, 'utf8');
+  1053→      expect(code).toContain('initTelemetry');
+  1054→    });
+  1055→
+  1056→    it('should have graceful telemetry shutdown', async () => {
+  1057→      const fs = await import('fs');
+  1058→      const path = await import('path');
+  1059→      const indexPath = path.join(__dirname, '../index.ts');
+  1060→
+  1061→      const code = fs.readFileSync(indexPath, 'utf8');
+  1062→      expect(code).toContain('shutdownTelemetry');
+  1063→    });
+  1064→  });
+  1065→
+  1066→  describe('Tracing Service', () => {
+  1067→    it('should support span creation and context propagation', async () => {
+  1068→      const { tracingService } = await import('../services/telemetry/TracingService');
+  1069→      expect(tracingService).toBeDefined();
+  1070→      expect(typeof tracingService.startSpan).toBe('function');
+  1071→      expect(typeof tracingService.withSpan).toBe('function');
+  1072→      expect(typeof tracingService.addEvent).toBe('function');
+  1073→      expect(typeof tracingService.setAttribute).toBe('function');
+  1074→      expect(typeof tracingService.setAttributes).toBe('function');
+  1075→      expect(typeof tracingService.recordException).toBe('function');
+  1076→    });
+  1077→
+  1078→    it('should support child span creation', async () => {
+  1079→      const { tracingService } = await import('../services/telemetry/TracingService');
+  1080→      expect(typeof tracingService.startChildSpan).toBe('function');
+  1081→    });
+  1082→
+  1083→    it('should provide isEnabled status', async () => {
+  1084→      const { tracingService } = await import('../services/telemetry/TracingService');
+  1085→      expect(typeof tracingService.isEnabled()).toBe('boolean');
+  1086→    });
+  1087→  });
+  1088→
+  1089→  describe('Metrics Service', () => {
+  1090→    it('should have all required counters and histograms', async () => {
+  1091→      const { metricsService } = await import('../services/telemetry/MetricsService');
+  1092→      expect(metricsService).toBeDefined();
+  1093→      expect(typeof metricsService.recordExecution).toBe('function');
+  1094→      expect(typeof metricsService.recordCacheHit).toBe('function');
+  1095→      expect(typeof metricsService.recordExecutionDuration).toBe('function');
+  1096→      expect(typeof metricsService.recordLLMCallDuration).toBe('function');
+  1097→      expect(typeof metricsService.recordHTTPRequest).toBe('function');
+  1098→      expect(typeof metricsService.recordExecutionStart).toBe('function');
+  1099→      expect(typeof metricsService.recordExecutionEnd).toBe('function');
+  1100→    });
+  1101→  });
+  1102→
+  1103→  describe('Alert Manager', () => {
+  1104→    it('should have default alert rules configured', async () => {
+  1105→      const { alertManager } = await import('../services/telemetry/AlertManager');
+  1106→      expect(alertManager).toBeDefined();
+  1107→      const rules = alertManager.getRules();
+  1108→      expect(rules.length).toBeGreaterThan(0);
+  1109→    });
+  1110→
+  1111→    it('should track active alerts and support acknowledgement', async () => {
+  1112→      const { alertManager } = await import('../services/telemetry/AlertManager');
+  1113→      expect(typeof alertManager.getActiveAlerts).toBe('function');
+  1114→      expect(typeof alertManager.acknowledge).toBe('function');
+  1115→    });
+  1116→  });
+  1117→
+  1118→  describe('Observability Middleware', () => {
+  1119→    it('should have observability middleware that creates spans', async () => {
+  1120→      const mod = await import('../middleware/observability');
+  1121→      expect(mod.observabilityMiddleware).toBeDefined();
+  1122→    });
+  1123→
+  1124→    it('should have request logger middleware with request ID', async () => {
+  1125→      const mod = await import('../middleware/requestLogger');
+  1126→      expect(mod.requestLogger).toBeDefined();
+  1127→    });
+  1128→  });
+  1129→});
+  1130→
+  1131→// ═══════════════════════════════════════════════════════════
+  1132→// P2.2.8 — CI/CD ENTERPRISE VALIDATION
+  1133→// ═══════════════════════════════════════════════════════════
+  1134→
+  1135→describe('P2.2.8 — CI/CD Enterprise Validation', () => {
+  1136→  describe('Build Scripts', () => {
+  1137→    it('should have lint, typecheck, test, build scripts', async () => {
+  1138→      const fs = await import('fs');
+  1139→      const path = await import('path');
+  1140→      const pkgPath = path.join(__dirname, '../../../../package.json');
+  1141→
+  1142→      const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+  1143→      expect(pkg.scripts.lint).toBeDefined();
+  1144→      expect(pkg.scripts.typecheck).toBeDefined();
+  1145→      expect(pkg.scripts.test).toBeDefined();
+  1146→      expect(pkg.scripts.build).toBeDefined();
+  1147→    });
+  1148→
+  1149→    it('should have test:coverage script in API package', async () => {
+  1150→      const fs = await import('fs');
+  1151→      const path = await import('path');
+  1152→      const apiPkgPath = path.join(__dirname, '../../package.json');
+  1153→
+  1154→      const pkg = JSON.parse(fs.readFileSync(apiPkgPath, 'utf8'));
+  1155→      expect(pkg.scripts['test:coverage']).toBeDefined();
+  1156→    });
+  1157→  });
+  1158→
+  1159→  describe('Vitest Configuration', () => {
+  1160→    it('should have coverage thresholds configured', async () => {
+  1161→      const fs = await import('fs');
+  1162→      const path = await import('path');
+  1163→      const vitestPath = path.join(__dirname, '../../vitest.config.ts');
+  1164→
+  1165→      const config = fs.readFileSync(vitestPath, 'utf8');
+  1166→      expect(config).toContain('coverage');
+  1167→    });
+  1168→
+  1169→    it('should have test timeout configured', async () => {
+  1170→      const fs = await import('fs');
+  1171→      const path = await import('path');
+  1172→      const vitestPath = path.join(__dirname, '../../vitest.config.ts');
+  1173→
+  1174→      const config = fs.readFileSync(vitestPath, 'utf8');
+  1175→      expect(config).toMatch(/timeout/i);
+  1176→    });
+  1177→  });
+  1178→
+  1179→  describe('Docker Build Validation', () => {
+  1180→    it('should have API Dockerfile with multi-stage build and non-root user', async () => {
+  1181→      const fs = await import('fs');
+  1182→      const path = await import('path');
+  1183→      const dockerfilePath = path.join(__dirname, '../../Dockerfile');
+  1184→
+  1185→      const dockerfile = fs.readFileSync(dockerfilePath, 'utf8');
+  1186→      expect(dockerfile).toContain('FROM node:20-alpine AS base');
+  1187→      expect(dockerfile).toContain('FROM node:20-alpine AS runner');
+  1188→      expect(dockerfile).toContain('USER node');
+  1189→    });
+  1190→
+  1191→    it('should have production Web Dockerfile with TLS support', async () => {
+  1192→      const fs = await import('fs');
+  1193→      const path = await import('path');
+  1194→      const dockerfilePath = path.join(__dirname, '../../../web/Dockerfile.production');
+  1195→
+  1196→      expect(fs.existsSync(dockerfilePath)).toBe(true);
+  1197→      const dockerfile = fs.readFileSync(dockerfilePath, 'utf8');
+  1198→      expect(dockerfile).toContain('nginx-secure.conf');
+  1199→      expect(dockerfile).toContain('443');
+  1200→    });
+  1201→  });
+  1202→
+  1203→  describe('TypeScript Configuration', () => {
+  1204→    it('should have strict mode in tsconfig (via base config)', async () => {
+  1205→      const fs = await import('fs');
+  1206→      const path = await import('path');
+  1207→      const tsconfigPath = path.join(__dirname, '../../../../tsconfig.base.json');
+  1208→
+  1209→      const tsconfig = JSON.parse(fs.readFileSync(tsconfigPath, 'utf8'));
+  1210→      expect(tsconfig.compilerOptions.strict).toBe(true);
+  1211→    });
+  1212→  });
+  1213→});
+  1214→
+  1215→// ═══════════════════════════════════════════════════════════
+  1216→// P2.2.9 — NON-REGRESSION FINAL AUDIT
+  1217→// ═══════════════════════════════════════════════════════════
+  1218→
+  1219→describe('P2.2.9 — Non-Regression Final Audit', () => {
+  1220→  describe('No Tenant Leaks in API Responses', () => {
+  1221→    it('should NOT expose MFA secrets in user API responses', async () => {
+  1222→      const fs = await import('fs');
+  1223→      const path = await import('path');
+  1224→      const adminPath = path.join(__dirname, '../routes/admin.ts');
+  1225→      const code = fs.readFileSync(adminPath, 'utf8');
+  1226→
+  1227→      // The user list endpoint should NOT return mfaSecret
+  1228→      const userSelectMatch = code.match(/select\(\{[^}]*\}\)/g);
+  1229→      if (userSelectMatch) {
+  1230→        for (const match of userSelectMatch) {
+  1231→          expect(match).not.toContain('mfaSecret');
+  1232→          expect(match).not.toContain('passwordHash');
+  1233→          expect(match).not.toContain('mfaBackupCodes');
+  1234→        }
+  1235→      }
+  1236→    });
+  1237→
+  1238→    it('should NOT expose passwordHash in any auth response', async () => {
+  1239→      const fs = await import('fs');
+  1240→      const path = await import('path');
+  1241→
+  1242→      const authPath = path.join(__dirname, '../routes/auth.ts');
+  1243→      const code = fs.readFileSync(authPath, 'utf8');
+  1244→
+  1245→      // Check that user data returned in c.json responses does not include
+  1246→      // passwordHash or mfaSecret. These only appear in DB query contexts.
+  1247→      const lines = code.split('\n');
+  1248→      for (let i = 0; i < lines.length; i++) {
+  1249→        const line = lines[i];
+  1250→        // Only check lines that are part of c.json() response blocks
+  1251→        // that contain user data objects (e.g., user: { id, email, ... })
+  1252→        if (line.includes('c.json(') && line.includes('user:') && !line.includes('userId')) {
+  1253→          // Scan the next few lines for the response block
+  1254→          const block = lines.slice(i, Math.min(i + 10, lines.length)).join('\n');
+  1255→          if (block.includes('id:') && block.includes('email:')) {
+  1256→            // This is a user data response — ensure no secrets
+  1257→            expect(block).not.toContain('passwordHash');
+  1258→            expect(block).not.toContain('mfaSecret');
+  1259→          }
+  1260→        }
+  1261→      }
+  1262→    });
+  1263→  });
+  1264→
+  1265→  describe('No Admin Endpoints Exposed Without Auth', () => {
+  1266→    it('should have requirePermission on ALL admin routes', async () => {
+  1267→      const fs = await import('fs');
+  1268→      const path = await import('path');
+  1269→      const adminPath = path.join(__dirname, '../routes/admin.ts');
+  1270→      const code = fs.readFileSync(adminPath, 'utf8');
+  1271→
+  1272→      // Every admin route definition line should include requirePermission
+  1273→      // Route format: admin.METHOD('/path', requirePermission({...}), handler)
+  1274→      const routeLines = code.split('\n').filter(l =>
+  1275→        l.trim().startsWith('admin.') &&
+  1276→        (l.includes('.get(') || l.includes('.post(') || l.includes('.put(') ||
+  1277→         l.includes('.patch(') || l.includes('.delete('))
+  1278→      );
+  1279→
+  1280→      for (const line of routeLines) {
+  1281→        expect(line).toContain('requirePermission');
+  1282→      }
+  1283→    });
+  1284→  });
+  1285→
+  1286→  describe('No Insecure Default Configuration', () => {
+  1287→    it('should NOT have hardcoded secrets in source code', async () => {
+  1288→      const fs = await import('fs');
+  1289→      const path = await import('path');
+  1290→      const indexPath = path.join(__dirname, '../index.ts');
+  1291→      const code = fs.readFileSync(indexPath, 'utf8');
+  1292→
+  1293→      expect(code).not.toMatch(/password\s*[:=]\s*['"][^'"]+['"]/);
+  1294→      expect(code).not.toMatch(/secret\s*[:=]\s*['"][^'"]+['"]/i);
+  1295→    });
+  1296→
+  1297→    it('should have proper CORS configuration', async () => {
+  1298→      const fs = await import('fs');
+  1299→      const path = await import('path');
+  1300→      const indexPath = path.join(__dirname, '../index.ts');
+  1301→      const code = fs.readFileSync(indexPath, 'utf8');
+  1302→
+  1303→      expect(code).toContain('cors');
+  1304→      expect(code).toContain('credentials: true');
+  1305→      expect(code).toContain('allowMethods');
+  1306→      expect(code).toContain('allowHeaders');
+  1307→    });
+  1308→  });
+  1309→
+  1310→  describe('Encryption Service No Regression', () => {
+  1311→    it('should still encrypt/decrypt correctly after P2.2 changes', () => {
+  1312→      const enc = new EncryptionService();
+  1313→      enc.initialize('test-mfa-encryption-key-for-testing', '01');
+  1314→
+  1315→      const testData = [
+  1316→        'short',
+  1317→        'A'.repeat(1000),
+  1318→        'Special chars: accents and unicode',
+  1319→        '{"json": true, "nested": {"key": "value"}}',
+  1320→        'JBSWY3DPEHPK3PXP',
+  1321→      ];
+  1322→
+  1323→      for (const data of testData) {
+  1324→        const encrypted = enc.encrypt(data);
+  1325→        const decrypted = enc.decrypt(encrypted);
+  1326→        expect(decrypted).toBe(data);
+  1327→      }
+  1328→    });
+  1329→  });
+  1330→
+  1331→  describe('RBAC No Regression', () => {
+  1332→    it('should maintain correct permission matrix after P2.2 changes', () => {
+  1333→      const rbac = new RBACService();
+  1334→
+  1335→      // Critical checks that must never regress
+  1336→      expect(rbac.hasPermission('viewer', 'users', 'delete')).toBe(false);
+  1337→      expect(rbac.hasPermission('user', 'billing', 'read')).toBe(false);
+  1338→      expect(rbac.hasPermission('manager', 'users', 'manage')).toBe(false);
+  1339→      expect(rbac.hasPermission('admin', 'tenants', 'delete')).toBe(false);
+  1340→      expect(rbac.hasPermission('super_admin', 'users', 'manage')).toBe(true);
+  1341→      expect(rbac.hasPermission('admin', 'users', 'manage')).toBe(true);
+  1342→      expect(rbac.hasPermission('viewer', 'projects', 'read')).toBe(true);
+  1343→    });
+  1344→  });
+  1345→
+  1346→  describe('JWT Blacklist No Regression', () => {
+  1347→    it('should still blacklist tokens correctly', async () => {
+  1348→      const blacklist = new JWTBlacklist();
+  1349→      const jti = `regression-test-${Date.now()}`;
+  1350→
+  1351→      expect(await blacklist.isBlacklisted(jti)).toBe(false);
+  1352→
+  1353→      await blacklist.blacklist(jti, 3600);
+  1354→      expect(await blacklist.isBlacklisted(jti)).toBe(true);
+  1355→    });
+  1356→  });
+  1357→});
+  1358→

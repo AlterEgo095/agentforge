@@ -1,0 +1,994 @@
+     1→/**
+     2→ * ALTER EGO OS — Writer Worker Tests (Sprint 4 Enhanced)
+     3→ *
+     4→ * Tests cover:
+     5→ * - Templates (existing)
+     6→ * - Renderer (existing)
+     7→ * - WriterWorker core (existing + Sprint 4)
+     8→ * - Plugin integration (existing)
+     9→ * - Sprint 4: LLM Enhancer
+    10→ * - Sprint 4: Quality Scorer
+    11→ * - Sprint 4: Refinement Loop
+    12→ * - Sprint 4: Research→Writer Bridge
+    13→ * - Sprint 4: End-to-end pipeline
+    14→ */
+    15→
+    16→import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
+    17→import { WriterWorker } from '../writer-worker.js';
+    18→import { createWriterWorker, WRITER_WORKER_MANIFEST } from '../plugin.js';
+    19→import { buildSections, buildTocFromSections, formatReferencesList } from '../templates.js';
+    20→import { renderMarkdown, renderHtml, renderPlain } from '../renderer.js';
+    21→import { LLMEnhancer } from '../enhancer.js';
+    22→import { QualityScorer } from '../quality-scorer.js';
+    23→import { RefinementEngine } from '../refinement.js';
+    24→import { bridgeResearchToWriter } from '../bridge.js';
+    25→import type {
+    26→  ResearchInput,
+    27→  ContentType,
+    28→  ContentTone,
+    29→  DocumentSection,
+    30→  WrittenDocument,
+    31→  ILLMProvider,
+    32→  LLMCallMessage,
+    33→  LLMCallResult,
+    34→  QualityDimension,
+    35→  WriterConfig,
+    36→} from '../types.js';
+    37→import { DEFAULT_WRITER_CONFIG, QUALITY_DIMENSION_WEIGHTS } from '../types.js';
+    38→
+    39→// ─── Test Fixtures ────────────────────────────────────────────
+    40→
+    41→function createMockResearchInput(): ResearchInput {
+    42→  return {
+    43→    query: 'Agentic AI frameworks 2026',
+    44→    sources: [
+    45→      {
+    46→        id: 'src_1',
+    47→        url: 'https://example.com/ai-agents',
+    48→        title: 'AI Agents: A Comprehensive Guide',
+    49→        snippet: 'Everything about AI agents and their applications in modern software.',
+    50→        type: 'article',
+    51→        credibility: 'high',
+    52→        relevanceScore: 0.9,
+    53→        tags: ['ai', 'agents', 'frameworks'],
+    54→        content: {
+    55→          text: 'AI agents are autonomous programs. According to research, 78% of enterprises are exploring agentic AI. The technology is growing rapidly, with adoption increasing by 150% YoY. Key frameworks include LangChain, AutoGPT, and CrewAI. Security risks must be carefully addressed. Docker containers are increasingly used to isolate agent execution. Kubernetes enables scalable multi-agent deployments.',
+    56→          wordCount: 50,
+    57→          language: 'en',
+    58→          meta: { title: 'AI Agents Guide', description: 'Guide about AI agents', author: 'Dr. Smith', publishedTime: '2026-01-15' },
+    59→        },
+    60→      },
+    61→      {
+    62→        id: 'src_2',
+    63→        url: 'https://example.com/agentic-state',
+    64→        title: 'The State of Agentic AI in 2026',
+    65→        snippet: 'Agentic AI is transforming software development with autonomous capabilities.',
+    66→        type: 'blog',
+    67→        credibility: 'medium',
+    68→        relevanceScore: 0.75,
+    69→        tags: ['agentic', 'ai', 'deployment'],
+    70→        content: {
+    71→          text: 'Agentic AI represents the next frontier. Agent-based systems improve productivity by 40%. The technology should be deployed with safety guardrails. LangChain is the most popular framework. Multi-agent systems outperform single agents by 60%. Security remains a critical concern for autonomous deployments.',
+    72→          wordCount: 40,
+    73→          language: 'en',
+    74→          meta: { title: 'Agentic AI 2026', author: 'Jane Doe', publishedTime: '2026-03-20' },
+    75→        },
+    76→      },
+    77→    ],
+    78→    findings: [
+    79→      { id: 'f1', content: '78% of enterprises are exploring agentic AI', type: 'statistic', sourceIds: ['src_1'], sentiment: 'positive', confidence: 0.85, topics: ['ai', 'enterprise'] },
+    80→      { id: 'f2', content: 'Agent-based systems improve productivity by 40%', type: 'statistic', sourceIds: ['src_2'], sentiment: 'positive', confidence: 0.8, topics: ['productivity', 'ai'] },
+    81→      { id: 'f3', content: 'Security risks must be carefully addressed', type: 'warning', sourceIds: ['src_1', 'src_2'], sentiment: 'negative', confidence: 0.9, topics: ['security'] },
+    82→      { id: 'f4', content: 'Adoption is increasing by 150% year-over-year', type: 'trend', sourceIds: ['src_1'], sentiment: 'positive', confidence: 0.7, topics: ['trends', 'adoption'] },
+    83→      { id: 'f5', content: 'LangChain is the most popular framework for building agents', type: 'fact', sourceIds: ['src_1', 'src_2'], sentiment: 'neutral', confidence: 0.75, topics: ['langchain', 'frameworks'] },
+    84→      { id: 'f6', content: 'Multi-agent systems outperform single agents by 60%', type: 'statistic', sourceIds: ['src_2'], sentiment: 'positive', confidence: 0.7, topics: ['multi-agent'] },
+    85→      { id: 'f7', content: 'Docker containers are increasingly used for isolation', type: 'fact', sourceIds: ['src_1'], sentiment: 'neutral', confidence: 0.6, topics: ['docker', 'deployment'] },
+    86→      { id: 'f8', content: 'Guardrails should be implemented for production deployments', type: 'recommendation', sourceIds: ['src_2'], sentiment: 'neutral', confidence: 0.85, topics: ['best-practices'] },
+    87→    ],
+    88→    comparisons: [
+    89→      { sourceIds: ['src_1', 'src_2'], type: 'agreement', agreements: ['LangChain is the leading framework', 'Security is a critical concern'], disagreements: [], similarity: 0.65 },
+    90→    ],
+    91→    classification: {
+    92→      primaryTopic: 'Agentic AI frameworks',
+    93→      subTopics: ['ai', 'agents', 'deployment', 'security', 'langchain'],
+    94→      domain: 'artificial-intelligence',
+    95→      entities: [
+    96→        { name: 'LangChain', type: 'tool', frequency: 4 },
+    97→        { name: 'AutoGPT', type: 'tool', frequency: 2 },
+    98→        { name: 'Docker', type: 'tool', frequency: 3 },
+    99→        { name: 'Kubernetes', type: 'tool', frequency: 2 },
+   100→        { name: 'Python', type: 'language', frequency: 1 },
+   101→      ],
+   102→      overallSentiment: 'positive',
+   103→      temporalFocus: 'forward-looking',
+   104→    },
+   105→    summary: {
+   106→      executive: 'Agentic AI is rapidly transforming software development with 78% enterprise adoption. Key frameworks include LangChain, AutoGPT, and CrewAI.',
+   107→      keyFindings: [
+   108→        { finding: '78% enterprise adoption of agentic AI', confidence: 0.85, type: 'statistic' },
+   109→        { finding: 'Security risks must be addressed', confidence: 0.9, type: 'warning' },
+   110→        { finding: 'Multi-agent systems outperform single agents', confidence: 0.7, type: 'statistic' },
+   111→      ],
+   112→      consensus: ['LangChain is the leading framework', 'Security is a critical concern'],
+   113→      controversies: [],
+   114→      gaps: ['Limited academic research on long-term agent reliability'],
+   115→      recommendations: ['Deep-dive into LangChain', 'Search academic databases', 'Investigate security concerns'],
+   116→    },
+   117→    references: [
+   118→      { id: 'ref_1', sourceId: 'src_1', citation: 'Dr. Smith (2026). AI Agents: A Comprehensive Guide. example.com. https://example.com/ai-agents', format: 'apa', author: 'Dr. Smith', publishedDate: '2026-01-15', title: 'AI Agents: A Comprehensive Guide', url: 'https://example.com/ai-agents' },
+   119→      { id: 'ref_2', sourceId: 'src_2', citation: 'Doe, J. (2026). The State of Agentic AI in 2026. example.com. https://example.com/agentic-state', format: 'apa', author: 'Jane Doe', publishedDate: '2026-03-20', title: 'The State of Agentic AI in 2026', url: 'https://example.com/agentic-state' },
+   120→    ],
+   121→  };
+   122→}
+   123→
+   124→// ─── Mock LLM Provider ────────────────────────────────────────
+   125→
+   126→function createMockLLMProvider(enhancedContent?: string): ILLMProvider {
+   127→  const defaultEnhanced = enhancedContent || 'This is an enhanced version of the section content with more depth, better flow, and richer analysis. The research findings support several key conclusions about the topic. Furthermore, the evidence suggests significant implications for the field. Additionally, this enhanced content provides greater context and nuance than the original template-generated text. In conclusion, the data strongly supports the central thesis while highlighting areas for further investigation.';
+   128→
+   129→  return {
+   130→    async call(messages: LLMCallMessage[], options?: { temperature?: number; maxTokens?: number }): Promise<LLMCallResult> {
+   131→      // Simulate LLM response based on the user message content
+   132→      const lastUserMessage = messages[messages.length - 1]?.content || '';
+   133→
+   134→      // Generate contextual enhanced content
+   135→      let response = defaultEnhanced;
+   136→
+   137→      if (lastUserMessage.includes('Introduction')) {
+   138→        response = 'The landscape of artificial intelligence has undergone a profound transformation with the emergence of agentic AI frameworks. These sophisticated systems represent a paradigm shift from traditional chatbot interactions to autonomous, goal-oriented agents capable of complex multi-step reasoning and action. Based on comprehensive analysis of multiple authoritative sources, this document examines the current state of agentic AI, its enterprise adoption patterns, and the critical frameworks driving innovation in this space. The findings reveal a rapidly maturing ecosystem with significant implications for software development practices.';
+   139→      } else if (lastUserMessage.includes('Finding')) {
+   140→        response = 'The research reveals several compelling findings that paint a picture of rapid evolution in the agentic AI landscape. Most notably, enterprise adoption has reached 78%, signaling a decisive shift from experimental to production deployment. Furthermore, productivity gains of 40% in agent-based systems demonstrate tangible business value. However, these opportunities are tempered by significant security concerns that demand careful attention from practitioners and organizations alike.';
+   141→      } else if (lastUserMessage.includes('improve') || lastUserMessage.includes('feedback')) {
+   142→        response = defaultEnhanced + ' This revised version addresses the identified quality concerns by adding more detailed analysis, improving source attribution, and strengthening the logical flow between ideas.';
+   143→      }
+   144→
+   145→      return {
+   146→        content: response,
+   147→        tokensUsed: Math.floor(Math.random() * 500) + 200,
+   148→        cost: 0.002,
+   149→        latencyMs: Math.floor(Math.random() * 200) + 100,
+   150→        provider: 'mock-llm',
+   151→      };
+   152→    },
+   153→  };
+   154→}
+   155→
+   156→// ═══════════════════════════════════════════════════════════════
+   157→// TEMPLATE TESTS
+   158→// ═══════════════════════════════════════════════════════════════
+   159→
+   160→describe('Templates', () => {
+   161→  const input = createMockResearchInput();
+   162→
+   163→  it('should build article sections', () => {
+   164→    const sections = buildSections('article', input, 'professional');
+   165→    expect(sections.length).toBeGreaterThan(3);
+   166→    expect(sections.some(s => s.title === 'Introduction')).toBe(true);
+   167→    expect(sections.some(s => s.title === 'Key Findings')).toBe(true);
+   168→  });
+   169→
+   170→  it('should build report sections', () => {
+   171→    const sections = buildSections('report', input, 'professional');
+   172→    expect(sections.some(s => s.title === 'Executive Summary')).toBe(true);
+   173→    expect(sections.some(s => s.title === 'Findings')).toBe(true);
+   174→    expect(sections.some(s => s.title === 'Conclusions')).toBe(true);
+   175→  });
+   176→
+   177→  it('should build documentation sections', () => {
+   178→    const sections = buildSections('documentation', input, 'technical');
+   179→    expect(sections.some(s => s.title === 'Overview')).toBe(true);
+   180→    expect(sections.some(s => s.title === 'How It Works')).toBe(true);
+   181→  });
+   182→
+   183→  it('should build course sections', () => {
+   184→    const sections = buildSections('course', input, 'instructional');
+   185→    expect(sections.some(s => s.title === 'Course Overview')).toBe(true);
+   186→    expect(sections.some(s => s.title === 'Learning Objectives')).toBe(true);
+   187→    expect(sections.some(s => s.title.includes('Module'))).toBe(true);
+   188→  });
+   189→
+   190→  it('should build comparison sections', () => {
+   191→    const sections = buildSections('comparison', input, 'professional');
+   192→    expect(sections.some(s => s.title === 'Comparative Analysis')).toBe(true);
+   193→  });
+   194→
+   195→  it('should build TOC from sections', () => {
+   196→    const sections = buildSections('article', input, 'professional');
+   197→    const toc = buildTocFromSections(sections);
+   198→    expect(toc.length).toBeGreaterThan(0);
+   199→    expect(toc[0].title).toBeTruthy();
+   200→    expect(toc[0].sectionId).toBeTruthy();
+   201→  });
+   202→
+   203→  it('should format references list', () => {
+   204→    const list = formatReferencesList(input.references);
+   205→    expect(list).toContain('Dr. Smith');
+   206→    expect(list).toContain('example.com');
+   207→  });
+   208→
+   209→  it('should handle empty findings gracefully', () => {
+   210→    const emptyInput = { ...input, findings: [], comparisons: [], summary: { ...input.summary, keyFindings: [], consensus: [], controversies: [], gaps: [], recommendations: [] } };
+   211→    const sections = buildSections('article', emptyInput, 'professional');
+   212→    expect(sections.length).toBeGreaterThan(0);
+   213→  });
+   214→});
+   215→
+   216→// ═══════════════════════════════════════════════════════════════
+   217→// RENDERER TESTS
+   218→// ═══════════════════════════════════════════════════════════════
+   219→
+   220→describe('Renderer', () => {
+   221→  function createTestDocument(): WrittenDocument {
+   222→    const input = createMockResearchInput();
+   223→    return {
+   224→      id: 'doc_test',
+   225→      topic: input.query,
+   226→      contentType: 'article',
+   227→      tone: 'professional',
+   228→      format: 'markdown',
+   229→      title: 'Test Article',
+   230→      subtitle: 'A test',
+   231→      toc: [{ title: 'Introduction', level: 2, sectionId: 'sec_1', children: [] }],
+   232→      sections: [
+   233→        { id: 'sec_1', title: 'Introduction', level: 2, content: 'This is the **introduction**.', children: [], sourceIds: [] },
+   234→        { id: 'sec_2', title: 'Details', level: 2, content: '- Item 1\n- Item 2', children: [], sourceIds: [] },
+   235→      ],
+   236→      references: input.references,
+   237→      summary: 'Test summary content.',
+   238→      wordCount: 100,
+   239→      language: 'en',
+   240→      metadata: {
+   241→        sourceCount: 2,
+   242→        findingCount: 8,
+   243→        primaryDomain: 'ai',
+   244→        entities: [{ name: 'LangChain', type: 'tool' }],
+   245→        readingTimeMinutes: 1,
+   246→        confidence: 0.8,
+   247→      },
+   248→      rendered: '',
+   249→      createdAt: new Date().toISOString(),
+   250→    };
+   251→  }
+   252→
+   253→  it('should render markdown', () => {
+   254→    const doc = createTestDocument();
+   255→    const md = renderMarkdown(doc);
+   256→    expect(md).toContain('# Test Article');
+   257→    expect(md).toContain('## Introduction');
+   258→    expect(md).toContain('**introduction**');
+   259→    expect(md).toContain('## References');
+   260→  });
+   261→
+   262→  it('should render HTML', () => {
+   263→    const doc = createTestDocument();
+   264→    const html = renderHtml(doc);
+   265→    expect(html).toContain('<!DOCTYPE html>');
+   266→    expect(html).toContain('<title>Test Article</title>');
+   267→    expect(html).toContain('<h2');
+   268→    expect(html).toContain('</html>');
+   269→  });
+   270→
+   271→  it('should render plain text', () => {
+   272→    const doc = createTestDocument();
+   273→    const plain = renderPlain(doc);
+   274→    expect(plain).toContain('Test Article');
+   275→    expect(plain).toContain('Introduction');
+   276→    expect(plain).not.toContain('##'); // Markdown markers removed
+   277→  });
+   278→
+   279→  it('should include TOC in markdown', () => {
+   280→    const doc = createTestDocument();
+   281→    const md = renderMarkdown(doc);
+   282→    expect(md).toContain('Table of Contents');
+   283→  });
+   284→
+   285→  it('should include references in markdown', () => {
+   286→    const doc = createTestDocument();
+   287→    const md = renderMarkdown(doc);
+   288→    expect(md).toContain('Dr. Smith');
+   289→  });
+   290→
+   291→  it('should include summary in markdown', () => {
+   292→    const doc = createTestDocument();
+   293→    const md = renderMarkdown(doc);
+   294→    expect(md).toContain('Test summary content');
+   295→  });
+   296→});
+   297→
+   298→// ═══════════════════════════════════════════════════════════════
+   299→// WRITER WORKER TESTS (existing + Sprint 4)
+   300→// ═══════════════════════════════════════════════════════════════
+   301→
+   302→describe('WriterWorker', () => {
+   303→  it('should write an article from research input', async () => {
+   304→    const writer = new WriterWorker();
+   305→    const input = createMockResearchInput();
+   306→    const session = await writer.write(input, { defaultContentType: 'article' });
+   307→
+   308→    expect(session.status).toBe('completed');
+   309→    expect(session.document).toBeTruthy();
+   310→    expect(session.document!.contentType).toBe('article');
+   311→    expect(session.document!.title).toContain('Agentic AI');
+   312→    expect(session.document!.sections.length).toBeGreaterThan(3);
+   313→    expect(session.document!.rendered).toBeTruthy();
+   314→    expect(session.document!.wordCount).toBeGreaterThan(100);
+   315→    expect(session.document!.metadata.sourceCount).toBe(2);
+   316→    expect(session.durationMs).toBeGreaterThanOrEqual(0);
+   317→  });
+   318→
+   319→  it('should write a report from research input', async () => {
+   320→    const writer = new WriterWorker();
+   321→    const input = createMockResearchInput();
+   322→    const session = await writer.writeReport(input);
+   323→
+   324→    expect(session.status).toBe('completed');
+   325→    expect(session.document!.contentType).toBe('report');
+   326→    expect(session.document!.sections.some(s => s.title === 'Executive Summary')).toBe(true);
+   327→  });
+   328→
+   329→  it('should write documentation from research input', async () => {
+   330→    const writer = new WriterWorker();
+   331→    const input = createMockResearchInput();
+   332→    const session = await writer.writeDocumentation(input);
+   333→
+   334→    expect(session.status).toBe('completed');
+   335→    expect(session.document!.contentType).toBe('documentation');
+   336→    expect(session.document!.sections.some(s => s.title === 'How It Works')).toBe(true);
+   337→  });
+   338→
+   339→  it('should write a course from research input', async () => {
+   340→    const writer = new WriterWorker();
+   341→    const input = createMockResearchInput();
+   342→    const session = await writer.writeCourse(input);
+   343→
+   344→    expect(session.status).toBe('completed');
+   345→    expect(session.document!.contentType).toBe('course');
+   346→    expect(session.document!.sections.some(s => s.title === 'Course Overview')).toBe(true);
+   347→    expect(session.document!.sections.some(s => s.title === 'Learning Objectives')).toBe(true);
+   348→  });
+   349→
+   350→  it('should compute word count and reading time', async () => {
+   351→    const writer = new WriterWorker();
+   352→    const input = createMockResearchInput();
+   353→    const session = await writer.write(input);
+   354→
+   355→    expect(session.document!.wordCount).toBeGreaterThan(0);
+   356→    expect(session.document!.metadata.readingTimeMinutes).toBeGreaterThanOrEqual(1);
+   357→  });
+   358→
+   359→  it('should compute overall confidence', async () => {
+   360→    const writer = new WriterWorker();
+   361→    const input = createMockResearchInput();
+   362→    const session = await writer.write(input);
+   363→
+   364→    expect(session.document!.metadata.confidence).toBeGreaterThan(0);
+   365→    expect(session.document!.metadata.confidence).toBeLessThanOrEqual(1);
+   366→  });
+   367→
+   368→  it('should respect output format config', async () => {
+   369→    const writer = new WriterWorker();
+   370→    const input = createMockResearchInput();
+   371→    const session = await writer.write(input, { outputFormat: 'html' });
+   372→
+   373→    expect(session.document!.format).toBe('html');
+   374→    expect(session.document!.rendered).toContain('<!DOCTYPE html>');
+   375→  });
+   376→
+   377→  it('should include TOC when configured', async () => {
+   378→    const writer = new WriterWorker();
+   379→    const input = createMockResearchInput();
+   380→    const session = await writer.write(input, { includeToc: true });
+   381→
+   382→    expect(session.document!.toc.length).toBeGreaterThan(0);
+   383→  });
+   384→
+   385→  it('should exclude TOC when configured', async () => {
+   386→    const writer = new WriterWorker();
+   387→    const input = createMockResearchInput();
+   388→    const session = await writer.write(input, { includeToc: false });
+   389→
+   390→    expect(session.document!.toc.length).toBe(0);
+   391→  });
+   392→
+   393→  it('should exclude references when configured', async () => {
+   394→    const writer = new WriterWorker();
+   395→    const input = createMockResearchInput();
+   396→    const session = await writer.write(input, { includeReferences: false });
+   397→
+   398→    expect(session.document!.references.length).toBe(0);
+   399→  });
+   400→
+   401→  it('should list sessions', async () => {
+   402→    const writer = new WriterWorker();
+   403→    const input = createMockResearchInput();
+   404→    await writer.write(input);
+   405→    const sessions = await writer.listSessions();
+   406→    expect(sessions.length).toBeGreaterThanOrEqual(1);
+   407→  });
+   408→
+   409→  it('should get session by id', async () => {
+   410→    const writer = new WriterWorker();
+   411→    const input = createMockResearchInput();
+   412→    const session = await writer.write(input);
+   413→    const retrieved = await writer.getSession(session.id);
+   414→    expect(retrieved).toBeTruthy();
+   415→    expect(retrieved!.id).toBe(session.id);
+   416→  });
+   417→
+   418→  it('should report healthy', async () => {
+   419→    const writer = new WriterWorker();
+   420→    const health = await writer.healthCheck();
+   421→    expect(health.status).toBe('degraded'); // No LLM provider = degraded
+   422→  });
+   423→
+   424→  it('should report healthy with LLM provider', async () => {
+   425→    const writer = new WriterWorker({ llmProvider: createMockLLMProvider() });
+   426→    const health = await writer.healthCheck();
+   427→    expect(health.status).toBe('healthy');
+   428→  });
+   429→
+   430→  it('should report unhealthy when disposed', async () => {
+   431→    const writer = new WriterWorker();
+   432→    await writer.dispose();
+   433→    const health = await writer.healthCheck();
+   434→    expect(health.status).toBe('unhealthy');
+   435→  });
+   436→
+   437→  it('should throw when writing after disposal', async () => {
+   438→    const writer = new WriterWorker();
+   439→    await writer.dispose();
+   440→    await expect(writer.write(createMockResearchInput())).rejects.toThrow('disposed');
+   441→  });
+   442→
+   443→  it('should use default config', () => {
+   444→    expect(DEFAULT_WRITER_CONFIG.defaultContentType).toBe('article');
+   445→    expect(DEFAULT_WRITER_CONFIG.defaultTone).toBe('professional');
+   446→    expect(DEFAULT_WRITER_CONFIG.outputFormat).toBe('markdown');
+   447→    expect(DEFAULT_WRITER_CONFIG.targetWordCount).toBe(2000);
+   448→    expect(DEFAULT_WRITER_CONFIG.includeToc).toBe(true);
+   449→    expect(DEFAULT_WRITER_CONFIG.includeReferences).toBe(true);
+   450→    expect(DEFAULT_WRITER_CONFIG.includeSummary).toBe(true);
+   451→    // Sprint 4 defaults
+   452→    expect(DEFAULT_WRITER_CONFIG.enableLLMEnhancement).toBe(false);
+   453→    expect(DEFAULT_WRITER_CONFIG.enableQualityScoring).toBe(true);
+   454→    expect(DEFAULT_WRITER_CONFIG.enableRefinement).toBe(false);
+   455→    expect(DEFAULT_WRITER_CONFIG.maxRefinementIterations).toBe(2);
+   456→    expect(DEFAULT_WRITER_CONFIG.minQualityScore).toBe(0.7);
+   457→  });
+   458→});
+   459→
+   460→// ═══════════════════════════════════════════════════════════════
+   461→// SPRINT 4: LLM ENHANCER TESTS
+   462→// ═══════════════════════════════════════════════════════════════
+   463→
+   464→describe('Sprint 4: LLM Enhancer', () => {
+   465→  it('should enhance sections with LLM', async () => {
+   466→    const mockLLM = createMockLLMProvider();
+   467→    const enhancer = new LLMEnhancer(mockLLM);
+   468→    const input = createMockResearchInput();
+   469→
+   470→    const sections = buildSections('article', input, 'professional');
+   471→    const result = await enhancer.enhanceSections(sections, input, 'article', 'professional', 2000);
+   472→
+   473→    expect(result.sections.length).toBe(sections.length);
+   474→    expect(result.tokensUsed).toBeGreaterThan(0);
+   475→    expect(result.cost).toBeGreaterThan(0);
+   476→
+   477→    // At least some sections should be enhanced
+   478→    const enhancedSections = result.sections.filter(s => s.llmEnhanced === true);
+   479→    expect(enhancedSections.length).toBeGreaterThan(0);
+   480→  });
+   481→
+   482→  it('should handle LLM failures gracefully', async () => {
+   483→    const failingLLM: ILLMProvider = {
+   484→      async call() {
+   485→        throw new Error('LLM unavailable');
+   486→      },
+   487→    };
+   488→
+   489→    const enhancer = new LLMEnhancer(failingLLM);
+   490→    const input = createMockResearchInput();
+   491→    const sections = buildSections('article', input, 'professional');
+   492→
+   493→    const result = await enhancer.enhanceSections(sections, input, 'article', 'professional', 2000);
+   494→
+   495→    // Should not throw — sections should keep original content
+   496→    expect(result.sections.length).toBe(sections.length);
+   497→    const failedSections = result.sections.filter(s => s.llmEnhanced === false);
+   498→    expect(failedSections.length).toBeGreaterThan(0);
+   499→  });
+   500→
+   501→  it('should improve specific sections', async () => {
+   502→    const mockLLM = createMockLLMProvider();
+   503→    const enhancer = new LLMEnhancer(mockLLM);
+   504→    const input = createMockResearchInput();
+   505→
+   506→    const section: DocumentSection = {
+   507→      id: 'sec_test',
+   508→      title: 'Test Section',
+   509→      level: 2,
+   510→      content: 'Short content.',
+   511→      children: [],
+   512→      sourceIds: ['src_1'],
+   513→    };
+   514→
+   515→    const improved = await enhancer.improveSection(
+   516→      section,
+   517→      ['Add more depth and detail', 'Include supporting evidence'],
+   518→      input,
+   519→      'article',
+   520→      'professional',
+   521→    );
+   522→
+   523→    expect(improved.content).toBeTruthy();
+   524→    expect(improved.llmEnhanced).toBe(true);
+   525→  });
+   526→
+   527→  it('should report cumulative stats', async () => {
+   528→    const mockLLM = createMockLLMProvider();
+   529→    const enhancer = new LLMEnhancer(mockLLM);
+   530→    const input = createMockResearchInput();
+   531→    const sections = buildSections('article', input, 'professional');
+   532→
+   533→    await enhancer.enhanceSections(sections, input, 'article', 'professional', 2000);
+   534→
+   535→    const stats = enhancer.getStats();
+   536→    expect(stats.tokensUsed).toBeGreaterThan(0);
+   537→    expect(stats.cost).toBeGreaterThan(0);
+   538→  });
+   539→});
+   540→
+   541→// ═══════════════════════════════════════════════════════════════
+   542→// SPRINT 4: QUALITY SCORER TESTS
+   543→// ═══════════════════════════════════════════════════════════════
+   544→
+   545→describe('Sprint 4: Quality Scorer', () => {
+   546→  it('should score a document across all dimensions', async () => {
+   547→    const writer = new WriterWorker();
+   548→    const input = createMockResearchInput();
+   549→    const session = await writer.write(input, { enableQualityScoring: true });
+   550→
+   551→    expect(session.document!.quality).toBeTruthy();
+   552→    const quality = session.document!.quality!;
+   553→
+   554→    expect(quality.overall).toBeGreaterThanOrEqual(0);
+   555→    expect(quality.overall).toBeLessThanOrEqual(1);
+   556→
+   557→    // All dimensions should have scores
+   558→    expect(quality.dimensions.coherence).toBeDefined();
+   559→    expect(quality.dimensions.coverage).toBeDefined();
+   560→    expect(quality.dimensions.readability).toBeDefined();
+   561→    expect(quality.dimensions.citation).toBeDefined();
+   562→    expect(quality.dimensions.depth).toBeDefined();
+   563→    expect(quality.dimensions.structure).toBeDefined();
+   564→    expect(quality.dimensions.tone).toBeDefined();
+   565→    expect(quality.dimensions.accuracy).toBeDefined();
+   566→  });
+   567→
+   568→  it('should provide improvement suggestions for low scores', async () => {
+   569→    const scorer = new QualityScorer();
+   570→
+   571→    // Create a deliberately poor document
+   572→    const poorDoc: WrittenDocument = {
+   573→      id: 'doc_poor',
+   574→      topic: 'Test',
+   575→      contentType: 'article',
+   576→      tone: 'professional',
+   577→      format: 'markdown',
+   578→      title: 'Poor Doc',
+   579→      subtitle: '',
+   580→      toc: [],
+   581→      sections: [
+   582→        { id: 's1', title: 'Intro', level: 2, content: 'Short.', children: [], sourceIds: [] },
+   583→      ],
+   584→      references: [],
+   585→      summary: '',
+   586→      wordCount: 5,
+   587→      language: 'en',
+   588→      metadata: {
+   589→        sourceCount: 0,
+   590→        findingCount: 0,
+   591→        primaryDomain: 'test',
+   592→        entities: [],
+   593→        readingTimeMinutes: 1,
+   594→        confidence: 0,
+   595→      },
+   596→      rendered: 'Short.',
+   597→      createdAt: new Date().toISOString(),
+   598→    };
+   599→
+   600→    const input = createMockResearchInput();
+   601→    const score = scorer.score(poorDoc, input, 0);
+   602→
+   603→    // Should have suggestions for improvement
+   604→    expect(score.suggestions.length).toBeGreaterThan(0);
+   605→
+   606→    // Overall score should be low
+   607→    expect(score.overall).toBeLessThan(0.8);
+   608→
+   609→    // Should have at least one critical suggestion
+   610→    const criticalSuggestions = score.suggestions.filter(s => s.priority === 'critical');
+   611→    expect(criticalSuggestions.length).toBeGreaterThan(0);
+   612→  });
+   613→
+   614→  it('should score a well-written document higher', async () => {
+   615→    const writer = new WriterWorker();
+   616→    const input = createMockResearchInput();
+   617→    const session = await writer.write(input, { enableQualityScoring: true });
+   618→
+   619→    const quality = session.document!.quality!;
+   620→    // Template-generated content with references should score reasonably
+   621→    expect(quality.overall).toBeGreaterThan(0.2);
+   622→  });
+   623→
+   624→  it('should use custom dimensions when provided', async () => {
+   625→    const scorer = new QualityScorer(['coherence', 'readability']);
+   626→    const writer = new WriterWorker();
+   627→    const input = createMockResearchInput();
+   628→    const session = await writer.write(input);
+   629→
+   630→    const score = scorer.score(session.document!, input, 0);
+   631→
+   632→    expect(score.dimensions.coherence).toBeDefined();
+   633→    expect(score.dimensions.readability).toBeDefined();
+   634→    // Other dimensions should not be defined
+   635→    expect(score.dimensions.coverage).toBeUndefined();
+   636→  });
+   637→
+   638→  it('should track iteration number', async () => {
+   639→    const scorer = new QualityScorer();
+   640→    const writer = new WriterWorker();
+   641→    const input = createMockResearchInput();
+   642→    const session = await writer.write(input);
+   643→
+   644→    const score = scorer.score(session.document!, input, 3);
+   645→    expect(score.iteration).toBe(3);
+   646→  });
+   647→
+   648→  it('should have proper quality dimension weights', () => {
+   649→    const weights = Object.values(QUALITY_DIMENSION_WEIGHTS);
+   650→    const totalWeight = weights.reduce((sum, w) => sum + w, 0);
+   651→    // Weights should approximately sum to 1.0
+   652→    expect(totalWeight).toBeCloseTo(1.0, 1);
+   653→  });
+   654→});
+   655→
+   656→// ═══════════════════════════════════════════════════════════════
+   657→// SPRINT 4: REFINEMENT LOOP TESTS
+   658→// ═══════════════════════════════════════════════════════════════
+   659→
+   660→describe('Sprint 4: Refinement Loop', () => {
+   661→  it('should skip refinement when score is above threshold', async () => {
+   662→    const mockLLM = createMockLLMProvider();
+   663→    const engine = new RefinementEngine(mockLLM);
+   664→    const writer = new WriterWorker({ llmProvider: mockLLM });
+   665→    const input = createMockResearchInput();
+   666→
+   667→    // Write with a very low threshold (should always pass)
+   668→    const session = await writer.write(input, {
+   669→      enableQualityScoring: true,
+   670→      enableRefinement: true,
+   671→      minQualityScore: 0.0, // Always passes
+   672→      maxRefinementIterations: 2,
+   673→    });
+   674→
+   675→    // If the score is already above 0, refinement should be minimal
+   676→    if (session.document?.refinement) {
+   677→      // Quality history should have at least the initial score
+   678→      expect(session.document.refinement.qualityHistory.length).toBeGreaterThanOrEqual(1);
+   679→    }
+   680→  });
+   681→
+   682→  it('should perform refinement iterations when below threshold', async () => {
+   683→    const mockLLM = createMockLLMProvider();
+   684→    const writer = new WriterWorker({ llmProvider: mockLLM });
+   685→    const input = createMockResearchInput();
+   686→
+   687→    // Write with a very high threshold (forces refinement attempts)
+   688→    const session = await writer.write(input, {
+   689→      enableQualityScoring: true,
+   690→      enableRefinement: true,
+   691→      minQualityScore: 0.99, // Almost impossible to reach
+   692→      maxRefinementIterations: 2,
+   693→    });
+   694→
+   695→    if (session.document?.refinement) {
+   696→      expect(session.document.refinement.iterationsPerformed).toBeGreaterThan(0);
+   697→      expect(session.document.refinement.qualityHistory.length).toBeGreaterThan(1);
+   698→    }
+   699→  });
+   700→
+   701→  it('should track quality history across iterations', async () => {
+   702→    const mockLLM = createMockLLMProvider();
+   703→    const writer = new WriterWorker({ llmProvider: mockLLM });
+   704→    const input = createMockResearchInput();
+   705→
+   706→    const session = await writer.write(input, {
+   707→      enableQualityScoring: true,
+   708→      enableRefinement: true,
+   709→      minQualityScore: 0.99,
+   710→      maxRefinementIterations: 2,
+   711→    });
+   712→
+   713→    if (session.document?.refinement) {
+   714→      const history = session.document.refinement.qualityHistory;
+   715→      // Each entry should have an iteration number
+   716→      for (let i = 0; i < history.length; i++) {
+   717→        expect(history[i].iteration).toBe(i);
+   718→      }
+   719→    }
+   720→  });
+   721→});
+   722→
+   723→// ═══════════════════════════════════════════════════════════════
+   724→// SPRINT 4: RESEARCH → WRITER BRIDGE TESTS
+   725→// ═══════════════════════════════════════════════════════════════
+   726→
+   727→describe('Sprint 4: Research→Writer Bridge', () => {
+   728→  it('should transform a ResearchSession into Writer-compatible ResearchInput', () => {
+   729→    // Create a mock ResearchSession (matching research-worker types)
+   730→    const researchSession = {
+   731→      id: 'rs_test_1' as any,
+   732→      query: 'Test query about AI agents',
+   733→      config: {} as any,
+   734→      status: 'completed' as const,
+   735→      sources: [
+   736→        {
+   737→          id: 'src_1' as any,
+   738→          url: 'https://example.com/test',
+   739→          title: 'Test Source',
+   740→          snippet: 'A test source about AI agents.',
+   741→          type: 'article' as const,
+   742→          credibility: 'high' as const,
+   743→          engine: 'duckduckgo' as const,
+   744→          position: 1,
+   745→          relevanceScore: 0.85,
+   746→          tags: ['ai', 'agents'],
+   747→          content: {
+   748→            text: 'AI agents are autonomous programs.',
+   749→            wordCount: 5,
+   750→            language: 'en',
+   751→            meta: { title: 'Test Source' },
+   752→            links: [],
+   753→            images: [],
+   754→          },
+   755→        },
+   756→      ],
+   757→      findings: [
+   758→        {
+   759→          id: 'f1' as any,
+   760→          content: 'AI agents improve productivity',
+   761→          type: 'statistic' as const,
+   762→          sourceIds: ['src_1' as any],
+   763→          sentiment: 'positive' as const,
+   764→          confidence: 0.85,
+   765→          topics: ['ai', 'productivity'],
+   766→          extractedAt: new Date(),
+   767→        },
+   768→      ],
+   769→      comparisons: [
+   770→        {
+   771→          sourceIds: ['src_1' as any, 'src_2' as any],
+   772→          type: 'agreement' as const,
+   773→          agreements: ['AI agents are useful'],
+   774→          disagreements: [],
+   775→          uniqueToA: [],
+   776→          uniqueToB: [],
+   777→          similarity: 0.7,
+   778→        },
+   779→      ],
+   780→      classification: {
+   781→        primaryTopic: 'AI agents',
+   782→        subTopics: ['ai', 'productivity'],
+   783→        domain: 'technology',
+   784→        entities: [
+   785→          { name: 'LangChain', type: 'tool' as const, frequency: 3, mentionedIn: ['src_1' as any] },
+   786→        ],
+   787→        overallSentiment: 'positive' as const,
+   788→        temporalFocus: 'forward-looking' as const,
+   789→      },
+   790→      summary: {
+   791→        executive: 'AI agents are transforming productivity.',
+   792→        keyFindings: ['AI agents improve productivity'],
+   793→        consensus: ['AI agents are valuable'],
+   794→        controversies: [],
+   795→        gaps: ['Limited data on long-term effects'],
+   796→        recommendations: ['Further research needed'],
+   797→      },
+   798→      references: [
+   799→        {
+   800→          id: 'ref_1',
+   801→          sourceId: 'src_1' as any,
+   802→          citation: 'Test Citation (2026)',
+   803→          format: 'apa' as const,
+   804→          title: 'Test Source',
+   805→          url: 'https://example.com/test',
+   806→          accessDate: '2026-06-13',
+   807→        },
+   808→      ],
+   809→      createdAt: new Date(),
+   810→    };
+   811→
+   812→    const writerInput = bridgeResearchToWriter(researchSession as any);
+   813→
+   814→    // Verify transformation
+   815→    expect(writerInput.query).toBe('Test query about AI agents');
+   816→    expect(writerInput.sources.length).toBe(1);
+   817→    expect(writerInput.sources[0].id).toBe('src_1');
+   818→    expect(writerInput.sources[0].title).toBe('Test Source');
+   819→    expect(writerInput.findings.length).toBe(1);
+   820→    expect(writerInput.findings[0].content).toBe('AI agents improve productivity');
+   821→    expect(writerInput.classification.primaryTopic).toBe('AI agents');
+   822→    expect(writerInput.summary.executive).toBe('AI agents are transforming productivity.');
+   823→    expect(writerInput.references.length).toBe(1);
+   824→  });
+   825→
+   826→  it('should handle ResearchSession without classification or summary', () => {
+   827→    const minimalSession = {
+   828→      id: 'rs_minimal' as any,
+   829→      query: 'Minimal query',
+   830→      config: {} as any,
+   831→      status: 'completed' as const,
+   832→      sources: [],
+   833→      findings: [],
+   834→      comparisons: [],
+   835→      references: [],
+   836→      createdAt: new Date(),
+   837→    };
+   838→
+   839→    const writerInput = bridgeResearchToWriter(minimalSession as any);
+   840→
+   841→    expect(writerInput.query).toBe('Minimal query');
+   842→    expect(writerInput.classification.primaryTopic).toBe('Minimal query'); // Fallback
+   843→    expect(writerInput.summary.executive).toBeTruthy(); // Default summary
+   844→  });
+   845→});
+   846→
+   847→// ═══════════════════════════════════════════════════════════════
+   848→// SPRINT 4: INTEGRATED WRITER + LLM + QUALITY TESTS
+   849→// ═══════════════════════════════════════════════════════════════
+   850→
+   851→describe('Sprint 4: Integrated Writer Pipeline', () => {
+   852→  it('should write with LLM enhancement enabled', async () => {
+   853→    const mockLLM = createMockLLMProvider();
+   854→    const writer = new WriterWorker({ llmProvider: mockLLM });
+   855→    const input = createMockResearchInput();
+   856→
+   857→    const session = await writer.write(input, {
+   858→      enableLLMEnhancement: true,
+   859→      enableQualityScoring: true,
+   860→    });
+   861→
+   862→    expect(session.status).toBe('completed');
+   863→    expect(session.document).toBeTruthy();
+   864→    expect(session.document!.metadata.llmEnhanced).toBe(true);
+   865→    expect(session.document!.metadata.llmTokensUsed).toBeGreaterThan(0);
+   866→    expect(session.document!.metadata.llmCost).toBeGreaterThan(0);
+   867→    expect(session.document!.quality).toBeTruthy();
+   868→
+   869→    // Some sections should be LLM-enhanced
+   870→    const enhancedSections = session.document!.sections.filter(s => s.llmEnhanced === true);
+   871→    expect(enhancedSections.length).toBeGreaterThan(0);
+   872→  });
+   873→
+   874→  it('should write with full pipeline: LLM + Quality + Refinement', async () => {
+   875→    const mockLLM = createMockLLMProvider();
+   876→    const writer = new WriterWorker({ llmProvider: mockLLM });
+   877→    const input = createMockResearchInput();
+   878→
+   879→    const session = await writer.write(input, {
+   880→      enableLLMEnhancement: true,
+   881→      enableQualityScoring: true,
+   882→      enableRefinement: true,
+   883→      maxRefinementIterations: 1,
+   884→      minQualityScore: 0.9, // High threshold to trigger refinement
+   885→    });
+   886→
+   887→    expect(session.status).toBe('completed');
+   888→    expect(session.document).toBeTruthy();
+   889→    expect(session.document!.quality).toBeTruthy();
+   890→    expect(session.document!.quality!.overall).toBeGreaterThan(0);
+   891→
+   892→    // Should have quality history if refinement ran
+   893→    if (session.qualityHistory) {
+   894→      expect(session.qualityHistory.length).toBeGreaterThanOrEqual(1);
+   895→    }
+   896→  });
+   897→
+   898→  it('should fall back to template-only when no LLM provider', async () => {
+   899→    const writer = new WriterWorker(); // No LLM provider
+   900→    const input = createMockResearchInput();
+   901→
+   902→    const session = await writer.write(input, {
+   903→      enableLLMEnhancement: true, // Requested but no provider
+   904→      enableQualityScoring: true,
+   905→    });
+   906→
+   907→    expect(session.status).toBe('completed');
+   908→    expect(session.document).toBeTruthy();
+   909→    // Should still have content from templates
+   910→    expect(session.document!.wordCount).toBeGreaterThan(100);
+   911→    // Quality should still be scored
+   912→    expect(session.document!.quality).toBeTruthy();
+   913→    // But not LLM-enhanced
+   914→    expect(session.document!.metadata.llmEnhanced).toBeFalsy();
+   915→  });
+   916→
+   917→  it('should produce different content for different types', async () => {
+   918→    const input = createMockResearchInput();
+   919→    const writer = new WriterWorker();
+   920→
+   921→    const article = await writer.writeArticle(input);
+   922→    const report = await writer.writeReport(input);
+   923→    const docs = await writer.writeDocumentation(input);
+   924→
+   925→    // Different templates produce different content
+   926→    expect(article.document!.contentType).toBe('article');
+   927→    expect(report.document!.contentType).toBe('report');
+   928→    expect(docs.document!.contentType).toBe('documentation');
+   929→
+   930→    // Reports have executive summary
+   931→    expect(report.document!.sections.some(s => s.title === 'Executive Summary')).toBe(true);
+   932→    // Docs have How It Works
+   933→    expect(docs.document!.sections.some(s => s.title === 'How It Works')).toBe(true);
+   934→    // Articles have Introduction
+   935→    expect(article.document!.sections.some(s => s.title === 'Introduction')).toBe(true);
+   936→  });
+   937→
+   938→  it('should render in all three formats', async () => {
+   939→    const input = createMockResearchInput();
+   940→
+   941→    for (const format of ['markdown', 'html', 'plain'] as const) {
+   942→      const writer = new WriterWorker();
+   943→      const session = await writer.write(input, { outputFormat: format });
+   944→      expect(session.status).toBe('completed');
+   945→      expect(session.document!.format).toBe(format);
+   946→      expect(session.document!.rendered).toBeTruthy();
+   947→      expect(session.document!.wordCount).toBeGreaterThan(0);
+   948→    }
+   949→  });
+   950→});
+   951→
+   952→// ═══════════════════════════════════════════════════════════════
+   953→// PLUGIN INTEGRATION TESTS
+   954→// ═══════════════════════════════════════════════════════════════
+   955→
+   956→describe('Plugin Integration', () => {
+   957→  it('should have correct manifest with Sprint 4 capabilities', () => {
+   958→    expect(WRITER_WORKER_MANIFEST.id).toBe('writer-worker');
+   959→    expect(WRITER_WORKER_MANIFEST.type).toBe('worker');
+   960→    expect(WRITER_WORKER_MANIFEST.capabilities).toContain('writing');
+   961→    expect(WRITER_WORKER_MANIFEST.capabilities).toContain('article-generation');
+   962→    expect(WRITER_WORKER_MANIFEST.capabilities).toContain('markdown');
+   963→    // Sprint 4 capabilities
+   964→    expect(WRITER_WORKER_MANIFEST.capabilities).toContain('llm-enhancement');
+   965→    expect(WRITER_WORKER_MANIFEST.capabilities).toContain('quality-scoring');
+   966→    expect(WRITER_WORKER_MANIFEST.capabilities).toContain('iterative-refinement');
+   967→    expect(WRITER_WORKER_MANIFEST.capabilities).toContain('research-pipeline');
+   968→  });
+   969→
+   970→  it('should have version 2.0.0', () => {
+   971→    expect(WRITER_WORKER_MANIFEST.version).toBe('2.0.0');
+   972→  });
+   973→
+   974→  it('should create standalone writer worker', () => {
+   975→    const writer = createWriterWorker();
+   976→    expect(writer).toBeInstanceOf(WriterWorker);
+   977→  });
+   978→
+   979→  it('should create writer with LLM provider', () => {
+   980→    const mockLLM = createMockLLMProvider();
+   981→    const writer = createWriterWorker({ llmProvider: mockLLM });
+   982→    expect(writer).toBeInstanceOf(WriterWorker);
+   983→  });
+   984→
+   985→  it('should write with standalone writer', async () => {
+   986→    const writer = createWriterWorker();
+   987→    const input = createMockResearchInput();
+   988→    const session = await writer.write(input);
+   989→
+   990→    expect(session.status).toBe('completed');
+   991→    expect(session.document).toBeTruthy();
+   992→  });
+   993→});
+   994→
