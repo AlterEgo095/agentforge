@@ -1,0 +1,732 @@
+     1→// ============================================================
+     2→// AgentForge - Admin Dashboard
+     3→// Comprehensive system admin with tabbed navigation
+     4→// ============================================================
+     5→
+     6→import React, { useState, useEffect, useCallback } from 'react';
+     7→import {
+     8→  Shield, Users, Cpu, GitBranch, DollarSign, Lock,
+     9→  Server, Activity, RefreshCw, X, Loader2, Check,
+    10→  AlertTriangle, Clock, TrendingUp, TrendingDown, Wifi,
+    11→  WifiOff, AlertCircle, Eye,
+    12→} from 'lucide-react';
+    13→import {
+    14→  api,
+    15→  type AdminStats, type AdminUser, type ProviderInfo, type ProviderHealth,
+    16→  type OrchestrationStatus, type FinanceData, type SecurityEvent,
+    17→  type InfrastructureData, type MonitoringData,
+    18→} from '../lib/api';
+    19→import { cn } from '../lib/cn';
+    20→
+    21→type TabId = 'overview' | 'users' | 'providers' | 'orchestration' | 'finances' | 'security' | 'infrastructure' | 'monitoring';
+    22→
+    23→const TABS: { id: TabId; label: string; icon: React.ElementType }[] = [
+    24→  { id: 'overview', label: 'Overview', icon: Activity },
+    25→  { id: 'users', label: 'Users', icon: Users },
+    26→  { id: 'providers', label: 'Providers', icon: Cpu },
+    27→  { id: 'orchestration', label: 'Orchestration', icon: GitBranch },
+    28→  { id: 'finances', label: 'Finances', icon: DollarSign },
+    29→  { id: 'security', label: 'Security', icon: Lock },
+    30→  { id: 'infrastructure', label: 'Infrastructure', icon: Server },
+    31→  { id: 'monitoring', label: 'Monitoring', icon: Activity },
+    32→];
+    33→
+    34→export function Admin() {
+    35→  const [activeTab, setActiveTab] = useState<TabId>('overview');
+    36→  const [stats, setStats] = useState<AdminStats | null>(null);
+    37→  const [users, setUsers] = useState<AdminUser[]>([]);
+    38→  const [providers, setProviders] = useState<ProviderInfo[]>([]);
+    39→  const [providerHealth, setProviderHealth] = useState<Record<string, ProviderHealth>>({});
+    40→  const [orchestration, setOrchestration] = useState<OrchestrationStatus | null>(null);
+    41→  const [finances, setFinances] = useState<FinanceData | null>(null);
+    42→  const [securityEvents, setSecurityEvents] = useState<SecurityEvent[]>([]);
+    43→  const [infrastructure, setInfrastructure] = useState<InfrastructureData | null>(null);
+    44→  const [monitoring, setMonitoring] = useState<MonitoringData | null>(null);
+    45→  const [loading, setLoading] = useState(true);
+    46→  const [error, setError] = useState<string | null>(null);
+    47→
+    48→  const fetchData = useCallback(async () => {
+    49→    setLoading(true);
+    50→    setError(null);
+    51→    try {
+    52→      const [statsRes, usersRes, providersRes, orchRes, finRes, secRes, infraRes, monRes] = await Promise.allSettled([
+    53→        api.getAdminStats(),
+    54→        api.listUsers(),
+    55→        api.getProviders(),
+    56→        api.getOrchestration(),
+    57→        api.getFinances(),
+    58→        api.getSecurityEvents(),
+    59→        api.getInfrastructure(),
+    60→        api.getMonitoring(),
+    61→      ]);
+    62→      if (statsRes.status === 'fulfilled') setStats(statsRes.value.data);
+    63→      if (usersRes.status === 'fulfilled') setUsers(usersRes.value.data || []);
+    64→      if (providersRes.status === 'fulfilled') setProviders(providersRes.value.data || []);
+    65→      if (orchRes.status === 'fulfilled') setOrchestration(orchRes.value.data);
+    66→      if (finRes.status === 'fulfilled') setFinances(finRes.value.data);
+    67→      if (secRes.status === 'fulfilled') setSecurityEvents(secRes.value.data || []);
+    68→      if (infraRes.status === 'fulfilled') setInfrastructure(infraRes.value.data);
+    69→      if (monRes.status === 'fulfilled') setMonitoring(monRes.value.data);
+    70→    } catch (err: any) {
+    71→      setError(err.message || 'Failed to load admin data');
+    72→    } finally {
+    73→      setLoading(false);
+    74→    }
+    75→  }, []);
+    76→
+    77→  useEffect(() => {
+    78→    fetchData();
+    79→  }, [fetchData]);
+    80→
+    81→  return (
+    82→    <div className="p-6 lg:p-8 max-w-7xl mx-auto animate-fade-in">
+    83→      {/* Header */}
+    84→      <div className="flex items-center justify-between mb-6">
+    85→        <div>
+    86→          <div className="flex items-center gap-3 mb-1">
+    87→            <Shield className="w-7 h-7 text-amber-400" />
+    88→            <h1 className="text-3xl font-bold gradient-text">Admin</h1>
+    89→          </div>
+    90→          <p className="text-gray-500 text-sm">System administration and monitoring</p>
+    91→        </div>
+    92→        <button
+    93→          onClick={fetchData}
+    94→          className="p-2.5 rounded-lg bg-gray-800 hover:bg-gray-700 text-gray-400 hover:text-white transition-colors"
+    95→        >
+    96→          <RefreshCw className={cn('w-4 h-4', loading && 'animate-spin')} />
+    97→        </button>
+    98→      </div>
+    99→
+   100→      {/* Error */}
+   101→      {error && (
+   102→        <div className="mb-4 px-4 py-3 rounded-lg bg-red-500/10 border border-red-500/20 text-red-400 text-sm flex items-center justify-between">
+   103→          <span>{error}</span>
+   104→          <button onClick={() => setError(null)}><X className="w-4 h-4" /></button>
+   105→        </div>
+   106→      )}
+   107→
+   108→      {/* Tab Navigation */}
+   109→      <div className="mb-6 overflow-x-auto">
+   110→        <div className="flex gap-1 p-1 glass-card rounded-xl min-w-max">
+   111→          {TABS.map(({ id, label, icon: Icon }) => (
+   112→            <button
+   113→              key={id}
+   114→              onClick={() => setActiveTab(id)}
+   115→              className={cn(
+   116→                'flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-all whitespace-nowrap',
+   117→                activeTab === id
+   118→                  ? 'bg-blue-500/10 text-blue-400'
+   119→                  : 'text-gray-400 hover:text-white hover:bg-gray-800/50'
+   120→              )}
+   121→            >
+   122→              <Icon className="w-4 h-4" />
+   123→              {label}
+   124→            </button>
+   125→          ))}
+   126→        </div>
+   127→      </div>
+   128→
+   129→      {/* Tab Content */}
+   130→      {loading && !stats ? (
+   131→        <div className="flex items-center justify-center py-20">
+   132→          <Loader2 className="w-8 h-8 text-blue-400 animate-spin" />
+   133→        </div>
+   134→      ) : (
+   135→        <>
+   136→          {activeTab === 'overview' && <OverviewTab stats={stats} providers={providers} />}
+   137→          {activeTab === 'users' && <UsersTab users={users} onUpdate={fetchData} />}
+   138→          {activeTab === 'providers' && <ProvidersTab providers={providers} />}
+   139→          {activeTab === 'orchestration' && <OrchestrationTab orchestration={orchestration} />}
+   140→          {activeTab === 'finances' && <FinancesTab finances={finances} />}
+   141→          {activeTab === 'security' && <SecurityTab events={securityEvents} />}
+   142→          {activeTab === 'infrastructure' && <InfrastructureTab infrastructure={infrastructure} />}
+   143→          {activeTab === 'monitoring' && <MonitoringTab monitoring={monitoring} />}
+   144→        </>
+   145→      )}
+   146→    </div>
+   147→  );
+   148→}
+   149→
+   150→// ── Overview Tab ──────────────────────────────────────────
+   151→
+   152→function OverviewTab({ stats, providers }: { stats: AdminStats | null; providers: ProviderInfo[] }) {
+   153→  const statCards = stats
+   154→    ? [
+   155→        { label: 'Total Users', value: stats.users.total, sub: `${stats.users.active} active`, icon: Users, color: '#3B82F6' },
+   156→        { label: 'Executions', value: stats.executions.today, sub: `${stats.executions.successRate}% success`, icon: Activity, color: '#10B981' },
+   157→        { label: 'Total Cost', value: `$${stats.costs.total.toFixed(2)}`, sub: `$${stats.costs.today.toFixed(2)} today`, icon: DollarSign, color: '#F59E0B' },
+   158→        { label: 'Uptime', value: `${stats.uptime}%`, sub: `${stats.agentCount} agents`, icon: Shield, color: '#8B5CF6' },
+   159→      ]
+   160→    : [];
+   161→
+   162→  return (
+   163→    <div className="space-y-6 animate-fade-in">
+   164→      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+   165→        {statCards.map((s) => (
+   166→          <div key={s.label} className="glass-card rounded-xl p-5">
+   167→            <div className="flex items-center justify-between mb-3">
+   168→              <div className="w-10 h-10 rounded-lg flex items-center justify-center" style={{ backgroundColor: `${s.color}15` }}>
+   169→                <s.icon className="w-5 h-5" style={{ color: s.color }} />
+   170→              </div>
+   171→            </div>
+   172→            <p className="text-2xl font-bold text-white">{s.value}</p>
+   173→            <p className="text-sm text-gray-500 mt-1">{s.label}</p>
+   174→            <p className="text-xs text-gray-600 mt-0.5">{s.sub}</p>
+   175→          </div>
+   176→        ))}
+   177→      </div>
+   178→
+   179→      {/* Provider Health */}
+   180→      <div className="glass-card rounded-xl p-5">
+   181→        <h3 className="text-base font-semibold text-white mb-4">Provider Health</h3>
+   182→        <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-3">
+   183→          {providers.map((p) => (
+   184→            <div key={p.id} className="p-3 rounded-lg bg-gray-800/40 border border-gray-700/30">
+   185→              <div className="flex items-center gap-2 mb-2">
+   186→                <span className={cn(
+   187→                  'w-2 h-2 rounded-full',
+   188→                  p.status === 'healthy' ? 'bg-green-400' : p.status === 'degraded' ? 'bg-yellow-400' : 'bg-red-400'
+   189→                )} />
+   190→                <span className="text-sm font-medium text-white">{p.name}</span>
+   191→              </div>
+   192→              <p className="text-xs text-gray-500">{p.latency}ms latency</p>
+   193→              <div className="flex flex-wrap gap-1 mt-2">
+   194→                {p.models.slice(0, 2).map((m) => (
+   195→                  <span key={m} className="px-1.5 py-0.5 rounded text-[10px] bg-gray-800 text-gray-400">{m}</span>
+   196→                ))}
+   197→              </div>
+   198→            </div>
+   199→          ))}
+   200→          {providers.length === 0 && (
+   201→            <p className="text-xs text-gray-600 col-span-full text-center py-4">No provider data available</p>
+   202→          )}
+   203→        </div>
+   204→      </div>
+   205→    </div>
+   206→  );
+   207→}
+   208→
+   209→// ── Users Tab ─────────────────────────────────────────────
+   210→
+   211→function UsersTab({ users, onUpdate }: { users: AdminUser[]; onUpdate: () => void }) {
+   212→  const [editingId, setEditingId] = useState<string | null>(null);
+   213→  const [editData, setEditData] = useState<{ tier: string; role: string; status: string }>({ tier: '', role: '', status: '' });
+   214→  const [saving, setSaving] = useState(false);
+   215→
+   216→  const startEdit = (u: AdminUser) => {
+   217→    setEditingId(u.id);
+   218→    setEditData({ tier: u.tier, role: u.role, status: u.status });
+   219→  };
+   220→
+   221→  const saveEdit = async () => {
+   222→    if (!editingId) return;
+   223→    try {
+   224→      setSaving(true);
+   225→      await api.updateUser(editingId, editData as any);
+   226→      setEditingId(null);
+   227→      onUpdate();
+   228→    } catch {
+   229→      // silent
+   230→    } finally {
+   231→      setSaving(false);
+   232→    }
+   233→  };
+   234→
+   235→  return (
+   236→    <div className="glass-card rounded-xl overflow-hidden animate-fade-in">
+   237→      <table className="w-full text-left">
+   238→        <thead>
+   239→          <tr>
+   240→            <th className="text-xs text-gray-500 uppercase tracking-wider py-3 px-4 border-b border-gray-800">User</th>
+   241→            <th className="text-xs text-gray-500 uppercase tracking-wider py-3 px-4 border-b border-gray-800">Tier</th>
+   242→            <th className="text-xs text-gray-500 uppercase tracking-wider py-3 px-4 border-b border-gray-800">Role</th>
+   243→            <th className="text-xs text-gray-500 uppercase tracking-wider py-3 px-4 border-b border-gray-800">Status</th>
+   244→            <th className="text-xs text-gray-500 uppercase tracking-wider py-3 px-4 border-b border-gray-800 text-right">Actions</th>
+   245→          </tr>
+   246→        </thead>
+   247→        <tbody>
+   248→          {users.map((u) => (
+   249→            <tr key={u.id} className="border-b border-gray-800/50 hover:bg-gray-800/30">
+   250→              <td className="py-3 px-4">
+   251→                <div className="flex items-center gap-3">
+   252→                  <div className="w-8 h-8 rounded-full bg-gradient-to-br from-blue-500 to-purple-600 flex items-center justify-center text-xs font-bold text-white">
+   253→                    {u.name?.[0]?.toUpperCase() || '?'}
+   254→                  </div>
+   255→                  <div>
+   256→                    <p className="text-sm font-medium text-white">{u.name}</p>
+   257→                    <p className="text-xs text-gray-500">{u.email}</p>
+   258→                  </div>
+   259→                </div>
+   260→              </td>
+   261→              <td className="py-3 px-4">
+   262→                {editingId === u.id ? (
+   263→                  <select value={editData.tier} onChange={(e) => setEditData({ ...editData, tier: e.target.value })} className="bg-gray-800 border border-gray-700 text-xs rounded px-2 py-1 text-gray-300">
+   264→                    {['free', 'starter', 'pro', 'enterprise'].map((t) => <option key={t} value={t}>{t}</option>)}
+   265→                  </select>
+   266→                ) : (
+   267→                  <span className="px-2 py-0.5 rounded-full text-xs font-medium bg-purple-500/10 text-purple-400 capitalize">{u.tier}</span>
+   268→                )}
+   269→              </td>
+   270→              <td className="py-3 px-4">
+   271→                {editingId === u.id ? (
+   272→                  <select value={editData.role} onChange={(e) => setEditData({ ...editData, role: e.target.value })} className="bg-gray-800 border border-gray-700 text-xs rounded px-2 py-1 text-gray-300">
+   273→                    {['user', 'admin', 'superadmin'].map((r) => <option key={r} value={r}>{r}</option>)}
+   274→                  </select>
+   275→                ) : (
+   276→                  <span className="px-2 py-0.5 rounded-full text-xs font-medium bg-blue-500/10 text-blue-400 capitalize">{u.role}</span>
+   277→                )}
+   278→              </td>
+   279→              <td className="py-3 px-4">
+   280→                {editingId === u.id ? (
+   281→                  <select value={editData.status} onChange={(e) => setEditData({ ...editData, status: e.target.value })} className="bg-gray-800 border border-gray-700 text-xs rounded px-2 py-1 text-gray-300">
+   282→                    {['active', 'inactive', 'suspended'].map((s) => <option key={s} value={s}>{s}</option>)}
+   283→                  </select>
+   284→                ) : (
+   285→                  <span className={cn('px-2 py-0.5 rounded-full text-xs font-medium capitalize',
+   286→                    u.status === 'active' ? 'bg-green-500/10 text-green-400' : u.status === 'suspended' ? 'bg-red-500/10 text-red-400' : 'bg-gray-500/10 text-gray-400'
+   287→                  )}>{u.status}</span>
+   288→                )}
+   289→              </td>
+   290→              <td className="py-3 px-4 text-right">
+   291→                {editingId === u.id ? (
+   292→                  <div className="flex items-center justify-end gap-2">
+   293→                    <button onClick={saveEdit} disabled={saving} className="p-1.5 rounded text-green-400 hover:bg-green-500/10">
+   294→                      {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Check className="w-4 h-4" />}
+   295→                    </button>
+   296→                    <button onClick={() => setEditingId(null)} className="p-1.5 rounded text-gray-500 hover:bg-gray-800">
+   297→                      <X className="w-4 h-4" />
+   298→                    </button>
+   299→                  </div>
+   300→                ) : (
+   301→                  <button onClick={() => startEdit(u)} className="text-xs text-gray-500 hover:text-blue-400 transition-colors">
+   302→                    Edit
+   303→                  </button>
+   304→                )}
+   305→              </td>
+   306→            </tr>
+   307→          ))}
+   308→          {users.length === 0 && (
+   309→            <tr>
+   310→              <td colSpan={5} className="py-12 text-center text-gray-600 text-sm">No users found</td>
+   311→            </tr>
+   312→          )}
+   313→        </tbody>
+   314→      </table>
+   315→    </div>
+   316→  );
+   317→}
+   318→
+   319→// ── Providers Tab ─────────────────────────────────────────
+   320→
+   321→function ProvidersTab({ providers }: { providers: ProviderInfo[] }) {
+   322→  return (
+   323→    <div className="space-y-4 animate-fade-in">
+   324→      {providers.length === 0 ? (
+   325→        <div className="glass-card rounded-xl p-12 text-center text-gray-600">
+   326→          <Cpu className="w-12 h-12 mx-auto mb-3 opacity-30" />
+   327→          <p>No provider data available</p>
+   328→        </div>
+   329→      ) : (
+   330→        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+   331→          {providers.map((p) => (
+   332→            <div key={p.id} className="glass-card rounded-xl p-5">
+   333→              <div className="flex items-center justify-between mb-4">
+   334→                <div className="flex items-center gap-3">
+   335→                  <div className={cn(
+   336→                    'w-10 h-10 rounded-lg flex items-center justify-center',
+   337→                    p.status === 'healthy' ? 'bg-green-500/10' : p.status === 'degraded' ? 'bg-yellow-500/10' : 'bg-red-500/10'
+   338→                  )}>
+   339→                    <Cpu className={cn(
+   340→                      'w-5 h-5',
+   341→                      p.status === 'healthy' ? 'text-green-400' : p.status === 'degraded' ? 'text-yellow-400' : 'text-red-400'
+   342→                    )} />
+   343→                  </div>
+   344→                  <div>
+   345→                    <p className="text-sm font-semibold text-white">{p.name}</p>
+   346→                    <p className="text-xs text-gray-500">{p.type}</p>
+   347→                  </div>
+   348→                </div>
+   349→                <span className={cn(
+   350→                  'px-2.5 py-1 rounded-full text-xs font-medium',
+   351→                  p.status === 'healthy' ? 'bg-green-500/10 text-green-400' : p.status === 'degraded' ? 'bg-yellow-500/10 text-yellow-400' : 'bg-red-500/10 text-red-400'
+   352→                )}>
+   353→                  {p.status}
+   354→                </span>
+   355→              </div>
+   356→
+   357→              <div className="grid grid-cols-2 gap-3">
+   358→                <div className="px-3 py-2 rounded-lg bg-gray-800/40">
+   359→                  <p className="text-[11px] text-gray-500">Latency</p>
+   360→                  <p className="text-sm font-medium text-white">{p.latency}ms</p>
+   361→                </div>
+   362→                <div className="px-3 py-2 rounded-lg bg-gray-800/40">
+   363→                  <p className="text-[11px] text-gray-500">Models</p>
+   364→                  <p className="text-sm font-medium text-white">{p.models.length}</p>
+   365→                </div>
+   366→              </div>
+   367→
+   368→              <div className="flex flex-wrap gap-1.5 mt-3">
+   369→                {p.models.map((m) => (
+   370→                  <span key={m} className="px-2 py-0.5 rounded text-[11px] bg-gray-800 text-gray-400 font-mono">
+   371→                    {m}
+   372→                  </span>
+   373→                ))}
+   374→              </div>
+   375→            </div>
+   376→          ))}
+   377→        </div>
+   378→      )}
+   379→    </div>
+   380→  );
+   381→}
+   382→
+   383→// ── Orchestration Tab ─────────────────────────────────────
+   384→
+   385→function OrchestrationTab({ orchestration }: { orchestration: OrchestrationStatus | null }) {
+   386→  if (!orchestration) {
+   387→    return (
+   388→      <div className="glass-card rounded-xl p-12 text-center text-gray-600 animate-fade-in">
+   389→        <GitBranch className="w-12 h-12 mx-auto mb-3 opacity-30" />
+   390→        <p>No orchestration data available</p>
+   391→      </div>
+   392→    );
+   393→  }
+   394→
+   395→  return (
+   396→    <div className="space-y-6 animate-fade-in">
+   397→      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+   398→        {[
+   399→          { label: 'Queue Length', value: orchestration.queueLength, color: '#F59E0B' },
+   400→          { label: 'Active Executions', value: orchestration.activeExecutions, color: '#3B82F6' },
+   401→          { label: 'Completed Today', value: orchestration.completedToday, color: '#10B981' },
+   402→          { label: 'Pipelines', value: orchestration.pipelines.length, color: '#8B5CF6' },
+   403→        ].map((s) => (
+   404→          <div key={s.label} className="glass-card rounded-xl p-4">
+   405→            <p className="text-2xl font-bold text-white">{s.value}</p>
+   406→            <p className="text-sm text-gray-500">{s.label}</p>
+   407→          </div>
+   408→        ))}
+   409→      </div>
+   410→
+   411→      <div className="glass-card rounded-xl p-5">
+   412→        <h3 className="text-base font-semibold text-white mb-4">Pipelines</h3>
+   413→        <div className="space-y-3">
+   414→          {orchestration.pipelines.map((p) => (
+   415→            <div key={p.id} className="flex items-center justify-between p-3 rounded-lg bg-gray-800/40">
+   416→              <div className="flex items-center gap-3">
+   417→                <span className={cn(
+   418→                  'w-2 h-2 rounded-full',
+   419→                  p.status === 'running' ? 'bg-green-400' : p.status === 'paused' ? 'bg-yellow-400' : 'bg-red-400'
+   420→                )} />
+   421→                <div>
+   422→                  <p className="text-sm font-medium text-white">{p.name}</p>
+   423→                  <p className="text-xs text-gray-500">Stage {p.currentStage}/{p.stages}</p>
+   424→                </div>
+   425→              </div>
+   426→              <span className={cn(
+   427→                'px-2 py-0.5 rounded-full text-xs font-medium capitalize',
+   428→                p.status === 'running' ? 'bg-green-500/10 text-green-400' : p.status === 'paused' ? 'bg-yellow-500/10 text-yellow-400' : 'bg-red-500/10 text-red-400'
+   429→              )}>
+   430→                {p.status}
+   431→              </span>
+   432→            </div>
+   433→          ))}
+   434→          {orchestration.pipelines.length === 0 && (
+   435→            <p className="text-xs text-gray-600 text-center py-4">No active pipelines</p>
+   436→          )}
+   437→        </div>
+   438→      </div>
+   439→    </div>
+   440→  );
+   441→}
+   442→
+   443→// ── Finances Tab ──────────────────────────────────────────
+   444→
+   445→function FinancesTab({ finances }: { finances: FinanceData | null }) {
+   446→  if (!finances) {
+   447→    return (
+   448→      <div className="glass-card rounded-xl p-12 text-center text-gray-600 animate-fade-in">
+   449→        <DollarSign className="w-12 h-12 mx-auto mb-3 opacity-30" />
+   450→        <p>No finance data available</p>
+   451→      </div>
+   452→    );
+   453→  }
+   454→
+   455→  return (
+   456→    <div className="space-y-6 animate-fade-in">
+   457→      <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+   458→        {[
+   459→          { label: 'Total Revenue', value: `$${finances.totalRevenue.toFixed(2)}`, icon: TrendingUp, color: '#10B981' },
+   460→          { label: 'Total Cost', value: `$${finances.totalCost.toFixed(2)}`, icon: TrendingDown, color: '#EF4444' },
+   461→          { label: 'Profit', value: `$${finances.profit.toFixed(2)}`, icon: DollarSign, color: finances.profit >= 0 ? '#10B981' : '#EF4444' },
+   462→        ].map((s) => (
+   463→          <div key={s.label} className="glass-card rounded-xl p-5">
+   464→            <div className="flex items-center justify-between mb-2">
+   465→              <div className="w-8 h-8 rounded-lg flex items-center justify-center" style={{ backgroundColor: `${s.color}15` }}>
+   466→                <s.icon className="w-4 h-4" style={{ color: s.color }} />
+   467→              </div>
+   468→            </div>
+   469→            <p className="text-2xl font-bold text-white">{s.value}</p>
+   470→            <p className="text-sm text-gray-500">{s.label}</p>
+   471→          </div>
+   472→        ))}
+   473→      </div>
+   474→
+   475→      {/* Cost by Provider */}
+   476→      <div className="glass-card rounded-xl p-5">
+   477→        <h3 className="text-base font-semibold text-white mb-4">Cost by Provider</h3>
+   478→        <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+   479→          {Object.entries(finances.costByProvider || {}).map(([provider, cost]) => (
+   480→            <div key={provider} className="p-3 rounded-lg bg-gray-800/40">
+   481→              <p className="text-xs text-gray-500 capitalize">{provider}</p>
+   482→              <p className="text-lg font-bold text-white">${(cost as number).toFixed(2)}</p>
+   483→            </div>
+   484→          ))}
+   485→          {Object.keys(finances.costByProvider || {}).length === 0 && (
+   486→            <p className="text-xs text-gray-600 col-span-full text-center py-4">No cost breakdown available</p>
+   487→          )}
+   488→        </div>
+   489→      </div>
+   490→
+   491→      {/* Cost Over Time */}
+   492→      <div className="glass-card rounded-xl p-5">
+   493→        <h3 className="text-base font-semibold text-white mb-4">Daily Costs</h3>
+   494→        <div className="space-y-2 max-h-64 overflow-y-auto">
+   495→          {(finances.costByDay || []).map((d, i) => (
+   496→            <div key={i} className="flex items-center justify-between py-1.5 px-3 rounded bg-gray-800/30 text-sm">
+   497→              <span className="text-gray-400">{d.date}</span>
+   498→              <span className="text-white font-medium">${d.cost.toFixed(2)}</span>
+   499→            </div>
+   500→          ))}
+   501→          {(finances.costByDay || []).length === 0 && (
+   502→            <p className="text-xs text-gray-600 text-center py-4">No daily cost data</p>
+   503→          )}
+   504→        </div>
+   505→      </div>
+   506→    </div>
+   507→  );
+   508→}
+   509→
+   510→// ── Security Tab ──────────────────────────────────────────
+   511→
+   512→function SecurityTab({ events }: { events: SecurityEvent[] }) {
+   513→  const severityColors: Record<string, string> = {
+   514→    low: 'bg-blue-500/10 text-blue-400',
+   515→    medium: 'bg-yellow-500/10 text-yellow-400',
+   516→    high: 'bg-orange-500/10 text-orange-400',
+   517→    critical: 'bg-red-500/10 text-red-400',
+   518→  };
+   519→
+   520→  return (
+   521→    <div className="space-y-4 animate-fade-in">
+   522→      {events.length === 0 ? (
+   523→        <div className="glass-card rounded-xl p-12 text-center text-gray-600">
+   524→          <Lock className="w-12 h-12 mx-auto mb-3 opacity-30" />
+   525→          <p>No security events</p>
+   526→          <p className="text-sm mt-1">All clear — no threats detected</p>
+   527→        </div>
+   528→      ) : (
+   529→        <div className="glass-card rounded-xl overflow-hidden">
+   530→          <table className="w-full text-left">
+   531→            <thead>
+   532→              <tr>
+   533→                <th className="text-xs text-gray-500 uppercase tracking-wider py-3 px-4 border-b border-gray-800">Event</th>
+   534→                <th className="text-xs text-gray-500 uppercase tracking-wider py-3 px-4 border-b border-gray-800">Severity</th>
+   535→                <th className="text-xs text-gray-500 uppercase tracking-wider py-3 px-4 border-b border-gray-800">IP</th>
+   536→                <th className="text-xs text-gray-500 uppercase tracking-wider py-3 px-4 border-b border-gray-800">Time</th>
+   537→                <th className="text-xs text-gray-500 uppercase tracking-wider py-3 px-4 border-b border-gray-800">Status</th>
+   538→              </tr>
+   539→            </thead>
+   540→            <tbody>
+   541→              {events.map((e) => (
+   542→                <tr key={e.id} className="border-b border-gray-800/50 hover:bg-gray-800/30">
+   543→                  <td className="py-3 px-4">
+   544→                    <p className="text-sm text-white">{e.description || e.type}</p>
+   545→                    <p className="text-xs text-gray-500">{e.type}</p>
+   546→                  </td>
+   547→                  <td className="py-3 px-4">
+   548→                    <span className={cn('px-2 py-0.5 rounded-full text-xs font-medium capitalize', severityColors[e.severity] || severityColors.low)}>
+   549→                      {e.severity}
+   550→                    </span>
+   551→                  </td>
+   552→                  <td className="py-3 px-4 text-xs text-gray-400 font-mono">{e.ip || '—'}</td>
+   553→                  <td className="py-3 px-4 text-xs text-gray-500">{new Date(e.timestamp).toLocaleString()}</td>
+   554→                  <td className="py-3 px-4">
+   555→                    <span className={cn('px-2 py-0.5 rounded-full text-xs font-medium',
+   556→                      e.resolved ? 'bg-green-500/10 text-green-400' : 'bg-red-500/10 text-red-400'
+   557→                    )}>
+   558→                      {e.resolved ? 'Resolved' : 'Open'}
+   559→                    </span>
+   560→                  </td>
+   561→                </tr>
+   562→              ))}
+   563→            </tbody>
+   564→          </table>
+   565→        </div>
+   566→      )}
+   567→    </div>
+   568→  );
+   569→}
+   570→
+   571→// ── Infrastructure Tab ────────────────────────────────────
+   572→
+   573→function InfrastructureTab({ infrastructure }: { infrastructure: InfrastructureData | null }) {
+   574→  if (!infrastructure) {
+   575→    return (
+   576→      <div className="glass-card rounded-xl p-12 text-center text-gray-600 animate-fade-in">
+   577→        <Server className="w-12 h-12 mx-auto mb-3 opacity-30" />
+   578→        <p>No infrastructure data available</p>
+   579→      </div>
+   580→    );
+   581→  }
+   582→
+   583→  const sections = [
+   584→    {
+   585→      title: 'Redis',
+   586→      icon: Wifi,
+   587→      items: [
+   588→        { label: 'Status', value: infrastructure.redis.status },
+   589→        { label: 'Memory', value: `${infrastructure.redis.memory}MB` },
+   590→        { label: 'Connections', value: infrastructure.redis.connections },
+   591→        { label: 'Hit Rate', value: `${infrastructure.redis.hitRate}%` },
+   592→      ],
+   593→    },
+   594→    {
+   595→      title: 'Database',
+   596→      icon: Server,
+   597→      items: [
+   598→        { label: 'Status', value: infrastructure.database.status },
+   599→        { label: 'Connections', value: infrastructure.database.connections },
+   600→        { label: 'Queries/s', value: infrastructure.database.queries },
+   601→        { label: 'Latency', value: `${infrastructure.database.latency}ms` },
+   602→      ],
+   603→    },
+   604→    {
+   605→      title: 'Cache',
+   606→      icon: Activity,
+   607→      items: [
+   608→        { label: 'Hit Rate', value: `${infrastructure.cache.hitRate}%` },
+   609→        { label: 'Miss Rate', value: `${infrastructure.cache.missRate}%` },
+   610→        { label: 'Size', value: `${infrastructure.cache.size}MB` },
+   611→      ],
+   612→    },
+   613→    {
+   614→      title: 'Job Queue',
+   615→      icon: Clock,
+   616→      items: [
+   617→        { label: 'Pending', value: infrastructure.jobQueue.pending },
+   618→        { label: 'Active', value: infrastructure.jobQueue.active },
+   619→        { label: 'Completed', value: infrastructure.jobQueue.completed },
+   620→        { label: 'Failed', value: infrastructure.jobQueue.failed },
+   621→      ],
+   622→    },
+   623→  ];
+   624→
+   625→  return (
+   626→    <div className="grid grid-cols-1 md:grid-cols-2 gap-4 animate-fade-in">
+   627→      {sections.map((s) => (
+   628→        <div key={s.title} className="glass-card rounded-xl p-5">
+   629→          <h3 className="text-base font-semibold text-white mb-4 flex items-center gap-2">
+   630→            <s.icon className="w-4 h-4 text-blue-400" /> {s.title}
+   631→          </h3>
+   632→          <div className="grid grid-cols-2 gap-3">
+   633→            {s.items.map((item) => (
+   634→              <div key={item.label} className="px-3 py-2 rounded-lg bg-gray-800/40">
+   635→                <p className="text-[11px] text-gray-500">{item.label}</p>
+   636→                <p className="text-sm font-medium text-white">{item.value}</p>
+   637→              </div>
+   638→            ))}
+   639→          </div>
+   640→        </div>
+   641→      ))}
+   642→    </div>
+   643→  );
+   644→}
+   645→
+   646→// ── Monitoring Tab ────────────────────────────────────────
+   647→
+   648→function MonitoringTab({ monitoring }: { monitoring: MonitoringData | null }) {
+   649→  if (!monitoring) {
+   650→    return (
+   651→      <div className="glass-card rounded-xl p-12 text-center text-gray-600 animate-fade-in">
+   652→        <Activity className="w-12 h-12 mx-auto mb-3 opacity-30" />
+   653→        <p>No monitoring data available</p>
+   654→      </div>
+   655→    );
+   656→  }
+   657→
+   658→  const levelColors: Record<string, string> = {
+   659→    info: 'bg-blue-500/10 text-blue-400',
+   660→    warning: 'bg-yellow-500/10 text-yellow-400',
+   661→    error: 'bg-orange-500/10 text-orange-400',
+   662→    critical: 'bg-red-500/10 text-red-400',
+   663→  };
+   664→
+   665→  return (
+   666→    <div className="space-y-6 animate-fade-in">
+   667→      {/* Alerts */}
+   668→      <div className="glass-card rounded-xl p-5">
+   669→        <h3 className="text-base font-semibold text-white mb-4 flex items-center gap-2">
+   670→          <AlertCircle className="w-4 h-4 text-yellow-400" /> Alerts
+   671→        </h3>
+   672→        {(monitoring.alerts || []).length === 0 ? (
+   673→          <p className="text-xs text-gray-600 text-center py-4">No active alerts</p>
+   674→        ) : (
+   675→          <div className="space-y-2 max-h-64 overflow-y-auto">
+   676→            {monitoring.alerts.map((a) => (
+   677→              <div key={a.id} className="flex items-center justify-between p-3 rounded-lg bg-gray-800/40">
+   678→                <div className="flex items-center gap-3">
+   679→                  <span className={cn('px-2 py-0.5 rounded-full text-xs font-medium capitalize', levelColors[a.level] || levelColors.info)}>
+   680→                    {a.level}
+   681→                  </span>
+   682→                  <p className="text-sm text-gray-300">{a.message}</p>
+   683→                </div>
+   684→                <span className="text-xs text-gray-500 flex-shrink-0">{new Date(a.timestamp).toLocaleTimeString()}</span>
+   685→              </div>
+   686→            ))}
+   687→          </div>
+   688→        )}
+   689→      </div>
+   690→
+   691→      {/* Metrics */}
+   692→      <div className="glass-card rounded-xl p-5">
+   693→        <h3 className="text-base font-semibold text-white mb-4">Metrics</h3>
+   694→        <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+   695→          {Object.entries(monitoring.metrics || {}).map(([key, value]) => (
+   696→            <div key={key} className="p-3 rounded-lg bg-gray-800/40">
+   697→              <p className="text-[11px] text-gray-500 capitalize">{key.replace(/([A-Z])/g, ' $1')}</p>
+   698→              <p className="text-lg font-bold text-white">{value}</p>
+   699→            </div>
+   700→          ))}
+   701→          {Object.keys(monitoring.metrics || {}).length === 0 && (
+   702→            <p className="text-xs text-gray-600 col-span-full text-center py-4">No metrics available</p>
+   703→          )}
+   704→        </div>
+   705→      </div>
+   706→
+   707→      {/* Traces */}
+   708→      <div className="glass-card rounded-xl p-5">
+   709→        <h3 className="text-base font-semibold text-white mb-4">Recent Traces</h3>
+   710→        {(monitoring.traces || []).length === 0 ? (
+   711→          <p className="text-xs text-gray-600 text-center py-4">No trace data</p>
+   712→        ) : (
+   713→          <div className="space-y-2 max-h-64 overflow-y-auto">
+   714→            {monitoring.traces.map((t) => (
+   715→              <div key={t.id} className="flex items-center justify-between p-3 rounded-lg bg-gray-800/40 text-sm">
+   716→                <div>
+   717→                  <p className="text-gray-300 font-mono">{t.operation}</p>
+   718→                  <p className="text-xs text-gray-500">{t.status}</p>
+   719→                </div>
+   720→                <div className="text-right">
+   721→                  <p className="text-white font-medium">{t.duration}ms</p>
+   722→                  <p className="text-xs text-gray-500">{new Date(t.timestamp).toLocaleTimeString()}</p>
+   723→                </div>
+   724→              </div>
+   725→            ))}
+   726→          </div>
+   727→        )}
+   728→      </div>
+   729→    </div>
+   730→  );
+   731→}
+   732→
